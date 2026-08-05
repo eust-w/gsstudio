@@ -1,0 +1,114 @@
+const API_BASE = "/api";
+
+export interface Task {
+  id: string;
+  name: string;
+  type: "worldgen" | "worldgen_from_pano" | "worldrecon";
+  status: "pending" | "running" | "completed" | "failed" | "cancelled";
+  current_stage?: string;
+  progress: number;
+  created_at: string;
+  updated_at?: string;
+}
+
+export interface StageInfo {
+  name: string;
+  status: "pending" | "running" | "completed" | "failed" | "skipped";
+  started_at?: string;
+  completed_at?: string;
+  duration_seconds?: number;
+  error?: string;
+}
+
+export interface Artifact {
+  name: string;
+  path: string;
+  size: number;
+  type: "image" | "video" | "3dgs" | "pointcloud" | "mesh" | "data" | "other";
+}
+
+export interface TaskDetail extends Task {
+  stages: StageInfo[];
+  config: Record<string, unknown>;
+  artifacts: Artifact[];
+  error?: string;
+}
+
+export interface GpuInfo {
+  index: number;
+  name: string;
+  used_by?: string;
+  vram_used_gb: number;
+  vram_total_gb: number;
+}
+
+export interface GpuStatus {
+  gpus: GpuInfo[];
+  active_task?: string;
+}
+
+export interface TaskListResponse {
+  tasks: Task[];
+  total: number;
+}
+
+export async function createTask(formData: FormData): Promise<{ task_id: string }> {
+  const resp = await fetch(`${API_BASE}/tasks`, { method: "POST", body: formData });
+  if (!resp.ok) throw new Error(`Create task failed: ${resp.statusText}`);
+  return resp.json();
+}
+
+export async function listTasks(params?: {
+  status?: string;
+  type?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<TaskListResponse> {
+  const searchParams = new URLSearchParams();
+  if (params?.status) searchParams.set("status", params.status);
+  if (params?.type) searchParams.set("type", params.type);
+  if (params?.limit) searchParams.set("limit", String(params.limit));
+  if (params?.offset) searchParams.set("offset", String(params.offset));
+  const qs = searchParams.toString();
+  const resp = await fetch(`${API_BASE}/tasks${qs ? "?" + qs : ""}`);
+  if (!resp.ok) throw new Error(`List tasks failed: ${resp.statusText}`);
+  return resp.json();
+}
+
+export async function getTask(id: string): Promise<TaskDetail> {
+  const resp = await fetch(`${API_BASE}/tasks/${id}`);
+  if (!resp.ok) throw new Error(`Get task failed: ${resp.statusText}`);
+  return resp.json();
+}
+
+export async function cancelTask(id: string): Promise<void> {
+  const resp = await fetch(`${API_BASE}/tasks/${id}/cancel`, { method: "POST" });
+  if (!resp.ok) throw new Error(`Cancel failed: ${resp.statusText}`);
+}
+
+export async function getArtifacts(taskId: string): Promise<Artifact[]> {
+  const resp = await fetch(`${API_BASE}/tasks/${taskId}/artifacts`);
+  if (!resp.ok) throw new Error(`Get artifacts failed: ${resp.statusText}`);
+  const data = await resp.json();
+  return data.artifacts || [];
+}
+
+export function getArtifactUrl(taskId: string, path: string): string {
+  return `${API_BASE}/tasks/${taskId}/artifacts/${path}`;
+}
+
+export function getLogWebSocketUrl(taskId: string): string {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}${API_BASE}/tasks/${taskId}/logs`;
+}
+
+export async function healthCheck(): Promise<{ status: string }> {
+  const resp = await fetch(`${API_BASE}/health`);
+  return resp.json();
+}
+
+export async function getGpuStatus(): Promise<GpuStatus> {
+  const resp = await fetch(`${API_BASE}/gpu/status`);
+  if (!resp.ok) throw new Error(`GPU status failed: ${resp.statusText}`);
+  return resp.json();
+}

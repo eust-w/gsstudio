@@ -1,0 +1,79 @@
+# GSStudio Design Document
+
+## Overview
+
+GSStudio is a full-stack web platform for running HY-World 2.0 pipelines on a 5x A800-SXM4-80GB GPU node in the POC Kubernetes cluster.
+
+## Architecture
+
+Single-pod deployment: API server + Pipeline Worker + vLLM sidecar, sharing 5 GPUs via CUDA_VISIBLE_DEVICES.
+
+### Components
+
+| Component | Technology | GPU | Purpose |
+|-----------|-----------|-----|---------|
+| API Server | FastAPI + SQLite | None | REST API, WebSocket logs, static files |
+| Pipeline Worker | asyncio | 0-4 | Stage orchestration, subprocess management |
+| vLLM Server | vLLM | GPU 0 | Qwen3-VL-8B for trajectory planning |
+| Web Frontend | React + Vite | None (browser) | Task management, 3DGS preview |
+
+### GPU Allocation
+
+- GPU 0: vLLM (60% VRAM limit) + Stage 1 (traj_generate) + worldrecon tasks
+- GPU 0-4: Stage 0 (panogen), Stage 2-5 (traj_render, video_gen, gen_gs_data, gs_training)
+
+### Task Types
+
+1. **worldgen** - Text/image -> 80B panogen -> 5-stage worldgen pipeline
+2. **worldgen_from_pano** - Upload panorama -> 5-stage worldgen pipeline (skip stage 0)
+3. **worldrecon** - Multi-view images -> WorldMirror-2 reconstruction
+
+### State Machine
+
+Task: pending -> running -> completed | failed | cancelled
+Stage: pending -> running -> completed | failed | skipped
+
+### Checkpoint Resume
+
+Each stage writes a completion marker to the task scene directory. On retry, completed stages are skipped.
+
+## Model Weights (pre-downloaded to PVC)
+
+| Model | Size | Purpose |
+|-------|------|---------|
+| HY-Pano-2.0 (80B) | 169.4 GB | Panorama generation |
+| HY-WorldMirror-2.0 | 5.1 GB | 3D reconstruction |
+| WorldStereo-2 (memory-dmd) | 34.9 GB | World expansion |
+| Qwen3-VL-8B-Instruct | 17.5 GB | vLLM trajectory planning |
+| facebook/sam3 | 6.9 GB | Semantic segmentation |
+| Ruicheng/moge-2-vitl-normal | 1.3 GB | Monocular depth |
+
+Total: ~235 GB
+
+## Storage Layout
+
+    /data/tasks/{task_id}/
+    +-- input/                    # Uploaded input files
+    +-- scene/                    # Pipeline scene directory
+    +-- output/                   # Final artifacts (ply, spz, glb)
+    +-- logs/                     # Per-stage log files
+    +-- task.json                 # Task metadata snapshot
+
+    /models/hf-cache/             # HuggingFace model cache (PVC)
+
+## Docker Image
+
+Based on pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel. All CUDA extensions are compiled at build time:
+
+- gsplat_maskgaussian (custom gsplat fork with MaskGaussian)
+- navmesh (recastnavigation)
+- flash-attn (FlashAttention-2)
+- nerfview, fused-ssim, spz, pytorch3d, MoGe
+
+## Key Decisions
+
+1. Single Pod with 5 GPUs - no multi-pod distribution complexity
+2. Serial task execution for worldgen (one at a time), worldrecon can interleave
+3. vLLM TP=1 on GPU 0 with 60% memory utilization limit
+4. 3DGS training steps scaled by factor 1.6 (8 GPU -> 5 GPU adjustment)
+5. GaussianSplats3D three.js plugin for browser-based 3DGS preview

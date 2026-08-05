@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Node
+node_modules/
+web/dist/
+
+# SQLite
+*.db
+*.db-journal
+
+# Task data (runtime)
+workdir/
+data/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Env
+.env
+.env.local

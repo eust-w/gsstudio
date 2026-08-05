@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gsstudio
+  namespace: gsstudio
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "2g"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/websocket-services: "gsstudio"
+spec:
+  # ingressClassName: nginx  # Uncomment for your cluster
+  rules:
+    - host: gsstudio.poc.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gsstudio
+                port:
+                  number: 80

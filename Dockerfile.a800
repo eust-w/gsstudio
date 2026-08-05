@@ -1,0 +1,117 @@
+# syntax=docker/dockerfile:1
+# GSStudio all-in-one image for 5x A800-SXM4-80GB
+# Base: PyTorch 2.7.1 + CUDA 12.8 (devel for compiling CUDA extensions)
+
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HOME=/models/hf-cache \
+    GSSTUDIO_DATA_DIR=/data/tasks \
+    GSSTUDIO_HF_HOME=/models/hf-cache \
+    GSSTUDIO_HYWORLD_REPO=/opt/hyworld2 \
+    GSSTUDIO_NUM_GPUS=5 \
+    GSSTUDIO_PORT=8000 \
+    VLLM_PORT=8100 \
+    VLLM_MODEL=Qwen/Qwen3-VL-8B-Instruct
+
+# ---------------------------------------------------------------------------
+# System dependencies
+# ---------------------------------------------------------------------------
+RUN apt-get update && apt-get install --yes --no-install-recommends \
+        build-essential \
+        cmake \
+        git \
+        git-lfs \
+        ffmpeg \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender-dev \
+        libgomp1 \
+        wget \
+        curl \
+        supervisor \
+        nodejs \
+        npm \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Clone HY-World-2.0
+# ---------------------------------------------------------------------------
+RUN git clone --recursive https://github.com/Tencent-Hunyuan/HY-World-2.0 /opt/hyworld2
+
+WORKDIR /opt/hyworld2
+
+# ---------------------------------------------------------------------------
+# Python dependencies (main requirements)
+# ---------------------------------------------------------------------------
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ---------------------------------------------------------------------------
+# CUDA extensions (compile at build time)
+# ---------------------------------------------------------------------------
+
+# 1. Custom gsplat with MaskGaussian
+RUN cd /opt/hyworld2/hyworld2/worldgen/third_party/gsplat_maskgaussian \
+    && pip install --no-cache-dir -e . --no-build-isolation
+
+# 2. Navmesh (recastnavigation)
+RUN cd /opt/hyworld2/hyworld2/worldgen/third_party/navmesh \
+    && pip install --no-cache-dir . --no-build-isolation
+
+# 3. FlashAttention-2
+RUN pip install --no-cache-dir flash-attn --no-build-isolation
+
+# 4. Git-based dependencies (nerfview, fused-ssim, spz, pytorch3d, MoGe)
+RUN pip install --no-cache-dir --no-build-isolation -r requirements_git.txt
+
+# ---------------------------------------------------------------------------
+# vLLM for Qwen3-VL serving
+# ---------------------------------------------------------------------------
+RUN pip install --no-cache-dir vllm
+
+# ---------------------------------------------------------------------------
+# GSStudio server dependencies
+# ---------------------------------------------------------------------------
+RUN pip install --no-cache-dir \
+        fastapi \
+        uvicorn[standard] \
+        python-multipart \
+        aiofiles \
+        websockets
+
+# ---------------------------------------------------------------------------
+# Build frontend
+# ---------------------------------------------------------------------------
+COPY web/package.json web/package-lock.json* /app/web/
+WORKDIR /app/web
+RUN npm install
+
+COPY web/ /app/web/
+RUN npm run build
+
+# ---------------------------------------------------------------------------
+# Copy GSStudio server code
+# ---------------------------------------------------------------------------
+COPY server/ /app/server/
+
+WORKDIR /app
+
+# ---------------------------------------------------------------------------
+# Supervisor config for multi-process (API + vLLM)
+# ---------------------------------------------------------------------------
+COPY deploy/supervisord.conf /etc/supervisor/conf.d/gsstudio.conf
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+COPY deploy/scripts/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+EXPOSE 8000 8100
+
+ENTRYPOINT ["/app/entrypoint.sh"]

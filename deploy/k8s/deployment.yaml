@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gsstudio
+  namespace: gsstudio
+  labels:
+    app: gsstudio
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: gsstudio
+  template:
+    metadata:
+      labels:
+        app: gsstudio
+    spec:
+      containers:
+        - name: gsstudio
+          image: gsstudio:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+            - name: vllm
+              containerPort: 8100
+              protocol: TCP
+          env:
+            - name: GSSTUDIO_PORT
+              value: "8000"
+            - name: GSSTUDIO_DATA_DIR
+              value: "/data/tasks"
+            - name: GSSTUDIO_HF_HOME
+              value: "/models/hf-cache"
+            - name: GSSTUDIO_HYWORLD_REPO
+              value: "/opt/hyworld2"
+            - name: GSSTUDIO_NUM_GPUS
+              value: "5"
+            - name: GSSTUDIO_MOCK_PIPELINE
+              value: "false"
+            - name: VLLM_PORT
+              value: "8100"
+            - name: VLLM_MODEL
+              value: "Qwen/Qwen3-VL-8B-Instruct"
+            - name: HF_HOME
+              value: "/models/hf-cache"
+          resources:
+            requests:
+              cpu: "16"
+              memory: 64Gi
+              nvidia.com/gpu: "5"
+            limits:
+              cpu: "32"
+              memory: 128Gi
+              nvidia.com/gpu: "5"
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /models/hf-cache
+            - name: workdir
+              mountPath: /data/tasks
+            - name: dshm
+              mountPath: /dev/shm
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: hf-cache
+          persistentVolumeClaim:
+            claimName: gsstudio-hf-cache
+        - name: workdir
+          persistentVolumeClaim:
+            claimName: gsstudio-workdir
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      restartPolicy: Always
