@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+# GSStudio lightweight image - Python backend + static frontend only.
+# No CUDA extensions compiled; runs with GSSTUDIO_MOCK_PIPELINE=true by default.
+# Use Dockerfile.a800 for real GPU pipeline execution.
+
+FROM python:3.11-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    GSSTUDIO_DATA_DIR=/data/tasks \
+    GSSTUDIO_NUM_GPUS=5 \
+    GSSTUDIO_PORT=8000 \
+    GSSTUDIO_MOCK_PIPELINE=true
+
+WORKDIR /app
+
+# Install server dependencies
+COPY server/ ./server/
+RUN pip install --no-cache-dir fastapi "uvicorn[standard]" python-multipart aiofiles websockets pydantic
+
+# Copy pre-built frontend (build locally with: cd web && npm install && npm run build)
+COPY web/dist/ ./web/dist/
+
+EXPOSE 8000
+
+CMD ["python", "-m", "uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8000"]

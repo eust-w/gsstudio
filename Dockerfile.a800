@@ -15,7 +15,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GSSTUDIO_NUM_GPUS=5 \
     GSSTUDIO_PORT=8000 \
     VLLM_PORT=8100 \
-    VLLM_MODEL=Qwen/Qwen3-VL-8B-Instruct
+    VLLM_MODEL=Qwen/Qwen3-VL-8B-Instruct \
+    TORCH_CUDA_ARCH_LIST="8.0" \
+    PYTHONPATH=/opt/hyworld2
 
 # ---------------------------------------------------------------------------
 # System dependencies
@@ -35,8 +37,6 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
         wget \
         curl \
         supervisor \
-        nodejs \
-        npm \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -44,12 +44,19 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
 # ---------------------------------------------------------------------------
 RUN git clone --recursive https://github.com/Tencent-Hunyuan/HY-World-2.0 /opt/hyworld2
 
+# glm is an undeclared gitlink inside gsplat_maskgaussian; fetch it explicitly
+RUN rm -rf /opt/hyworld2/hyworld2/worldgen/third_party/gsplat_maskgaussian/gsplat/cuda/csrc/third_party/glm \
+    && git clone --depth 1 --branch 1.0.1 https://github.com/g-truc/glm.git \
+       /opt/hyworld2/hyworld2/worldgen/third_party/gsplat_maskgaussian/gsplat/cuda/csrc/third_party/glm
+
 WORKDIR /opt/hyworld2
 
 # ---------------------------------------------------------------------------
 # Python dependencies (main requirements)
 # ---------------------------------------------------------------------------
-RUN pip install --no-cache-dir -r requirements.txt
+# cupy==13.6.0 is source-only on PyPI; use the prebuilt CUDA-12 wheel instead
+RUN sed -i 's/^cupy==13.6.0/cupy-cuda12x==13.6.0/' requirements.txt \
+    && pip install --no-cache-dir -r requirements.txt
 
 # ---------------------------------------------------------------------------
 # CUDA extensions (compile at build time)
@@ -64,15 +71,19 @@ RUN cd /opt/hyworld2/hyworld2/worldgen/third_party/navmesh \
     && pip install --no-cache-dir . --no-build-isolation
 
 # 3. FlashAttention-2
-RUN pip install --no-cache-dir flash-attn --no-build-isolation
+RUN TORCH_CUDA_ARCH_LIST="8.0" MAX_JOBS=8 pip install --no-cache-dir flash-attn --no-build-isolation
 
 # 4. Git-based dependencies (nerfview, fused-ssim, spz, pytorch3d, MoGe)
 RUN pip install --no-cache-dir --no-build-isolation -r requirements_git.txt
 
 # ---------------------------------------------------------------------------
-# vLLM for Qwen3-VL serving
+# vLLM for Qwen3-VL serving -- ISOLATED VENV
+# vLLM >= 0.11.0 (first release with native Qwen3-VL) requires torch==2.8.0
+# and transformers<5, which conflicts with HY-World's main env
+# (torch 2.7.1 + transformers 5.2.0). The pipeline only talks to vLLM over
+# HTTP, so we install it into a dedicated venv.
 # ---------------------------------------------------------------------------
-RUN pip install --no-cache-dir vllm
+RUN python -m venv /opt/vllm && /opt/vllm/bin/pip install --no-cache-dir --upgrade pip && /opt/vllm/bin/pip install --no-cache-dir "transformers==4.57.6" "vllm==0.11.0"
 
 # ---------------------------------------------------------------------------
 # GSStudio server dependencies
@@ -85,14 +96,9 @@ RUN pip install --no-cache-dir \
         websockets
 
 # ---------------------------------------------------------------------------
-# Build frontend
+# Copy pre-built frontend (built locally with: cd web && npm install && npm run build)
 # ---------------------------------------------------------------------------
-COPY web/package.json web/package-lock.json* /app/web/
-WORKDIR /app/web
-RUN npm install
-
-COPY web/ /app/web/
-RUN npm run build
+COPY web/dist/ /app/web/dist/
 
 # ---------------------------------------------------------------------------
 # Copy GSStudio server code
