@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gsstudio
+  namespace: gsstudio
+  labels:
+    app: gsstudio
+    variant: gpu
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: gsstudio
+  template:
+    metadata:
+      labels:
+        app: gsstudio
+        variant: gpu
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: "192.168.80.136"
+      containers:
+        - name: gsstudio
+          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v2
+          imagePullPolicy: IfNotPresent
+          command: ["bash","-c"]
+          args:
+            - |
+              mkdir -p /data/tasks /models/hf-cache
+              # Start API server (worker uses real pipeline)
+              cd /app && python -m uvicorn server.main:app --host 0.0.0.0 --port 8000 &
+              # Start vLLM (background, GPU 0, isolated venv)
+              CUDA_VISIBLE_DEVICES=0 /opt/vllm/bin/python -m vllm.entrypoints.openai.api_server \
+                --model $VLLM_MODEL --served-model-name $VLLM_MODEL \
+                --port $VLLM_PORT --host 0.0.0.0 \
+                --tensor-parallel-size 1 \
+                --max-model-len 32768 \
+                --trust-remote-code \
+                --gpu-memory-utilization 0.60 \
+                --disable-log-requests &
+              wait
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+            - name: vllm
+              containerPort: 8100
+              protocol: TCP
+          env:
+            - name: GSSTUDIO_PORT
+              value: "8000"
+            - name: GSSTUDIO_DATA_DIR
+              value: "/data/tasks"
+            - name: GSSTUDIO_HF_HOME
+              value: "/models/hf-cache"
+            - name: HF_HOME
+              value: "/models/hf-cache"
+            - name: GSSTUDIO_HYWORLD_REPO
+              value: "/opt/hyworld2"
+            - name: GSSTUDIO_NUM_GPUS
+              value: "5"
+            - name: GSSTUDIO_MOCK_PIPELINE
+              value: "false"
+            - name: VLLM_PORT
+              value: "8100"
+            - name: VLLM_MODEL
+              value: "Qwen/Qwen3-VL-8B-Instruct"
+            - name: PYTHONPATH
+              value: "/opt/hyworld2"
+            - name: TORCH_CUDA_ARCH_LIST
+              value: "8.0"
+          resources:
+            requests:
+              cpu: "8"
+              memory: 32Gi
+              nvidia.com/gpu: 5
+            limits:
+              cpu: "32"
+              memory: 64Gi
+              nvidia.com/gpu: 5
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: models
+              mountPath: /models
+            - name: dshm
+              mountPath: /dev/shm
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 60
+      volumes:
+        - name: data
+          hostPath:
+            path: /home/cce/gsstudio/data
+            type: DirectoryOrCreate
+        - name: models
+          hostPath:
+            path: /home/cce/gsstudio/models
+            type: DirectoryOrCreate
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      imagePullSecrets:
+        - name: gsstudio-registry

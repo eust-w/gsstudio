@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gsstudio
+  namespace: gsstudio
+  labels:
+    app: gsstudio
+    variant: lite
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: gsstudio
+  template:
+    metadata:
+      labels:
+        app: gsstudio
+        variant: lite
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: "192.168.80.136"
+      containers:
+        - name: gsstudio
+          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:lite-235a5b9
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: GSSTUDIO_PORT
+              value: "8000"
+            - name: GSSTUDIO_DATA_DIR
+              value: "/data/tasks"
+            - name: GSSTUDIO_NUM_GPUS
+              value: "5"
+            - name: GSSTUDIO_MOCK_PIPELINE
+              value: "true"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "8"
+              memory: 8Gi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: data
+          hostPath:
+            path: /home/cce/gsstudio-data
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gsstudio
+  namespace: gsstudio
+  labels:
+    app: gsstudio
+spec:
+  selector:
+    app: gsstudio
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+      protocol: TCP
