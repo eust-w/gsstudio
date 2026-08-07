@@ -77,3 +77,16 @@ Based on pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel. All CUDA extensions are co
 3. vLLM TP=1 on GPU 0 with 60% memory utilization limit
 4. 3DGS training steps scaled by factor 1.6 (8 GPU -> 5 GPU adjustment)
 5. GaussianSplats3D three.js plugin for browser-based 3DGS preview
+6. vLLM isolated in dedicated venv (/opt/vllm): vLLM 0.11.0 is the first
+   release with native Qwen3-VL support and requires torch 2.8.0 +
+   transformers <5, which conflicts with the main HY-World env
+   (torch 2.7.1 + transformers 5.2.0). Pipeline talks to vLLM only over HTTP.
+
+## Deployment Status (verified)
+
+- Image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v3
+- Pod: gsstudio ns, 1/1 Running, 5x A800 on node 192.168.80.136
+- vLLM 0.11.0 Qwen3-VL-8B: chat completion verified working
+- worldrecon e2e via API verified: 8 images -> gaussians.ply (82MB, 1.21M
+  vertices) + points.ply + depth/normal/camera in ~45s (warm) 
+- frontend served at / (static build), artifacts download verified
