@@ -23,24 +23,9 @@ spec:
         kubernetes.io/hostname: "192.168.80.136"
       containers:
         - name: gsstudio
-          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v2
+          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v4
           imagePullPolicy: IfNotPresent
-          command: ["bash","-c"]
-          args:
-            - |
-              mkdir -p /data/tasks /models/hf-cache
-              # Start API server (worker uses real pipeline)
-              cd /app && python -m uvicorn server.main:app --host 0.0.0.0 --port 8000 &
-              # Start vLLM (background, GPU 0, isolated venv)
-              CUDA_VISIBLE_DEVICES=0 /opt/vllm/bin/python -m vllm.entrypoints.openai.api_server \
-                --model $VLLM_MODEL --served-model-name $VLLM_MODEL \
-                --port $VLLM_PORT --host 0.0.0.0 \
-                --tensor-parallel-size 1 \
-                --max-model-len 32768 \
-                --trust-remote-code \
-                --gpu-memory-utilization 0.60 \
-                --disable-log-requests &
-              wait
+          command: ["/app/entrypoint.sh"]
           ports:
             - name: http
               containerPort: 8000
@@ -63,6 +48,8 @@ spec:
               value: "5"
             - name: GSSTUDIO_MOCK_PIPELINE
               value: "false"
+            - name: GSSTUDIO_MANAGE_VLLM
+              value: "true"
             - name: VLLM_PORT
               value: "8100"
             - name: VLLM_MODEL

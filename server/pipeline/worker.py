@@ -4,9 +4,8 @@ from __future__ import annotations
 from typing import Optional
 
 import asyncio
-import json
 import logging
-from datetime import datetime, timezone
+import urllib.request
 from pathlib import Path
 
 from ..config import Config
@@ -35,7 +34,70 @@ class PipelineWorker:
         self._running = False
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._current_task_id: Optional[str] = None
+        self._vllm_stopped = False
 
+    # ------------------------------------------------------------------
+    # vLLM lifecycle management (via supervisord)
+    #
+    # The 80B panogen stage shards weights across all 5 GPUs
+    # (device_map="auto", ~34GB/GPU weights + activations), which does not
+    # fit alongside the resident vLLM process on GPU 0 (~45GB). We therefore
+    # stop vLLM before panogen and restart it afterwards (stages 1/2 need it
+    # for trajectory planning / captioning).
+    # ------------------------------------------------------------------
+    async def _supervisorctl(self, *args: str) -> tuple[bool, str]:
+        """Run supervisorctl; returns (success, combined output)."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "supervisorctl", *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+            return proc.returncode == 0, out.decode(errors="replace").strip()
+        except Exception as e:
+            logger.warning("supervisorctl %s failed: %s", args, e)
+            return False, str(e)
+
+    async def _vllm_healthy(self) -> bool:
+        url = f"http://{self.config.VLLM_HOST}:{self.config.VLLM_PORT}/health"
+        try:
+            resp = await asyncio.to_thread(urllib.request.urlopen, url, timeout=3)
+            ok = getattr(resp, "status", 200) == 200
+            resp.close()
+            return ok
+        except Exception:
+            return False
+
+    async def _stop_vllm(self) -> None:
+        """Stop vLLM to free GPU 0 VRAM before a full-5-GPU stage (panogen)."""
+        if not self.config.MANAGE_VLLM or self._vllm_stopped:
+            return
+        ok, out = await self._supervisorctl("stop", "vllm")
+        logger.info("supervisorctl stop vllm: ok=%s out=%s", ok, out)
+        self._vllm_stopped = True
+        await asyncio.sleep(10)  # allow CUDA context teardown / VRAM release
+
+    async def _start_vllm(self) -> None:
+        """Restart vLLM and wait until its health endpoint responds."""
+        if not self.config.MANAGE_VLLM or not self._vllm_stopped:
+            return
+        ok, out = await self._supervisorctl("start", "vllm")
+        logger.info("supervisorctl start vllm: ok=%s out=%s", ok, out)
+        self._vllm_stopped = False
+        if not ok:
+            return
+        # Model load can take a few minutes.
+        for i in range(180):  # up to ~15 min
+            if await self._vllm_healthy():
+                logger.info("vLLM healthy again after restart (%ss)", i * 5)
+                return
+            await asyncio.sleep(5)
+        logger.warning("vLLM did not become healthy within timeout after restart")
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
     async def start(self):
         """Main worker loop: poll for pending tasks and execute serially."""
         self._running = True
@@ -43,7 +105,6 @@ class PipelineWorker:
 
         while self._running:
             try:
-                # Find next pending task
                 tasks, _ = list_tasks(self.config.DB_PATH, status="pending", limit=1)
                 if tasks:
                     task = tasks[0]
@@ -92,7 +153,6 @@ class PipelineWorker:
         task_config.setdefault("hf_home", self.config.HF_HOME)
         task_config.setdefault("num_gpus", self.config.NUM_GPUS)
 
-        # Set up stage list
         stage_names = get_stage_names(task_type)
         set_task_stages(self.config.DB_PATH, task_id, stage_names)
         update_task(self.config.DB_PATH, task_id, status=TaskStatus.RUNNING.value)
@@ -105,12 +165,10 @@ class PipelineWorker:
             else:
                 await self._execute_real(task_id, task_type, task_config, task_dir, scene_dir, input_dir, logs_dir, cancel_event)
 
-            # Check if cancelled
             if cancel_event.is_set():
                 update_task(self.config.DB_PATH, task_id, status=TaskStatus.CANCELLED.value)
                 return
 
-            # Collect artifacts
             artifacts = self._collect_artifacts(output_dir, scene_dir)
             update_task(
                 self.config.DB_PATH, task_id,
@@ -128,6 +186,11 @@ class PipelineWorker:
                 error=str(e),
             )
         finally:
+            # Make sure vLLM is restored even if the task failed mid-way.
+            try:
+                await self._start_vllm()
+            except Exception:
+                logger.exception("Failed to restore vLLM")
             self._cancel_events.pop(task_id, None)
             self._current_task_id = None
 
@@ -168,6 +231,10 @@ class PipelineWorker:
                 update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.SKIPPED)
                 continue
 
+            # panogen needs the full VRAM of all 5 GPUs -> pause vLLM first.
+            if stage_name == "panogen":
+                await self._stop_vllm()
+
             log_file = logs_dir / f"{stage_name}.log"
             update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.RUNNING)
 
@@ -185,10 +252,17 @@ class PipelineWorker:
                 update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.COMPLETED)
             else:
                 update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.FAILED, error=error)
+                # Even on failure, restore vLLM so later tasks can use it.
+                if stage_name == "panogen":
+                    await self._start_vllm()
                 raise RuntimeError(f"Stage {stage_name} failed: {error}")
 
+            # Restore vLLM once panogen (the only full-VRAM stage) finishes.
+            if stage_name == "panogen":
+                await self._start_vllm()
+
     async def _execute_mock(self, task_id, stage_names, cancel_event, task_dir, logs_dir):
-        """Execute mock pipeline for local development."""
+        """Mock pipeline for local development."""
         for stage_name in stage_names:
             if cancel_event.is_set():
                 return
@@ -198,18 +272,15 @@ class PipelineWorker:
                 update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.SKIPPED)
                 continue
 
-            log_file = logs_dir / f"{stage_name}.log"
+            log_file = task_dir / "logs" / f"{stage_name}.log"
             update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.RUNNING)
 
-            # Simulate stage execution with fake log lines
             fake_logs = [
                 f"[{stage_name}] Starting...",
                 f"[{stage_name}] Loading models...",
-                f"[{stage_name}] Processing...",
                 f"[{stage_name}] Progress: 25%",
                 f"[{stage_name}] Progress: 50%",
                 f"[{stage_name}] Progress: 75%",
-                f"[{stage_name}] Finalizing...",
                 f"[{stage_name}] Done.",
             ]
 
@@ -224,7 +295,6 @@ class PipelineWorker:
             marker.touch()
             update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.COMPLETED)
 
-        # Create fake output artifacts for preview testing
         output_dir = task_dir / "output"
         output_dir.mkdir(exist_ok=True)
         (output_dir / "result.ply").write_bytes(b"ply\nmock gaussian splatting data")
@@ -233,7 +303,6 @@ class PipelineWorker:
     def _collect_artifacts(self, output_dir: Path, scene_dir: Path) -> list[dict]:
         """Scan output and scene directories for artifacts."""
         artifacts = []
-
         for search_dir in (output_dir, scene_dir):
             if not search_dir.exists():
                 continue
@@ -249,5 +318,4 @@ class PipelineWorker:
                         "size": f.stat().st_size,
                         "type": ARTIFACT_TYPES[ext],
                     })
-
         return artifacts

@@ -22,6 +22,10 @@ class Config:
     VLLM_HOST: str = os.environ.get("VLLM_HOST", "localhost")
     VLLM_PORT: int = int(os.environ.get("VLLM_PORT", "8100"))
     VLLM_MODEL: str = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
+    # When true, the worker manages the vLLM sidecar lifecycle via
+    # supervisorctl (stop before panogen, restart after). Disable for
+    # local dev or when vLLM is managed externally.
+    MANAGE_VLLM: bool = os.environ.get("GSSTUDIO_MANAGE_VLLM", "true").lower() in ("true", "1", "yes")
 
     # Mock pipeline for local dev
     MOCK_PIPELINE: bool = os.environ.get("GSSTUDIO_MOCK_PIPELINE", "false").lower() in ("true", "1", "yes")
