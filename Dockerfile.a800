@@ -85,6 +85,19 @@ RUN pip install --no-cache-dir --no-build-isolation -r requirements_git.txt
 # ---------------------------------------------------------------------------
 RUN python -m venv /opt/vllm && /opt/vllm/bin/pip install --no-cache-dir --upgrade pip && /opt/vllm/bin/pip install --no-cache-dir "transformers==4.57.6" "vllm==0.11.0"
 
+# HY-Pano-2 requires Transformers 4.57.x while the main HY-World runtime
+# currently installs Transformers 5.x. Keep the panorama runtime isolated,
+# but reuse the base image's CUDA-enabled PyTorch to avoid a duplicate install.
+RUN python -m venv --system-site-packages /opt/panogen \
+    && /opt/panogen/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/panogen/bin/pip install --no-cache-dir \
+        "transformers[accelerate,tiktoken]==4.57.1" \
+        "diffusers==0.36.0" \
+        "safetensors==0.7.0" \
+        "tokenizers==0.22.0" \
+        "einops==0.8.1" \
+        loguru huggingface_hub gradio
+
 # ---------------------------------------------------------------------------
 # GSStudio server dependencies
 # ---------------------------------------------------------------------------

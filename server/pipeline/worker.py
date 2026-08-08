@@ -152,6 +152,7 @@ class PipelineWorker:
         task_config = task.get("config", {})
         task_config.setdefault("hf_home", self.config.HF_HOME)
         task_config.setdefault("num_gpus", self.config.NUM_GPUS)
+        task_config.setdefault("panogen_python", self.config.PANOGEN_PYTHON)
 
         stage_names = get_stage_names(task_type)
         set_task_stages(self.config.DB_PATH, task_id, stage_names)

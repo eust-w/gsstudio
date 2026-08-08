@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gsstudio-cloudflared
+  namespace: gsstudio
+  labels:
+    app: gsstudio-cloudflared
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gsstudio-cloudflared
+  template:
+    metadata:
+      labels:
+        app: gsstudio-cloudflared
+    spec:
+      containers:
+        - name: cloudflared
+          image: cloudflare/cloudflared:2026.7.0
+          args:
+            - tunnel
+            - --no-autoupdate
+            - --protocol
+            - http2
+            - --url
+            - http://gsstudio.gsstudio.svc.cluster.local:80
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi

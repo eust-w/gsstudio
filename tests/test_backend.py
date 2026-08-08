@@ -1,5 +1,6 @@
 """Backend tests for GSStudio."""
 import asyncio
+import base64
 import json
 import os
 import tempfile
@@ -10,10 +11,13 @@ import pytest
 # Set mock mode before importing server modules
 os.environ["GSSTUDIO_MOCK_PIPELINE"] = "true"
 os.environ["GSSTUDIO_DATA_DIR"] = tempfile.mkdtemp()
+os.environ["GSSTUDIO_BASIC_AUTH_USER"] = "poc-user"
+os.environ["GSSTUDIO_BASIC_AUTH_PASSWORD"] = "poc-password"
 
 from server.config import Config
 from server.db import create_task, get_task, init_db, list_tasks, set_task_stages, update_stage, update_task
 from server.models import StageStatus, TaskStatus
+from server.pipeline.worldgen import get_worldgen_commands
 
 
 @pytest.fixture
@@ -115,13 +119,55 @@ class TestCheckpointResume:
         assert (task_dir / ".stage_panogen_done").exists()
 
 
+class TestWorldgenCommands:
+    def test_panogen_uses_isolated_runtime_and_supported_attention(self, tmp_path):
+        commands = get_worldgen_commands(
+            task_dir=tmp_path / "task",
+            scene_dir=tmp_path / "scene",
+            input_dir=tmp_path / "input",
+            config={"panogen_python": "/opt/panogen/bin/python"},
+            hyworld_repo=Path("/opt/hyworld2"),
+            vllm_host="localhost",
+            vllm_port=8100,
+            vllm_model="Qwen/Qwen3-VL-8B-Instruct",
+        )
+
+        _, command, _, _ = commands[0]
+        assert command[0] == "/opt/panogen/bin/python"
+        assert command[command.index("--attn-impl") + 1] == "sdpa"
+
+
 class TestAPI:
     @pytest.fixture
     def client(self, cfg):
         from fastapi.testclient import TestClient
         from server.main import app
-        with TestClient(app) as c:
+        token = base64.b64encode(b"poc-user:poc-password").decode()
+        with TestClient(app, headers={"Authorization": f"Basic {token}"}) as c:
             yield c
+
+    def test_auth_rejects_missing_credentials(self, client):
+        resp = client.get("/api/tasks", headers={"Authorization": ""})
+        assert resp.status_code == 401
+        assert resp.headers["www-authenticate"] == 'Basic realm="GSStudio"'
+
+    def test_auth_rejects_wrong_credentials(self, client):
+        token = base64.b64encode(b"poc-user:wrong").decode()
+        resp = client.get("/api/tasks", headers={"Authorization": f"Basic {token}"})
+        assert resp.status_code == 401
+
+    def test_health_does_not_require_auth(self, client):
+        resp = client.get("/api/health", headers={"Authorization": ""})
+        assert resp.status_code == 200
+
+    def test_spa_deep_link_serves_frontend(self, client):
+        resp = client.get("/tasks/example-task")
+        assert resp.status_code == 200
+        assert "<title>GSStudio</title>" in resp.text
+
+    def test_unknown_api_route_remains_not_found(self, client):
+        resp = client.get("/api/does-not-exist")
+        assert resp.status_code == 404
 
     def test_health(self, client):
         resp = client.get("/api/health")
