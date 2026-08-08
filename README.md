@@ -49,10 +49,9 @@ The TLS endpoint uses a Cloudflare Quick Tunnel. Its URL remains valid while
 the `gsstudio-cloudflared` pod is running; recreating that pod generates a new
 URL.
 
-The username is `gsstudio`. The generated password is stored in macOS
-Keychain under service `gsstudio-poc-basic-auth` and is also injected into the
-cluster through the `gsstudio-basic-auth` Kubernetes Secret. It is never stored
-in Git.
+The username is `digua`. The password is stored in macOS Keychain under account
+`digua`, service `gsstudio-poc-basic-auth`, and is also injected into the cluster
+through the `gsstudio-basic-auth` Kubernetes Secret. It is never stored in Git.
 
 Full panorama/text world generation also uses the gated `facebook/sam3` model.
 Accept its Hugging Face access terms, then provide the approved token through
