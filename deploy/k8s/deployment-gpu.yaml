@@ -98,30 +98,6 @@ spec:
               port: 8000
             initialDelaySeconds: 30
             periodSeconds: 60
-        - name: caddy
-          image: caddy:2.10.2-alpine
-          command: ["caddy"]
-          args: ["run", "--config", "/etc/caddy/caddy.json"]
-          ports:
-            - name: caddy-http
-              containerPort: 80
-              protocol: TCP
-            - name: caddy-https
-              containerPort: 443
-              protocol: TCP
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: "1"
-              memory: 512Mi
-          volumeMounts:
-            - name: caddy-data
-              mountPath: /data
-            - name: caddy-config
-              mountPath: /etc/caddy
-              readOnly: true
       volumes:
         - name: data
           hostPath:
@@ -135,12 +111,5 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 16Gi
-        - name: caddy-data
-          hostPath:
-            path: /home/cce/gsstudio/caddy
-            type: DirectoryOrCreate
-        - name: caddy-config
-          configMap:
-            name: gsstudio-caddy
       imagePullSecrets:
         - name: gsstudio-registry
