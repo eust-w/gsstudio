@@ -6,6 +6,7 @@ from typing import Optional
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
@@ -52,6 +53,13 @@ async def create_task_endpoint(
     # Validate task type
     if type not in ("worldgen", "worldgen_from_pano", "worldrecon"):
         raise HTTPException(400, f"Invalid task type: {type}")
+
+    if type in ("worldgen", "worldgen_from_pano") and not os.environ.get("HF_TOKEN"):
+        raise HTTPException(
+            503,
+            "World generation requires approved access to facebook/sam3. "
+            "Configure the gsstudio-huggingface Kubernetes Secret first.",
+        )
 
     # Parse config
     try:

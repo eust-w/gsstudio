@@ -76,7 +76,10 @@ Based on pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel. All CUDA extensions are co
 2. Serial task execution for worldgen (one at a time), worldrecon can interleave
 3. vLLM TP=1 on GPU 0 with 60% memory utilization limit
 4. 3DGS training steps scaled by factor 1.6 (8 GPU -> 5 GPU adjustment)
-5. GaussianSplats3D three.js plugin for browser-based 3DGS preview
+5. Spark 2.1 viewer for browser-based 3DGS preview: the viewer mounts as soon
+   as a task is opened and streams/decompresses splat data in a Web Worker with
+   visible byte progress and dynamic LoD. Paged coarse-to-fine rendering can be
+   added later by publishing prebuilt RAD/RADC artifacts.
 6. vLLM isolated in dedicated venv (/opt/vllm): vLLM 0.11.0 is the first
    release with native Qwen3-VL support and requires torch 2.8.0 +
    transformers <5, which conflicts with the main HY-World env
@@ -84,7 +87,7 @@ Based on pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel. All CUDA extensions are co
 
 ## Deployment Status (verified)
 
-- Image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v9
+- Image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v10
 - Pod: gsstudio ns, 1/1 Running, 5x A800 on node 192.168.80.136
 - Public IP URL: http://120.48.33.45 (CCE load balancer + Basic Auth)
 - TLS URL: https://geneva-ingredients-expression-located.trycloudflare.com (Cloudflare Tunnel TLS + Basic Auth)
