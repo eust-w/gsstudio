@@ -3,6 +3,7 @@ import asyncio
 import base64
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -17,6 +18,7 @@ os.environ["GSSTUDIO_BASIC_AUTH_PASSWORD"] = "poc-password"
 from server.config import Config
 from server.db import create_task, get_task, init_db, list_tasks, set_task_stages, update_stage, update_task
 from server.models import StageStatus, TaskStatus
+from server.pipeline.stage_runner import run_stage
 from server.pipeline.worldgen import get_worldgen_commands
 
 
@@ -135,6 +137,37 @@ class TestWorldgenCommands:
         _, command, _, _ = commands[0]
         assert command[0] == "/opt/panogen/bin/python"
         assert command[command.index("--attn-impl") + 1] == "sdpa"
+
+
+class TestStageRunner:
+    def test_stage_accepts_log_lines_larger_than_asyncio_default_limit(self, tmp_path):
+        log_file = tmp_path / "long-line.log"
+        payload_size = 128 * 1024
+
+        success, error = asyncio.run(
+            run_stage(
+                stage_name="long-line",
+                cmd=[
+                    sys.executable,
+                    "-c",
+                    f"import sys; sys.stdout.write('x' * {payload_size}); sys.stdout.flush()",
+                ],
+                log_file=log_file,
+            )
+        )
+
+        assert success, error
+        assert log_file.stat().st_size == payload_size + 1
+
+
+class TestFrontendViewerContract:
+    def test_splat_viewer_starts_after_scene_load(self):
+        source = (Path(__file__).parents[1] / "web/src/components/SplatViewer.tsx").read_text()
+
+        scene_loaded_at = source.index("await viewer.addSplatScene")
+        viewer_started_at = source.index("viewer.start()")
+
+        assert viewer_started_at > scene_loaded_at
 
 
 class TestAPI:
