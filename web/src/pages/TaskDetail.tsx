@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   cancelTask,
@@ -9,9 +9,10 @@ import {
 } from "../api";
 import LogStream from "../components/LogStream";
 import PanoViewer from "../components/PanoViewer";
-import SplatViewer from "../components/SplatViewer";
 import StageProgress from "../components/StageProgress";
 import StatusBadge from "../components/StatusBadge";
+
+const SplatViewer = lazy(() => import("../components/SplatViewer"));
 
 export default function TaskDetail() {
   const { taskId } = useParams<{ taskId: string }>();
@@ -25,6 +26,14 @@ export default function TaskDetail() {
     try {
       const data = await getTask(taskId);
       setTask(data);
+      setActivePreview((current) => {
+        const available = [
+          data.artifacts.some((artifact) => artifact.type === "image" && artifact.name.includes("pano")) && "panorama",
+          data.artifacts.some((artifact) => artifact.type === "video") && "video",
+          data.artifacts.some((artifact) => artifact.type === "3dgs") && "3dgs",
+        ].filter(Boolean) as string[];
+        return available.includes(current) ? current : (available[0] ?? current);
+      });
       setError("");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load task");
@@ -151,7 +160,9 @@ export default function TaskDetail() {
               </video>
             )}
             {activePreview === "3dgs" && splatArtifacts.length > 0 && (
-              <SplatViewer url={getArtifactUrl(task.id, splatArtifacts[0].path)} />
+              <Suspense fallback={<div className="viewer-loading">Preparing streaming viewer…</div>}>
+                <SplatViewer url={getArtifactUrl(task.id, splatArtifacts[0].path)} />
+              </Suspense>
             )}
           </div>
 

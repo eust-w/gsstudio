@@ -161,13 +161,13 @@ class TestStageRunner:
 
 
 class TestFrontendViewerContract:
-    def test_splat_viewer_starts_after_scene_load(self):
+    def test_splat_viewer_uses_spark_streaming_lod_loader(self):
         source = (Path(__file__).parents[1] / "web/src/components/SplatViewer.tsx").read_text()
 
-        scene_loaded_at = source.index("await viewer.addSplatScene")
-        viewer_started_at = source.index("viewer.start()")
-
-        assert viewer_started_at > scene_loaded_at
+        assert 'from "@sparkjsdev/spark"' in source
+        assert "new SplatMesh" in source
+        assert "lod: true" in source
+        assert "onProgress" in source
 
 
 class TestAPI:
@@ -227,6 +227,27 @@ class TestAPI:
         assert resp.status_code == 200
         assert resp.json()["name"] == "test-api-task"
 
+    @pytest.mark.parametrize(
+        ("task_type", "upload_field"),
+        [("worldgen", "image"), ("worldgen_from_pano", "panorama")],
+    )
+    def test_world_generation_fails_fast_without_sam3_access_token(
+        self, client, monkeypatch, task_type, upload_field
+    ):
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+
+        resp = client.post(
+            "/api/tasks",
+            data={"type": task_type, "name": "missing-sam3-token", "config": "{}"},
+            files={upload_field: ("input.png", b"image-bytes", "image/png")},
+        )
+
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == (
+            "World generation requires approved access to facebook/sam3. "
+            "Configure the gsstudio-huggingface Kubernetes Secret first."
+        )
+
     def test_get_task_not_found(self, client):
         resp = client.get("/api/tasks/nonexistent")
         assert resp.status_code == 404
@@ -240,7 +261,7 @@ class TestAPI:
 
     def test_cancel_task(self, client):
         resp = client.post("/api/tasks", data={
-            "type": "worldgen",
+            "type": "worldrecon",
             "name": "cancel-test",
             "config": "{}",
         })

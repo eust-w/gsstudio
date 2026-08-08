@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { getArtifactUrl } from "../api";
-import SplatViewer from "../components/SplatViewer";
+
+const SplatViewer = lazy(() => import("../components/SplatViewer"));
 
 export default function ViewerPage() {
   const { taskId, artifactPath } = useParams<{ taskId: string; artifactPath: string }>();
@@ -25,7 +26,9 @@ export default function ViewerPage() {
         </Link>
       </div>
       <div className="viewer-container">
-        <SplatViewer url={url} />
+        <Suspense fallback={<div className="viewer-loading">Preparing streaming viewer…</div>}>
+          <SplatViewer url={url} />
+        </Suspense>
       </div>
     </div>
   );
