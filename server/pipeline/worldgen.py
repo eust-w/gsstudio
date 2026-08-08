@@ -63,9 +63,11 @@ def get_worldgen_commands(
         input_image = input_dir / config.get("input_image", "input.png")
         pano_output = scene_dir / "panorama.png"
         panogen_cmd = [
-            "python", str(panogen_dir / "pipeline.py"),
+            config.get("panogen_python", "/opt/panogen/bin/python"),
+            str(panogen_dir / "pipeline.py"),
             "--image", str(input_image),
             "--save", str(pano_output),
+            "--attn-impl", "sdpa",
         ]
         if config.get("prompt"):
             panogen_cmd.extend(["--prompt", config["prompt"]])

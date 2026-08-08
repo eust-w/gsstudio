@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gsstudio-caddy
+  namespace: gsstudio
+data:
+  caddy.json: |
+    {
+      "admin": {"disabled": true},
+      "apps": {
+        "http": {
+          "servers": {
+            "gsstudio": {
+              "listen": [":443"],
+              "routes": [
+                {
+                  "match": [{"host": ["gsstudio.180.76.58.158.nip.io"]}],
+                  "handle": [{
+                    "handler": "reverse_proxy",
+                    "upstreams": [{"dial": "127.0.0.1:8000"}]
+                  }],
+                  "terminal": true
+                },
+                {
+                  "handle": [{
+                    "handler": "static_response",
+                    "status_code": 200,
+                    "body": "ok\n"
+                  }],
+                  "terminal": true
+                }
+              ],
+              "tls_connection_policies": [{
+                "default_sni": "gsstudio.180.76.58.158.nip.io"
+              }]
+            }
+          }
+        }
+      }
+    }

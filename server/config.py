@@ -7,6 +7,8 @@ class Config:
     # Server
     HOST: str = os.environ.get("GSSTUDIO_HOST", "0.0.0.0")
     PORT: int = int(os.environ.get("GSSTUDIO_PORT", "8000"))
+    BASIC_AUTH_USER: str = os.environ.get("GSSTUDIO_BASIC_AUTH_USER", "")
+    BASIC_AUTH_PASSWORD: str = os.environ.get("GSSTUDIO_BASIC_AUTH_PASSWORD", "")
 
     # Data directories
     DATA_DIR: Path = Path(os.environ.get("GSSTUDIO_DATA_DIR", "./data"))
@@ -14,6 +16,7 @@ class Config:
 
     # HY-World-2.0 repo path
     HYWORLD_REPO: Path = Path(os.environ.get("GSSTUDIO_HYWORLD_REPO", "/opt/hyworld2"))
+    PANOGEN_PYTHON: str = os.environ.get("GSSTUDIO_PANOGEN_PYTHON", "/opt/panogen/bin/python")
 
     # GPU
     NUM_GPUS: int = int(os.environ.get("GSSTUDIO_NUM_GPUS", "5"))

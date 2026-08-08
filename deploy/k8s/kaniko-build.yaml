@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gsstudio-kaniko-build
+  namespace: gsstudio
+spec:
+  nodeName: 192.168.80.136
+  restartPolicy: Never
+  containers:
+    - name: kaniko
+      image: gcr.io/kaniko-project/executor:v1.23.2
+      args:
+        - --dockerfile=/build-context/Dockerfile.a800
+        - --context=dir:///build-context
+        - --destination=ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v7
+        - --cache=true
+        - --cache-repo=ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio-cache
+        - --snapshot-mode=redo
+      resources:
+        requests:
+          cpu: "8"
+          memory: 16Gi
+        limits:
+          cpu: "16"
+          memory: 48Gi
+      volumeMounts:
+        - name: build-context
+          mountPath: /build-context
+        - name: docker-config
+          mountPath: /kaniko/.docker
+  volumes:
+    - name: build-context
+      hostPath:
+        path: /home/cce/gsstudio/build-context
+        type: Directory
+    - name: docker-config
+      secret:
+        secretName: gsstudio-registry
+        items:
+          - key: .dockerconfigjson
+            path: config.json

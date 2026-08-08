@@ -84,8 +84,9 @@ Based on pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel. All CUDA extensions are co
 
 ## Deployment Status (verified)
 
-- Image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v3
-- Pod: gsstudio ns, 1/1 Running, 5x A800 on node 192.168.80.136
+- Image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v7
+- Pod: gsstudio ns, 2/2 Running, 5x A800 on node 192.168.80.136
+- Public URL: https://geneva-ingredients-expression-located.trycloudflare.com (Cloudflare Tunnel TLS + Basic Auth)
 - vLLM 0.11.0 Qwen3-VL-8B: chat completion verified working
 - worldrecon e2e via API verified: 8 images -> gaussians.ply (82MB, 1.21M
   vertices) + points.ply + depth/normal/camera in ~45s (warm) 

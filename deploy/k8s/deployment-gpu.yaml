@@ -23,7 +23,7 @@ spec:
         kubernetes.io/hostname: "192.168.80.136"
       containers:
         - name: gsstudio
-          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v4
+          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v7
           imagePullPolicy: IfNotPresent
           command: ["/app/entrypoint.sh"]
           ports:
@@ -36,6 +36,16 @@ spec:
           env:
             - name: GSSTUDIO_PORT
               value: "8000"
+            - name: GSSTUDIO_BASIC_AUTH_USER
+              valueFrom:
+                secretKeyRef:
+                  name: gsstudio-basic-auth
+                  key: username
+            - name: GSSTUDIO_BASIC_AUTH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gsstudio-basic-auth
+                  key: password
             - name: GSSTUDIO_DATA_DIR
               value: "/data/tasks"
             - name: GSSTUDIO_HF_HOME
@@ -44,6 +54,8 @@ spec:
               value: "/models/hf-cache"
             - name: GSSTUDIO_HYWORLD_REPO
               value: "/opt/hyworld2"
+            - name: GSSTUDIO_PANOGEN_PYTHON
+              value: "/opt/panogen/bin/python"
             - name: GSSTUDIO_NUM_GPUS
               value: "5"
             - name: GSSTUDIO_MOCK_PIPELINE
@@ -86,6 +98,30 @@ spec:
               port: 8000
             initialDelaySeconds: 30
             periodSeconds: 60
+        - name: caddy
+          image: caddy:2.10.2-alpine
+          command: ["caddy"]
+          args: ["run", "--config", "/etc/caddy/caddy.json"]
+          ports:
+            - name: caddy-http
+              containerPort: 80
+              protocol: TCP
+            - name: caddy-https
+              containerPort: 443
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: caddy-data
+              mountPath: /data
+            - name: caddy-config
+              mountPath: /etc/caddy
+              readOnly: true
       volumes:
         - name: data
           hostPath:
@@ -99,5 +135,12 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 16Gi
+        - name: caddy-data
+          hostPath:
+            path: /home/cce/gsstudio/caddy
+            type: DirectoryOrCreate
+        - name: caddy-config
+          configMap:
+            name: gsstudio-caddy
       imagePullSecrets:
         - name: gsstudio-registry

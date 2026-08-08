@@ -9,14 +9,15 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
+from .auth import BasicAuthMiddleware
 from .config import Config
 from .db import init_db, list_tasks
 from .models import GPUInfo, GPUStatus, HealthResponse
 from .pipeline.worker import PipelineWorker
 from .routes import artifacts as artifacts_route
 from .routes import tasks as tasks_route
+from .static import SPAStaticFiles
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -58,6 +59,13 @@ app = FastAPI(
     description="HY-World 2.0 Full-Stack Web Platform",
     version="0.1.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    BasicAuthMiddleware,
+    username=config.BASIC_AUTH_USER,
+    password=config.BASIC_AUTH_PASSWORD,
+    exempt_paths=("/api/health",),
 )
 
 # CORS
@@ -116,5 +124,5 @@ async def gpu_status():
 # Serve frontend static files in production
 web_dist = Path(__file__).parent.parent / "web" / "dist"
 if web_dist.exists():
-    app.mount("/", StaticFiles(directory=str(web_dist), html=True), name="static")
+    app.mount("/", SPAStaticFiles(directory=str(web_dist), html=True), name="static")
     logger.info("Serving frontend from %s", web_dist)
