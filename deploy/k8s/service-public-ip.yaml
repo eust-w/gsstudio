@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: gsstudio-public-ip
+  namespace: gsstudio
+  labels:
+    app: gsstudio
+  annotations:
+    service.kubernetes.io/cce-update-in-time: "true"
+    service.beta.kubernetes.io/cce.listener.customized-listener: |-
+      {
+        "80": {
+          "protocol": "TCP",
+          "scheduler": "RoundRobin",
+          "timeout": "900"
+        }
+      }
+    service.beta.kubernetes.io/cce.listener.customized-health-check: |-
+      {
+        "80": {
+          "healthCheck": "TCP",
+          "healthCheckTimeoutInSecond": "3",
+          "healthCheckIntervalInSecond": "3",
+          "healthCheckDownRetry": "3",
+          "healthCheckUpRetry": "2"
+        }
+      }
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 120.48.33.45
+  externalTrafficPolicy: Local
+  selector:
+    app: gsstudio
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

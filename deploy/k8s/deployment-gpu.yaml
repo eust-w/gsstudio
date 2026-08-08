@@ -23,7 +23,7 @@ spec:
         kubernetes.io/hostname: "192.168.80.136"
       containers:
         - name: gsstudio
-          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v7
+          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v9
           imagePullPolicy: IfNotPresent
           command: ["/app/entrypoint.sh"]
           ports:
@@ -46,6 +46,12 @@ spec:
                 secretKeyRef:
                   name: gsstudio-basic-auth
                   key: password
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gsstudio-huggingface
+                  key: token
+                  optional: true
             - name: GSSTUDIO_DATA_DIR
               value: "/data/tasks"
             - name: GSSTUDIO_HF_HOME

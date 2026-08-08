@@ -48,6 +48,7 @@ export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) 
             if (!disposed) setProgress(pct);
           },
         });
+        viewer.start();
 
         if (!disposed) {
           setLoading(false);

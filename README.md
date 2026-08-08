@@ -36,17 +36,28 @@ Deploy to K8s:
 
 ### Public POC
 
-The authenticated HTTPS deployment is available at:
+The direct public-IP deployment is available at:
+
+    http://120.48.33.45
+
+The direct-IP endpoint is backed by a CCE load balancer and protected with HTTP
+Basic Auth. It is plain HTTP. For encrypted access on an untrusted network, use:
 
     https://geneva-ingredients-expression-located.trycloudflare.com
 
-This POC uses a Cloudflare Quick Tunnel. The URL remains valid while the
-`gsstudio-cloudflared` pod is running; recreating that pod generates a new URL.
+The TLS endpoint uses a Cloudflare Quick Tunnel. Its URL remains valid while
+the `gsstudio-cloudflared` pod is running; recreating that pod generates a new
+URL.
 
 The username is `gsstudio`. The generated password is stored in macOS
 Keychain under service `gsstudio-poc-basic-auth` and is also injected into the
 cluster through the `gsstudio-basic-auth` Kubernetes Secret. It is never stored
 in Git.
+
+Full panorama/text world generation also uses the gated `facebook/sam3` model.
+Accept its Hugging Face access terms, then provide the approved token through
+the optional `gsstudio-huggingface` Secret (`token` key). Multi-view
+reconstruction does not require this gated token.
 
 ### Smoke Test
 

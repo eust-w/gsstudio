@@ -33,6 +33,7 @@ async def run_stage(
             stderr=asyncio.subprocess.STDOUT,
             env=merged_env,
             cwd=str(cwd) if cwd else None,
+            limit=10 * 1024 * 1024,
         )
     except FileNotFoundError as e:
         return False, f"Command not found: {cmd[0]}: {e}"
