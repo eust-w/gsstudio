@@ -485,3 +485,61 @@ class TestAPI:
 
         assert resp.status_code == 409
         assert client.get(f"/api/tasks/{task_id}").status_code == 200
+
+    @pytest.mark.parametrize("retryable_status", [TaskStatus.FAILED, TaskStatus.CANCELLED])
+    def test_retry_task_resets_transient_state_and_preserves_checkpoints(
+        self, client, retryable_status
+    ):
+        from server.config import Config
+        from server.db import update_task
+
+        cfg = Config()
+        task_id = client.post("/api/tasks", data={
+            "type": "worldrecon",
+            "name": "retry-me",
+            "config": "{}",
+        }).json()["task_id"]
+        checkpoint = cfg.task_dir(task_id) / ".stage_traj_render_done"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.touch()
+        update_task(
+            cfg.DB_PATH,
+            task_id,
+            status=retryable_status.value,
+            progress=0.75,
+            current_stage="gs_training",
+            error="interrupted",
+        )
+
+        resp = client.post(f"/api/tasks/{task_id}/retry")
+
+        assert resp.status_code == 200
+        task = resp.json()
+        assert task["status"] == TaskStatus.PENDING.value
+        assert task["progress"] == 0.0
+        assert task["current_stage"] is None
+        assert task["error"] is None
+        assert checkpoint.exists()
+
+    @pytest.mark.parametrize(
+        "blocked_status",
+        [TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.COMPLETED],
+    )
+    def test_retry_task_rejects_non_retryable_status(self, client, blocked_status):
+        from server.config import Config
+        from server.db import update_task
+
+        cfg = Config()
+        task_id = client.post("/api/tasks", data={
+            "type": "worldrecon",
+            "name": "do-not-retry",
+            "config": "{}",
+        }).json()["task_id"]
+        update_task(cfg.DB_PATH, task_id, status=blocked_status.value)
+
+        resp = client.post(f"/api/tasks/{task_id}/retry")
+
+        assert resp.status_code == 409
+
+    def test_retry_missing_task_returns_not_found(self, client):
+        assert client.post("/api/tasks/missing/retry").status_code == 404
