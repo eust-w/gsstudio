@@ -50,6 +50,10 @@ class TaskCreate(BaseModel):
     config: dict = Field(default_factory=dict)
 
 
+class TaskUpdate(BaseModel):
+    name: str
+
+
 class ArtifactInfo(BaseModel):
     name: str
     path: str

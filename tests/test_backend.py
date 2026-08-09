@@ -421,3 +421,67 @@ class TestAPI:
 
         resp = client.post(f"/api/tasks/{task_id}/cancel")
         assert resp.status_code == 400
+
+    def test_update_task_name(self, client):
+        resp = client.post("/api/tasks", data={
+            "type": "worldrecon",
+            "name": "before-edit",
+            "config": "{}",
+        })
+        task_id = resp.json()["task_id"]
+
+        resp = client.patch(f"/api/tasks/{task_id}", json={"name": "after-edit"})
+
+        assert resp.status_code == 200
+        assert resp.json()["name"] == "after-edit"
+        assert client.get(f"/api/tasks/{task_id}").json()["name"] == "after-edit"
+
+    def test_update_task_rejects_blank_name(self, client):
+        task_id = client.post("/api/tasks", data={
+            "type": "worldrecon",
+            "name": "keep-me",
+            "config": "{}",
+        }).json()["task_id"]
+
+        resp = client.patch(f"/api/tasks/{task_id}", json={"name": "   "})
+
+        assert resp.status_code == 400
+        assert client.get(f"/api/tasks/{task_id}").json()["name"] == "keep-me"
+
+    def test_delete_completed_task_removes_record_and_files(self, client):
+        from server.config import Config
+        from server.db import update_task
+
+        cfg = Config()
+        task_id = client.post("/api/tasks", data={
+            "type": "worldrecon",
+            "name": "delete-me",
+            "config": "{}",
+        }).json()["task_id"]
+        task_dir = cfg.task_dir(task_id)
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / "artifact.txt").write_text("generated")
+        update_task(cfg.DB_PATH, task_id, status=TaskStatus.COMPLETED.value)
+
+        resp = client.delete(f"/api/tasks/{task_id}")
+
+        assert resp.status_code == 204
+        assert client.get(f"/api/tasks/{task_id}").status_code == 404
+        assert not task_dir.exists()
+
+    def test_delete_active_task_is_rejected(self, client):
+        from server.config import Config
+        from server.db import update_task
+
+        cfg = Config()
+        task_id = client.post("/api/tasks", data={
+            "type": "worldrecon",
+            "name": "active-task",
+            "config": "{}",
+        }).json()["task_id"]
+        update_task(cfg.DB_PATH, task_id, status=TaskStatus.RUNNING.value)
+
+        resp = client.delete(f"/api/tasks/{task_id}")
+
+        assert resp.status_code == 409
+        assert client.get(f"/api/tasks/{task_id}").status_code == 200
