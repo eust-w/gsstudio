@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { disposeSplatResources } from "./splatCleanup";
+import { disposeSplatResources, disposeSplatResourcesWhenIdle } from "./splatCleanup";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -34,5 +34,21 @@ describe("disposeSplatResources", () => {
     disposeSplatResources(() => window.dispatchEvent(event));
 
     expect(event.defaultPrevented).toBe(false);
+  });
+
+  it("waits for an in-flight Spark sort before terminating its workers", () => {
+    vi.useFakeTimers();
+    let idle = false;
+    const dispose = vi.fn();
+
+    disposeSplatResourcesWhenIdle(() => idle, dispose);
+    expect(dispose).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(32);
+    expect(dispose).not.toHaveBeenCalled();
+
+    idle = true;
+    vi.advanceTimersByTime(16);
+    expect(dispose).toHaveBeenCalledOnce();
   });
 });
