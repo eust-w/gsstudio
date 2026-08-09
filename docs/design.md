@@ -87,11 +87,15 @@ Based on pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel. All CUDA extensions are co
 
 ## Deployment Status (verified)
 
-- Image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v10
+- Image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v11
 - Pod: gsstudio ns, 1/1 Running, 5x A800 on node 192.168.80.136
 - Public IP URL: http://120.48.33.45 (CCE load balancer + Basic Auth)
 - TLS URL: https://geneva-ingredients-expression-located.trycloudflare.com (Cloudflare Tunnel TLS + Basic Auth)
-- Full world generation prerequisite: approved access to gated `facebook/sam3` and `HF_TOKEN` via the optional `gsstudio-huggingface` Secret
+- One-time world generation prerequisite: approved access to gated
+  `facebook/sam3` and `HF_TOKEN` via the optional `gsstudio-huggingface` Secret
+- `facebook/sam3` only needs that token for its first download. Its complete
+  snapshot is retained under the node's persistent `/models/hf-cache`; later
+  tasks and Pod restarts use the local cache without requiring the token.
 - vLLM 0.11.0 Qwen3-VL-8B: chat completion verified working
 - worldrecon e2e via API verified: 8 images -> gaussians.ply (82MB, 1.21M
   vertices) + points.ply + depth/normal/camera in ~45s (warm) 

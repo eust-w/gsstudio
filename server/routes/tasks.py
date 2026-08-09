@@ -37,6 +37,16 @@ def _get_config() -> Config:
     return _config
 
 
+def _sam3_is_cached(hf_home: str) -> bool:
+    snapshots = Path(hf_home) / "hub" / "models--facebook--sam3" / "snapshots"
+    return any(
+        (snapshot / "config.json").is_file()
+        and (snapshot / "model.safetensors").is_file()
+        for snapshot in snapshots.glob("*")
+        if snapshot.is_dir()
+    )
+
+
 @router.post("/tasks", status_code=201)
 async def create_task_endpoint(
     type: str = Form(...),
@@ -54,11 +64,16 @@ async def create_task_endpoint(
     if type not in ("worldgen", "worldgen_from_pano", "worldrecon"):
         raise HTTPException(400, f"Invalid task type: {type}")
 
-    if type in ("worldgen", "worldgen_from_pano") and not os.environ.get("HF_TOKEN"):
+    if (
+        type in ("worldgen", "worldgen_from_pano")
+        and not os.environ.get("HF_TOKEN")
+        and not _sam3_is_cached(cfg.HF_HOME)
+    ):
         raise HTTPException(
             503,
-            "World generation requires approved access to facebook/sam3. "
-            "Configure the gsstudio-huggingface Kubernetes Secret first.",
+            "World generation requires a one-time download of facebook/sam3. "
+            "Approve access and configure the gsstudio-huggingface Kubernetes "
+            "Secret; after the model is cached, the token is no longer required.",
         )
 
     # Parse config
