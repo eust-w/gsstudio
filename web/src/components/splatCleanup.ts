@@ -4,6 +4,12 @@ function isExpectedWorkerTermination(reason: unknown) {
   return reason instanceof Error && reason.message === WORKER_TERMINATION_MESSAGE;
 }
 
+type WorkerWithMessages = { messages: Record<number, unknown> } | null;
+
+export function areSplatWorkersIdle(...workers: WorkerWithMessages[]) {
+  return workers.every((worker) => worker === null || Object.keys(worker.messages).length === 0);
+}
+
 export function disposeSplatResources(dispose: () => void) {
   const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
     if (isExpectedWorkerTermination(event.reason)) {
