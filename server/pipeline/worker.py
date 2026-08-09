@@ -27,6 +27,11 @@ ARTIFACT_TYPES = {
     ".json": "data", ".npy": "data", ".pt": "data",
 }
 
+# Stages that need all five GPUs and the CPU memory used by model loading.
+# Trajectory generation/rendering still need the resident vLLM service, while
+# WorldStereo and all later stages do not.
+VLLM_FREE_STAGES = frozenset({"panogen", "video_gen"})
+
 
 class PipelineWorker:
     def __init__(self, config: Config):
@@ -98,10 +103,23 @@ class PipelineWorker:
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
+    def _recover_interrupted_tasks(self) -> None:
+        """Return tasks interrupted by a container restart to the resume queue."""
+        tasks, _ = list_tasks(self.config.DB_PATH, status=TaskStatus.RUNNING.value, limit=100)
+        for task in tasks:
+            logger.warning("Recovering interrupted task %s", task["id"])
+            update_task(
+                self.config.DB_PATH,
+                task["id"],
+                status=TaskStatus.PENDING.value,
+                error=None,
+            )
+
     async def start(self):
         """Main worker loop: poll for pending tasks and execute serially."""
         self._running = True
         logger.info("Pipeline worker started (mock=%s)", self.config.MOCK_PIPELINE)
+        self._recover_interrupted_tasks()
 
         while self._running:
             try:
@@ -232,8 +250,8 @@ class PipelineWorker:
                 update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.SKIPPED)
                 continue
 
-            # panogen needs the full VRAM of all 5 GPUs -> pause vLLM first.
-            if stage_name == "panogen":
+            # Full-model stages need vLLM's GPU and host memory released first.
+            if stage_name in VLLM_FREE_STAGES:
                 await self._stop_vllm()
 
             log_file = logs_dir / f"{stage_name}.log"

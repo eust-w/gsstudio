@@ -73,8 +73,10 @@ RUN cd /opt/hyworld2/hyworld2/worldgen/third_party/navmesh \
 # 3. FlashAttention-2
 RUN TORCH_CUDA_ARCH_LIST="8.0" MAX_JOBS=8 pip install --no-cache-dir flash-attn --no-build-isolation
 
-# 4. Git-based dependencies (nerfview, fused-ssim, spz, pytorch3d, MoGe)
-RUN pip install --no-cache-dir --no-build-isolation -r requirements_git.txt
+# 4. Git-based dependencies (nerfview, fused-ssim, spz, pytorch3d, MoGe).
+# Kaniko has the CUDA toolkit but no visible GPU, so PyTorch3D otherwise
+# silently compiles a CPU-only extension and fails later in traj_render.
+RUN FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="8.0" MAX_JOBS=8 pip install --no-cache-dir --no-build-isolation -r requirements_git.txt
 
 # ---------------------------------------------------------------------------
 # vLLM for Qwen3-VL serving -- ISOLATED VENV
@@ -107,6 +109,14 @@ RUN pip install --no-cache-dir \
         python-multipart \
         aiofiles \
         websockets
+
+# HY-World forwards local_files_only to its auxiliary WorldStereo components,
+# but not to the sharded base transformer. Patch that upstream omission so a
+# fully populated persistent cache never triggers Hub metadata requests.
+COPY deploy/scripts/patch_hyworld_local_cache.py /tmp/patch_hyworld_local_cache.py
+RUN python /tmp/patch_hyworld_local_cache.py \
+        /opt/hyworld2/hyworld2/worldgen/models/worldstereo_wrapper.py \
+    && rm /tmp/patch_hyworld_local_cache.py
 
 # ---------------------------------------------------------------------------
 # Copy pre-built frontend (built locally with: cd web && npm install && npm run build)

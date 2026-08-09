@@ -4,7 +4,7 @@ import { render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 
-import TaskDetail from "./TaskDetail";
+import TaskDetail, { preferredSplatArtifact } from "./TaskDetail";
 
 vi.mock("../api", () => ({
   cancelTask: vi.fn(),
@@ -28,6 +28,12 @@ vi.mock("../api", () => ({
         type: "3dgs",
         size: 1024,
       },
+      {
+        name: "gaussians.spz",
+        path: "output/gaussians.spz",
+        type: "3dgs",
+        size: 512,
+      },
     ],
   }),
 }));
@@ -41,7 +47,18 @@ vi.mock("../components/SplatViewer", () => ({
 }));
 
 describe("TaskDetail", () => {
-  it("starts loading the only 3D model as soon as the task page opens", async () => {
+  it("falls back to PLY when no SPZ artifact exists", () => {
+    const ply = {
+      name: "gaussians.ply",
+      path: "output/gaussians.ply",
+      type: "3dgs" as const,
+      size: 1024,
+    };
+
+    expect(preferredSplatArtifact([ply])).toEqual(ply);
+  });
+
+  it("starts streaming SPZ instead of an earlier PLY artifact", async () => {
     render(
       <MemoryRouter initialEntries={["/tasks/recon-task"]}>
         <Routes>
@@ -51,7 +68,7 @@ describe("TaskDetail", () => {
     );
 
     expect(await screen.findByTestId("splat-viewer")).toHaveTextContent(
-      "/api/artifacts/output/gaussians.ply",
+      "/api/artifacts/output/gaussians.spz",
     );
   });
 });

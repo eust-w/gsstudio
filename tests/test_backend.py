@@ -20,6 +20,7 @@ from server.db import create_task, get_task, init_db, list_tasks, set_task_stage
 from server.models import StageStatus, TaskStatus
 from server.pipeline.stage_runner import run_stage
 from server.pipeline.worldgen import get_worldgen_commands
+from server.pipeline.worker import PipelineWorker, VLLM_FREE_STAGES
 
 
 @pytest.fixture
@@ -120,6 +121,20 @@ class TestCheckpointResume:
         (task_dir / ".stage_panogen_done").touch()
         assert (task_dir / ".stage_panogen_done").exists()
 
+    def test_worker_recovers_interrupted_task_after_container_restart(self, cfg):
+        tid = create_task(cfg.DB_PATH, name="interrupted", task_type="worldgen_from_pano")
+        update_task(cfg.DB_PATH, tid, status=TaskStatus.RUNNING.value)
+
+        PipelineWorker(cfg)._recover_interrupted_tasks()
+
+        task = get_task(cfg.DB_PATH, tid)
+        assert task["status"] == TaskStatus.PENDING.value
+        assert task["error"] is None
+
+    def test_world_expansion_releases_vllm_resources(self):
+        assert "panogen" in VLLM_FREE_STAGES
+        assert "video_gen" in VLLM_FREE_STAGES
+
 
 class TestWorldgenCommands:
     def test_panogen_uses_isolated_runtime_and_supported_attention(self, tmp_path):
@@ -137,6 +152,47 @@ class TestWorldgenCommands:
         _, command, _, _ = commands[0]
         assert command[0] == "/opt/panogen/bin/python"
         assert command[command.index("--attn-impl") + 1] == "sdpa"
+
+    def test_trajectory_generation_uses_only_persisted_huggingface_cache(self, tmp_path):
+        commands = get_worldgen_commands(
+            task_dir=tmp_path / "task",
+            scene_dir=tmp_path / "scene",
+            input_dir=tmp_path / "input",
+            config={"hf_home": "/models/hf-cache"},
+            hyworld_repo=Path("/opt/hyworld2"),
+            vllm_host="localhost",
+            vllm_port=8100,
+            vllm_model="Qwen/Qwen3-VL-8B-Instruct",
+            task_type="worldgen_from_pano",
+        )
+
+        _, _, trajectory_env, _ = next(
+            command for command in commands if command[0] == "traj_generate"
+        )
+        assert trajectory_env["HF_HUB_OFFLINE"] == "1"
+        assert trajectory_env["TRANSFORMERS_OFFLINE"] == "1"
+
+    def test_world_expansion_uses_only_persisted_huggingface_cache(self, tmp_path):
+        commands = get_worldgen_commands(
+            task_dir=tmp_path / "task",
+            scene_dir=tmp_path / "scene",
+            input_dir=tmp_path / "input",
+            config={"hf_home": "/models/hf-cache"},
+            hyworld_repo=Path("/opt/hyworld2"),
+            vllm_host="localhost",
+            vllm_port=8100,
+            vllm_model="Qwen/Qwen3-VL-8B-Instruct",
+            task_type="worldgen_from_pano",
+        )
+
+        _, command, video_env, _ = next(
+            item for item in commands if item[0] == "video_gen"
+        )
+        assert "--local_files_only" in command
+        assert command[command.index("--nproc_per_node") + 1] == "4"
+        assert video_env["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+        assert video_env["HF_HUB_OFFLINE"] == "1"
+        assert video_env["TRANSFORMERS_OFFLINE"] == "1"
 
 
 class TestStageRunner:
@@ -168,6 +224,56 @@ class TestFrontendViewerContract:
         assert "new SplatMesh" in source
         assert "lod: true" in source
         assert "onProgress" in source
+
+
+class TestDeploymentContract:
+    def test_entrypoint_maps_upstream_hf_cache_to_persistent_hub(self):
+        source = (Path(__file__).parents[1] / "deploy/scripts/entrypoint.sh").read_text()
+
+        assert 'UPSTREAM_HF_HOME="/root/.cache/huggingface"' in source
+        assert 'ln -sfn "$GSSTUDIO_HF_HOME/hub" "$UPSTREAM_HF_HOME/hub"' in source
+
+    def test_prefetch_includes_all_trajectory_huggingface_dependencies(self):
+        source = (Path(__file__).parents[1] / "deploy/scripts/prefetch_models.sh").read_text()
+
+        assert "naver-iv/zim-anything-vitl" in source
+        assert "IDEA-Research/grounding-dino-tiny" in source
+
+    def test_prefetch_includes_worldstereo_base_model_components(self):
+        source = (Path(__file__).parents[1] / "deploy/scripts/prefetch_models.sh").read_text()
+
+        assert "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers" in source
+        assert "facebook/dinov2-base" in source
+        for component in (
+            "transformer/*",
+            "text_encoder/*",
+            "image_encoder/*",
+            "image_processor/*",
+            "tokenizer/*",
+            "vae/*",
+        ):
+            assert component in source
+
+    def test_image_forces_cuda_build_for_pytorch3d(self):
+        source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
+
+        assert 'FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="8.0" MAX_JOBS=8 pip install' in source
+
+    def test_image_patches_worldstereo_transformer_for_local_only_loading(self):
+        source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
+        patch_source = (
+            Path(__file__).parents[1] / "deploy/scripts/patch_hyworld_local_cache.py"
+        ).read_text()
+
+        assert "patch_hyworld_local_cache.py" in source
+        assert "/opt/hyworld2/hyworld2/worldgen/models/worldstereo_wrapper.py" in source
+        assert "T5Tokenizer.from_pretrained" in patch_source
+
+    def test_gpu_deployment_allows_worldstereo_cpu_shard_loading(self):
+        source = (Path(__file__).parents[1] / "deploy/k8s/deployment-gpu.yaml").read_text()
+
+        assert 'memory: 128Gi' in source
+        assert 'memory: 512Gi' in source
 
 
 class TestAPI:
