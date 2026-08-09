@@ -22,7 +22,7 @@ spec:
       nodeName: 192.168.80.136
       containers:
         - name: prefetch
-          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v11
+          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v15
           command: ["bash", "-c"]
           args:
             - |
@@ -30,16 +30,30 @@ spec:
               from huggingface_hub import snapshot_download
               import os
 
-              # The large public models are already present on this node. This
-              # gated model is the only one that needs the temporary token.
-              models = [('facebook/sam3', None)]
+              models = [
+                  ('facebook/sam3', None),
+                  ('naver-iv/zim-anything-vitl', ['zim_vit_l_2092/*']),
+                  ('IDEA-Research/grounding-dino-tiny', ['*.json', '*.txt', 'model.safetensors']),
+                  ('facebook/dinov2-base', None),
+                  (
+                      'Wan-AI/Wan2.1-I2V-14B-480P-Diffusers',
+                      [
+                          'transformer/*',
+                          'text_encoder/*',
+                          'image_encoder/*',
+                          'image_processor/*',
+                          'tokenizer/*',
+                          'vae/*',
+                      ],
+                  ),
+              ]
 
               for repo_id, allow in models:
                   print(f'Downloading {repo_id}...')
                   snapshot_download(
                       repo_id,
                       allow_patterns=allow,
-                      local_files_only=False,
+                      local_files_only=(repo_id == 'facebook/sam3' and not os.environ.get('HF_TOKEN')),
                   )
                   print(f'Done: {repo_id}')
 
@@ -53,6 +67,7 @@ spec:
                 secretKeyRef:
                   name: gsstudio-huggingface
                   key: token
+                  optional: true
           volumeMounts:
             - name: hf-cache
               mountPath: /models/hf-cache
@@ -86,6 +101,8 @@ models = [
     'Qwen/Qwen3-VL-8B-Instruct',
     'facebook/sam3',
     'Ruicheng/moge-2-vitl-normal',
+    'facebook/dinov2-base',
+    'Wan-AI/Wan2.1-I2V-14B-480P-Diffusers',
 ]
 
 for repo_id in models:
