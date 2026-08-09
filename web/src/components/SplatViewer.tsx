@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { isEditableTarget, moveCamera } from "./splatNavigation";
 
 interface SplatViewerProps {
   url: string;
@@ -10,15 +11,20 @@ interface SplatViewerProps {
 }
 
 export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
+  const viewerRef = useRef<HTMLDivElement>(null);
+  const canvasContainerRef = useRef<HTMLDivElement>(null);
+  const pressedKeysRef = useRef(new Set<string>());
+  const moveSpeedRef = useRef(1);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [progress, setProgress] = useState(0);
   const [loadedBytes, setLoadedBytes] = useState(0);
+  const [keyboardActive, setKeyboardActive] = useState(false);
 
   useEffect(() => {
-    const container = containerRef.current;
-    if (!container || !url) return;
+    const container = canvasContainerRef.current;
+    const viewer = viewerRef.current;
+    if (!container || !viewer || !url) return;
 
     let disposed = false;
     setLoading(true);
@@ -70,6 +76,7 @@ export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) 
         const bounds = mesh.getBoundingBox();
         const center = bounds.getCenter(new THREE.Vector3());
         const diagonal = Math.max(bounds.getSize(new THREE.Vector3()).length(), 1);
+        moveSpeedRef.current = Math.max(diagonal * 0.3, 0.1);
         controls.target.copy(center);
         camera.position.copy(center).add(new THREE.Vector3(0, 0, diagonal * 1.2));
         camera.near = Math.max(diagonal / 10000, 0.001);
@@ -95,13 +102,44 @@ export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) 
 
     const resizeObserver = new ResizeObserver(resize);
     resizeObserver.observe(container);
-    renderer.setAnimationLoop(() => {
+    const navigationCodes = new Set(["KeyW", "KeyA", "KeyS", "KeyD", "ShiftLeft", "ShiftRight"]);
+    const keyboardControlsActive = () => (
+      document.activeElement === viewer || Boolean(document.fullscreenElement?.contains(viewer))
+    );
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!navigationCodes.has(event.code) || !keyboardControlsActive() || isEditableTarget(event.target)) return;
+      event.preventDefault();
+      pressedKeysRef.current.add(event.code);
+      setKeyboardActive(true);
+    };
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (!navigationCodes.has(event.code)) return;
+      pressedKeysRef.current.delete(event.code);
+    };
+    const clearPressedKeys = () => pressedKeysRef.current.clear();
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", clearPressedKeys);
+    document.addEventListener("visibilitychange", clearPressedKeys);
+
+    let previousFrameTime = 0;
+    renderer.setAnimationLoop((frameTime) => {
+      const deltaSeconds = previousFrameTime === 0
+        ? 0
+        : Math.min((frameTime - previousFrameTime) / 1000, 0.1);
+      previousFrameTime = frameTime;
+      moveCamera(camera, controls.target, pressedKeysRef.current, deltaSeconds, moveSpeedRef.current);
       controls.update();
       renderer.render(scene, camera);
     });
 
     return () => {
       disposed = true;
+      pressedKeysRef.current.clear();
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", clearPressedKeys);
+      document.removeEventListener("visibilitychange", clearPressedKeys);
       resizeObserver.disconnect();
       renderer.setAnimationLoop(null);
       controls.dispose();
@@ -115,8 +153,20 @@ export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) 
   const loadedMegabytes = loadedBytes / 1024 / 1024;
 
   return (
-    <div className="splat-viewer">
-      <div ref={containerRef} className="splat-canvas" />
+    <div
+      ref={viewerRef}
+      className={`splat-viewer ${keyboardActive ? "keyboard-active" : ""}`}
+      tabIndex={0}
+      data-keyboard-viewer
+      aria-label="Interactive 3D model viewer. Use WASD to move and Shift to move faster."
+      onFocus={() => setKeyboardActive(true)}
+      onBlur={() => {
+        pressedKeysRef.current.clear();
+        setKeyboardActive(false);
+      }}
+      onPointerDown={() => viewerRef.current?.focus({ preventScroll: true })}
+    >
+      <div ref={canvasContainerRef} className="splat-canvas" />
       {loading && (
         <div className="viewer-loading viewer-loading-overlay">
           <div className="loading-spinner" />
@@ -134,7 +184,7 @@ export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) 
         </div>
       )}
       {!loading && !error && (
-        <div className="splat-hint">Left-drag to rotate | Right-drag to pan | Scroll to zoom</div>
+        <div className="splat-hint">Click to control | WASD move | Shift boost | Drag to look | Scroll to zoom</div>
       )}
     </div>
   );

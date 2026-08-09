@@ -2,46 +2,41 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import TaskDetail, { preferredSplatArtifact } from "./TaskDetail";
 
-const { deleteTaskMock, updateTaskMock } = vi.hoisted(() => ({
+const { deleteTaskMock, getTaskMock, updateTaskMock } = vi.hoisted(() => ({
   deleteTaskMock: vi.fn().mockResolvedValue(undefined),
+  getTaskMock: vi.fn(),
   updateTaskMock: vi.fn().mockResolvedValue(undefined),
 }));
+
+const taskFixture = {
+  id: "recon-task",
+  name: "Reconstruction",
+  type: "worldrecon",
+  status: "completed",
+  progress: 1,
+  current_stage: null,
+  created_at: "2026-08-09T00:00:00Z",
+  updated_at: "2026-08-09T00:01:00Z",
+  config: {},
+  error: null,
+  stages: [],
+  artifacts: [
+    { name: "panorama.png", path: "output/panorama.png", type: "image", size: 256 },
+    { name: "render.mp4", path: "output/render.mp4", type: "video", size: 2048 },
+    { name: "gaussians.ply", path: "output/gaussians.ply", type: "3dgs", size: 1024 },
+    { name: "gaussians.spz", path: "output/gaussians.spz", type: "3dgs", size: 512 },
+  ],
+};
 
 vi.mock("../api", () => ({
   cancelTask: vi.fn(),
   deleteTask: deleteTaskMock,
   getArtifactUrl: (_taskId: string, path: string) => `/api/artifacts/${path}`,
-  getTask: vi.fn().mockResolvedValue({
-    id: "recon-task",
-    name: "Reconstruction",
-    type: "worldrecon",
-    status: "completed",
-    progress: 1,
-    current_stage: null,
-    created_at: "2026-08-09T00:00:00Z",
-    updated_at: "2026-08-09T00:01:00Z",
-    config: {},
-    error: null,
-    stages: [],
-    artifacts: [
-      {
-        name: "gaussians.ply",
-        path: "output/gaussians.ply",
-        type: "3dgs",
-        size: 1024,
-      },
-      {
-        name: "gaussians.spz",
-        path: "output/gaussians.spz",
-        type: "3dgs",
-        size: 512,
-      },
-    ],
-  }),
+  getTask: getTaskMock,
   updateTask: updateTaskMock,
 }));
 
@@ -57,6 +52,10 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   vi.restoreAllMocks();
+});
+
+beforeEach(() => {
+  getTaskMock.mockResolvedValue(taskFixture);
 });
 
 describe("TaskDetail", () => {
@@ -83,6 +82,25 @@ describe("TaskDetail", () => {
     expect(await screen.findByTestId("splat-viewer")).toHaveTextContent(
       "/api/artifacts/output/gaussians.spz",
     );
+  });
+
+  it("defaults to 3D and exposes fullscreen for every preview type", async () => {
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes>
+          <Route path="/tasks/:taskId" element={<TaskDetail />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByTestId("splat-viewer")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Enter 3D Model fullscreen" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Video" }));
+    expect(screen.getByRole("button", { name: "Enter Video fullscreen" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Panorama" }));
+    expect(screen.getByRole("button", { name: "Enter Panorama fullscreen" })).toBeInTheDocument();
   });
 
   it("edits the task name from the detail page", async () => {
