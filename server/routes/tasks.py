@@ -193,6 +193,26 @@ async def cancel_task_endpoint(task_id: str):
     return {"status": "cancelled"}
 
 
+@router.post("/tasks/{task_id}/retry")
+async def retry_task_endpoint(task_id: str):
+    cfg = _get_config()
+    task = get_task(cfg.DB_PATH, task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    if task["status"] not in (TaskStatus.FAILED.value, TaskStatus.CANCELLED.value):
+        raise HTTPException(409, f"Cannot retry task in status: {task['status']}")
+
+    update_task(
+        cfg.DB_PATH,
+        task_id,
+        status=TaskStatus.PENDING.value,
+        progress=0.0,
+        current_stage=None,
+        error=None,
+    )
+    return get_task(cfg.DB_PATH, task_id)
+
+
 @router.websocket("/tasks/{task_id}/logs")
 async def task_logs_websocket(websocket: WebSocket, task_id: str):
     await websocket.accept()

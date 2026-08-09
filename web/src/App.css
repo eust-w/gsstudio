@@ -248,8 +248,28 @@ body {
 .filter-bar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 20px;
+}
+
+.select-visible-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-right: 4px;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.select-visible-control input,
+.task-select-checkbox {
+  width: 17px;
+  height: 17px;
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 
 .filter-btn {
@@ -276,6 +296,37 @@ body {
   font-size: 0.85rem;
 }
 
+.batch-toolbar {
+  position: sticky;
+  top: 12px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+  padding: 12px 14px;
+  background: rgba(21, 30, 53, 0.96);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(8px);
+}
+
+.batch-selection-count {
+  flex: 0 0 auto;
+  color: var(--text-primary);
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.batch-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 /* Task Cards */
 .task-grid {
   display: grid;
@@ -283,16 +334,36 @@ body {
   gap: 16px;
 }
 
+.task-card-shell {
+  position: relative;
+  border-radius: 10px;
+}
+
+.task-card-shell.selected {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.task-select-checkbox {
+  position: absolute;
+  top: 18px;
+  left: 18px;
+  z-index: 2;
+}
+
 .task-card-link {
+  display: block;
+  height: 100%;
   text-decoration: none;
   color: inherit;
 }
 
 .task-card {
+  height: 100%;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: 10px;
-  padding: 20px;
+  padding: 20px 20px 20px 48px;
   transition: all 0.2s;
 }
 
@@ -997,5 +1068,21 @@ body {
 
   .task-grid {
     grid-template-columns: 1fr;
+  }
+
+  .task-count {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .batch-toolbar {
+    position: static;
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .batch-actions {
+    justify-content: flex-start;
+    width: 100%;
   }
 }

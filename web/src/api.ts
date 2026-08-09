@@ -86,6 +86,11 @@ export async function cancelTask(id: string): Promise<void> {
   if (!resp.ok) throw new Error(`Cancel failed: ${resp.statusText}`);
 }
 
+export async function retryTask(id: string): Promise<void> {
+  const resp = await fetch(`${API_BASE}/tasks/${id}/retry`, { method: "POST" });
+  if (!resp.ok) throw new Error(`Retry failed: ${resp.statusText}`);
+}
+
 export async function updateTask(id: string, updates: { name: string }): Promise<TaskDetail> {
   const resp = await fetch(`${API_BASE}/tasks/${id}`, {
     method: "PATCH",
