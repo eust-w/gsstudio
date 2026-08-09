@@ -7,13 +7,14 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, File, Form, HTTPException, Query, Response, UploadFile, WebSocket, WebSocketDisconnect
 
 from ..config import Config
-from ..db import create_task, get_task, list_tasks, update_task
-from ..models import TaskDetail, TaskListResponse, TaskResponse, TaskStatus
+from ..db import create_task, delete_task, get_task, list_tasks, update_task
+from ..models import TaskDetail, TaskListResponse, TaskResponse, TaskStatus, TaskUpdate
 from ..pipeline.stage_runner import stream_log
 
 logger = logging.getLogger(__name__)
@@ -141,6 +142,37 @@ async def get_task_endpoint(task_id: str):
     if not task:
         raise HTTPException(404, "Task not found")
     return task
+
+
+@router.patch("/tasks/{task_id}")
+async def update_task_endpoint(task_id: str, payload: TaskUpdate):
+    cfg = _get_config()
+    task = get_task(cfg.DB_PATH, task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(400, "Task name cannot be blank")
+
+    update_task(cfg.DB_PATH, task_id, name=name)
+    return get_task(cfg.DB_PATH, task_id)
+
+
+@router.delete("/tasks/{task_id}", status_code=204)
+async def delete_task_endpoint(task_id: str):
+    cfg = _get_config()
+    task = get_task(cfg.DB_PATH, task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    if task["status"] in (TaskStatus.PENDING.value, TaskStatus.RUNNING.value):
+        raise HTTPException(409, "Cancel the active task before deleting it")
+
+    task_dir = cfg.task_dir(task_id)
+    if task_dir.exists():
+        shutil.rmtree(task_dir)
+    delete_task(cfg.DB_PATH, task_id)
+    return Response(status_code=204)
 
 
 @router.post("/tasks/{task_id}/cancel")

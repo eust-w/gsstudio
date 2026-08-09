@@ -110,6 +110,12 @@ def update_task(db_path: Path, task_id: str, **updates) -> None:
         conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
 
 
+def delete_task(db_path: Path, task_id: str) -> bool:
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        return cursor.rowcount > 0
+
+
 def update_stage(db_path: Path, task_id: str, stage_name: str, status: StageStatus, error: Optional[str] = None) -> None:
     task = get_task(db_path, task_id)
     if not task:

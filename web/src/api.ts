@@ -86,6 +86,21 @@ export async function cancelTask(id: string): Promise<void> {
   if (!resp.ok) throw new Error(`Cancel failed: ${resp.statusText}`);
 }
 
+export async function updateTask(id: string, updates: { name: string }): Promise<TaskDetail> {
+  const resp = await fetch(`${API_BASE}/tasks/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(updates),
+  });
+  if (!resp.ok) throw new Error(`Update task failed: ${resp.statusText}`);
+  return resp.json();
+}
+
+export async function deleteTask(id: string): Promise<void> {
+  const resp = await fetch(`${API_BASE}/tasks/${id}`, { method: "DELETE" });
+  if (!resp.ok) throw new Error(`Delete task failed: ${resp.statusText}`);
+}
+
 export async function getArtifacts(taskId: string): Promise<Artifact[]> {
   const resp = await fetch(`${API_BASE}/tasks/${taskId}/artifacts`);
   if (!resp.ok) throw new Error(`Get artifacts failed: ${resp.statusText}`);

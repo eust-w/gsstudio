@@ -1,13 +1,19 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import TaskDetail, { preferredSplatArtifact } from "./TaskDetail";
 
+const { deleteTaskMock, updateTaskMock } = vi.hoisted(() => ({
+  deleteTaskMock: vi.fn().mockResolvedValue(undefined),
+  updateTaskMock: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("../api", () => ({
   cancelTask: vi.fn(),
+  deleteTask: deleteTaskMock,
   getArtifactUrl: (_taskId: string, path: string) => `/api/artifacts/${path}`,
   getTask: vi.fn().mockResolvedValue({
     id: "recon-task",
@@ -36,6 +42,7 @@ vi.mock("../api", () => ({
       },
     ],
   }),
+  updateTask: updateTaskMock,
 }));
 
 vi.mock("../components/LogStream", () => ({ default: () => <div>Logs</div> }));
@@ -45,6 +52,12 @@ vi.mock("../components/PanoViewer", () => ({ default: () => <div>Panorama</div> 
 vi.mock("../components/SplatViewer", () => ({
   default: ({ url }: { url: string }) => <div data-testid="splat-viewer">{url}</div>,
 }));
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+  vi.restoreAllMocks();
+});
 
 describe("TaskDetail", () => {
   it("falls back to PLY when no SPZ artifact exists", () => {
@@ -70,5 +83,40 @@ describe("TaskDetail", () => {
     expect(await screen.findByTestId("splat-viewer")).toHaveTextContent(
       "/api/artifacts/output/gaussians.spz",
     );
+  });
+
+  it("edits the task name from the detail page", async () => {
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes>
+          <Route path="/tasks/:taskId" element={<TaskDetail />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByRole("heading", { name: "Reconstruction" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit task" }));
+    fireEvent.change(screen.getByLabelText("Task name"), { target: { value: "Renamed task" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(updateTaskMock).toHaveBeenCalledWith("recon-task", { name: "Renamed task" }));
+  });
+
+  it("deletes a completed task after confirmation", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes>
+          <Route path="/tasks/:taskId" element={<TaskDetail />} />
+          <Route path="/" element={<div>Task list</div>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByRole("heading", { name: "Reconstruction" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete task" }));
+
+    await waitFor(() => expect(deleteTaskMock).toHaveBeenCalledWith("recon-task"));
+    expect(await screen.findByText("Task list")).toBeInTheDocument();
   });
 });
