@@ -1,7 +1,11 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { disposeSplatResources, disposeSplatResourcesWhenIdle } from "./splatCleanup";
+import {
+  areSplatWorkersIdle,
+  disposeSplatResources,
+  disposeSplatResourcesWhenIdle,
+} from "./splatCleanup";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -50,5 +54,14 @@ describe("disposeSplatResources", () => {
     idle = true;
     vi.advanceTimersByTime(16);
     expect(dispose).toHaveBeenCalledOnce();
+  });
+
+  it("requires both Spark workers to have no pending messages", () => {
+    const idleWorker = { messages: {} };
+    const busyWorker = { messages: { 7: {} } };
+
+    expect(areSplatWorkersIdle(null, idleWorker)).toBe(true);
+    expect(areSplatWorkersIdle(idleWorker, busyWorker)).toBe(false);
+    expect(areSplatWorkersIdle(busyWorker, idleWorker)).toBe(false);
   });
 });

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { disposeSplatResourcesWhenIdle } from "./splatCleanup";
+import { areSplatWorkersIdle, disposeSplatResourcesWhenIdle } from "./splatCleanup";
 import { isEditableTarget, moveCamera } from "./splatNavigation";
 
 interface SplatViewerProps {
@@ -153,13 +153,20 @@ export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) 
         spark.sortTimeoutId = -1;
       }
       spark.sortDirty = false;
-      disposeSplatResourcesWhenIdle(() => !spark.sorting, () => {
-        controls.dispose();
-        splat.dispose();
-        spark.dispose();
-        renderer.dispose();
-        renderer.domElement.remove();
-      });
+      spark.enableDriveLod = false;
+      spark.lodDirty = false;
+      spark.lodInitQueue = [];
+      spark.lodUpdates = [];
+      disposeSplatResourcesWhenIdle(
+        () => !spark.sorting && areSplatWorkersIdle(spark.sortWorker, spark.lodWorker),
+        () => {
+          controls.dispose();
+          splat.dispose();
+          spark.dispose();
+          renderer.dispose();
+          renderer.domElement.remove();
+        },
+      );
     };
   }, [url, onLoad, onError]);
 
