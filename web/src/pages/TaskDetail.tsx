@@ -14,6 +14,10 @@ import StatusBadge from "../components/StatusBadge";
 
 const SplatViewer = lazy(() => import("../components/SplatViewer"));
 
+export function preferredSplatArtifact(artifacts: Artifact[]): Artifact | undefined {
+  return artifacts.find((artifact) => artifact.name.toLowerCase().endsWith(".spz")) ?? artifacts[0];
+}
+
 export default function TaskDetail() {
   const { taskId } = useParams<{ taskId: string }>();
   const [task, setTask] = useState<TaskDetailType | null>(null);
@@ -76,6 +80,7 @@ export default function TaskDetail() {
   const panoArtifacts = task.artifacts.filter((a) => a.type === "image" && a.name.includes("pano"));
   const videoArtifacts = task.artifacts.filter((a) => a.type === "video");
   const splatArtifacts = task.artifacts.filter((a) => a.type === "3dgs");
+  const previewSplat = preferredSplatArtifact(splatArtifacts);
   const imageArtifacts = task.artifacts.filter((a) => a.type === "image" && !a.name.includes("pano"));
   const otherArtifacts = task.artifacts.filter(
     (a) => !["image", "video", "3dgs"].includes(a.type)
@@ -159,9 +164,9 @@ export default function TaskDetail() {
                 Your browser does not support video playback.
               </video>
             )}
-            {activePreview === "3dgs" && splatArtifacts.length > 0 && (
+            {activePreview === "3dgs" && previewSplat && (
               <Suspense fallback={<div className="viewer-loading">Preparing streaming viewer…</div>}>
-                <SplatViewer url={getArtifactUrl(task.id, splatArtifacts[0].path)} />
+                <SplatViewer url={getArtifactUrl(task.id, previewSplat.path)} />
               </Suspense>
             )}
           </div>

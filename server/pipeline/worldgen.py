@@ -47,6 +47,10 @@ def get_worldgen_commands(
     panogen_dir = hyworld_repo / "hyworld2" / "panogen"
     num_gpus = config.get("num_gpus", 5)
     gpu_list = ",".join(str(i) for i in range(num_gpus))
+    # WorldStereo has 16 attention heads, so sequence-parallel world size must
+    # divide 16. Use the largest valid subset of the available GPUs.
+    video_num_gpus = max(size for size in (1, 2, 4, 8, 16) if size <= num_gpus)
+    video_gpu_list = ",".join(str(i) for i in range(video_num_gpus))
 
     # 3DGS training steps: 8-GPU baseline is 1500, scale by 8/num_gpus
     step_factor = 8.0 / num_gpus
@@ -94,6 +98,8 @@ def get_worldgen_commands(
     traj_gen_env = {
         "CUDA_VISIBLE_DEVICES": "0",
         "HF_HOME": config.get("hf_home", "/models/hf-cache"),
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
     }
     commands.append(("traj_generate", traj_gen_cmd, traj_gen_env, worldgen_dir))
 
@@ -114,14 +120,17 @@ def get_worldgen_commands(
 
     # Stage 3: Video generation (WorldStereo-2, multi-GPU FSDP)
     video_gen_cmd = [
-        "torchrun", "--nproc_per_node", str(num_gpus),
+        "torchrun", "--nproc_per_node", str(video_num_gpus),
         str(worldgen_dir / "video_gen.py"),
         "--target_path", str(scene_dir),
         "--fsdp",
+        "--local_files_only",
     ]
     video_gen_env = {
-        "CUDA_VISIBLE_DEVICES": gpu_list,
+        "CUDA_VISIBLE_DEVICES": video_gpu_list,
         "HF_HOME": config.get("hf_home", "/models/hf-cache"),
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
     }
     commands.append(("video_gen", video_gen_cmd, video_gen_env, worldgen_dir))
 
