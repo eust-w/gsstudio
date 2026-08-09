@@ -11,6 +11,7 @@ import {
 } from "../api";
 import LogStream from "../components/LogStream";
 import PanoViewer from "../components/PanoViewer";
+import PreviewFrame from "../components/PreviewFrame";
 import StageProgress from "../components/StageProgress";
 import StatusBadge from "../components/StatusBadge";
 
@@ -25,7 +26,7 @@ export default function TaskDetail() {
   const navigate = useNavigate();
   const [task, setTask] = useState<TaskDetailType | null>(null);
   const [error, setError] = useState("");
-  const [activePreview, setActivePreview] = useState<string>("panorama");
+  const [activePreview, setActivePreview] = useState<string>("3dgs");
   const [cancelling, setCancelling] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draftName, setDraftName] = useState("");
@@ -39,9 +40,9 @@ export default function TaskDetail() {
       setTask(data);
       setActivePreview((current) => {
         const available = [
-          data.artifacts.some((artifact) => artifact.type === "image" && artifact.name.includes("pano")) && "panorama",
-          data.artifacts.some((artifact) => artifact.type === "video") && "video",
           data.artifacts.some((artifact) => artifact.type === "3dgs") && "3dgs",
+          data.artifacts.some((artifact) => artifact.type === "video") && "video",
+          data.artifacts.some((artifact) => artifact.type === "image" && artifact.name.includes("pano")) && "panorama",
         ].filter(Boolean) as string[];
         return available.includes(current) ? current : (available[0] ?? current);
       });
@@ -127,6 +128,11 @@ export default function TaskDetail() {
   );
 
   const canCancel = task.status === "pending" || task.status === "running";
+  const previewLabels: Record<string, string> = {
+    "3dgs": "3D Model",
+    video: "Video",
+    panorama: "Panorama",
+  };
 
   return (
     <div className="page task-detail-page">
@@ -216,25 +222,29 @@ export default function TaskDetail() {
             )}
           </div>
 
-          <div className="preview-content">
-            {activePreview === "panorama" && panoArtifacts.length > 0 && (
-              <PanoViewer url={getArtifactUrl(task.id, panoArtifacts[0].path)} />
-            )}
-            {activePreview === "video" && videoArtifacts.length > 0 && (
-              <video
-                controls
-                className="video-preview"
-                src={getArtifactUrl(task.id, videoArtifacts[0].path)}
-              >
-                Your browser does not support video playback.
-              </video>
-            )}
-            {activePreview === "3dgs" && previewSplat && (
-              <Suspense fallback={<div className="viewer-loading">Preparing streaming viewer…</div>}>
-                <SplatViewer url={getArtifactUrl(task.id, previewSplat.path)} />
-              </Suspense>
-            )}
-          </div>
+          {previewLabels[activePreview] && (
+            <PreviewFrame label={previewLabels[activePreview]}>
+              <div className="preview-content">
+                {activePreview === "panorama" && panoArtifacts.length > 0 && (
+                  <PanoViewer url={getArtifactUrl(task.id, panoArtifacts[0].path)} />
+                )}
+                {activePreview === "video" && videoArtifacts.length > 0 && (
+                  <video
+                    controls
+                    className="video-preview"
+                    src={getArtifactUrl(task.id, videoArtifacts[0].path)}
+                  >
+                    Your browser does not support video playback.
+                  </video>
+                )}
+                {activePreview === "3dgs" && previewSplat && (
+                  <Suspense fallback={<div className="viewer-loading">Preparing streaming viewer…</div>}>
+                    <SplatViewer url={getArtifactUrl(task.id, previewSplat.path)} />
+                  </Suspense>
+                )}
+              </div>
+            </PreviewFrame>
+          )}
 
           {task.artifacts.length > 0 && (
             <div className="artifacts-list">
