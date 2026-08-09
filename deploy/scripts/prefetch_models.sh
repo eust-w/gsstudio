@@ -30,13 +30,9 @@ spec:
               from huggingface_hub import snapshot_download
               import os
 
-              models = [
-                  ('tencent/HY-World-2.0', None),
-                  ('hanshanxue/WorldStereo', None),
-                  ('Qwen/Qwen3-VL-8B-Instruct', None),
-                  ('facebook/sam3', None),
-                  ('Ruicheng/moge-2-vitl-normal', None),
-              ]
+              # The large public models are already present on this node. This
+              # gated model is the only one that needs the temporary token.
+              models = [('facebook/sam3', None)]
 
               for repo_id, allow in models:
                   print(f'Downloading {repo_id}...')
