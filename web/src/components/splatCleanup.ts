@@ -20,3 +20,15 @@ export function disposeSplatResources(dispose: () => void) {
     }, 0);
   }
 }
+
+export function disposeSplatResourcesWhenIdle(isIdle: () => boolean, dispose: () => void) {
+  const disposeOrWait = () => {
+    if (isIdle()) {
+      disposeSplatResources(dispose);
+      return;
+    }
+    window.setTimeout(disposeOrWait, 16);
+  };
+
+  disposeOrWait();
+}

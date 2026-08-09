@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { disposeSplatResources } from "./splatCleanup";
+import { disposeSplatResourcesWhenIdle } from "./splatCleanup";
 import { isEditableTarget, moveCamera } from "./splatNavigation";
 
 interface SplatViewerProps {
@@ -143,7 +143,17 @@ export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) 
       document.removeEventListener("visibilitychange", clearPressedKeys);
       resizeObserver.disconnect();
       renderer.setAnimationLoop(null);
-      disposeSplatResources(() => {
+      spark.autoUpdate = false;
+      if (spark.updateTimeoutId !== -1) {
+        window.clearTimeout(spark.updateTimeoutId);
+        spark.updateTimeoutId = -1;
+      }
+      if (spark.sortTimeoutId !== -1) {
+        window.clearTimeout(spark.sortTimeoutId);
+        spark.sortTimeoutId = -1;
+      }
+      spark.sortDirty = false;
+      disposeSplatResourcesWhenIdle(() => !spark.sorting, () => {
         controls.dispose();
         splat.dispose();
         spark.dispose();
