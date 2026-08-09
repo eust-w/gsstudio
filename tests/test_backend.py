@@ -244,9 +244,36 @@ class TestAPI:
 
         assert resp.status_code == 503
         assert resp.json()["detail"] == (
-            "World generation requires approved access to facebook/sam3. "
-            "Configure the gsstudio-huggingface Kubernetes Secret first."
+            "World generation requires a one-time download of facebook/sam3. "
+            "Approve access and configure the gsstudio-huggingface Kubernetes "
+            "Secret; after the model is cached, the token is no longer required."
         )
+
+    def test_world_generation_uses_persisted_sam3_cache_without_token(
+        self, client, monkeypatch, tmp_path
+    ):
+        from server.routes import tasks as task_routes
+
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+        monkeypatch.setattr(task_routes._config, "HF_HOME", str(tmp_path))
+        cached_snapshot = (
+            tmp_path
+            / "hub"
+            / "models--facebook--sam3"
+            / "snapshots"
+            / "approved-revision"
+        )
+        cached_snapshot.mkdir(parents=True)
+        (cached_snapshot / "config.json").write_text("{}")
+        (cached_snapshot / "model.safetensors").write_bytes(b"cached-weights")
+
+        resp = client.post(
+            "/api/tasks",
+            data={"type": "worldgen", "name": "cached-sam3", "config": "{}"},
+            files={"image": ("input.png", b"image-bytes", "image/png")},
+        )
+
+        assert resp.status_code == 201
 
     def test_get_task_not_found(self, client):
         resp = client.get("/api/tasks/nonexistent")
