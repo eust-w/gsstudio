@@ -19,13 +19,13 @@ spec:
   backoffLimit: 2
   template:
     spec:
+      nodeName: 192.168.80.136
       containers:
         - name: prefetch
-          image: python:3.11-slim
+          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v11
           command: ["bash", "-c"]
           args:
             - |
-              pip install huggingface_hub
               python -c "
               from huggingface_hub import snapshot_download
               import os
@@ -52,6 +52,11 @@ spec:
           env:
             - name: HF_HOME
               value: /models/hf-cache
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gsstudio-huggingface
+                  key: token
           volumeMounts:
             - name: hf-cache
               mountPath: /models/hf-cache
@@ -64,8 +69,11 @@ spec:
               memory: 16Gi
       volumes:
         - name: hf-cache
-          persistentVolumeClaim:
-            claimName: gsstudio-hf-cache
+          hostPath:
+            path: /home/cce/gsstudio/models/hf-cache
+            type: DirectoryOrCreate
+      imagePullSecrets:
+        - name: gsstudio-registry
       restartPolicy: Never
 EOF
     echo "Job created. Monitor with: kubectl -n gsstudio logs -f job/gsstudio-prefetch-models"
