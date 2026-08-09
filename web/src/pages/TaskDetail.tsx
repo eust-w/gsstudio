@@ -1,9 +1,11 @@
 import { lazy, Suspense, useCallback, useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   cancelTask,
+  deleteTask,
   getArtifactUrl,
   getTask,
+  updateTask,
   Artifact,
   TaskDetail as TaskDetailType,
 } from "../api";
@@ -20,10 +22,15 @@ export function preferredSplatArtifact(artifacts: Artifact[]): Artifact | undefi
 
 export default function TaskDetail() {
   const { taskId } = useParams<{ taskId: string }>();
+  const navigate = useNavigate();
   const [task, setTask] = useState<TaskDetailType | null>(null);
   const [error, setError] = useState("");
   const [activePreview, setActivePreview] = useState<string>("panorama");
   const [cancelling, setCancelling] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draftName, setDraftName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   const fetchTask = useCallback(async () => {
     if (!taskId) return;
@@ -76,6 +83,39 @@ export default function TaskDetail() {
     }
   };
 
+  const startEditing = () => {
+    setDraftName(task.name);
+    setEditing(true);
+  };
+
+  const handleSave = async () => {
+    if (!taskId || saving || !draftName.trim()) return;
+    setSaving(true);
+    try {
+      const updated = await updateTask(taskId, { name: draftName.trim() });
+      setTask(updated);
+      setEditing(false);
+      setError("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Update failed");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!taskId || deleting) return;
+    if (!window.confirm(`Delete task "${task.name}" and all of its generated files?`)) return;
+    setDeleting(true);
+    try {
+      await deleteTask(taskId);
+      navigate("/");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Delete failed");
+      setDeleting(false);
+    }
+  };
+
   // Categorize artifacts
   const panoArtifacts = task.artifacts.filter((a) => a.type === "image" && a.name.includes("pano"));
   const videoArtifacts = task.artifacts.filter((a) => a.type === "video");
@@ -93,18 +133,43 @@ export default function TaskDetail() {
       <div className="page-header">
         <div>
           <Link to="/" className="back-link">&larr; Back</Link>
-          <h2>{task.name}</h2>
+          {editing ? (
+            <div className="task-name-editor">
+              <label htmlFor="task-name">Task name</label>
+              <input
+                id="task-name"
+                value={draftName}
+                onChange={(event) => setDraftName(event.target.value)}
+                autoFocus
+              />
+              <button className="btn btn-primary" onClick={handleSave} disabled={saving || !draftName.trim()}>
+                {saving ? "Saving..." : "Save"}
+              </button>
+              <button className="btn btn-secondary" onClick={() => setEditing(false)} disabled={saving}>
+                Cancel
+              </button>
+            </div>
+          ) : (
+            <h2>{task.name}</h2>
+          )}
           <StatusBadge status={task.status} />
         </div>
-        {canCancel && (
-          <button
-            className="btn btn-danger"
-            onClick={handleCancel}
-            disabled={cancelling}
-          >
-            {cancelling ? "Cancelling..." : "Cancel Task"}
-          </button>
-        )}
+        <div className="task-actions">
+          {!editing && <button className="btn" onClick={startEditing}>Edit task</button>}
+          {canCancel ? (
+            <button
+              className="btn btn-danger"
+              onClick={handleCancel}
+              disabled={cancelling}
+            >
+              {cancelling ? "Cancelling..." : "Cancel Task"}
+            </button>
+          ) : (
+            <button className="btn btn-danger" onClick={handleDelete} disabled={deleting}>
+              {deleting ? "Deleting..." : "Delete task"}
+            </button>
+          )}
+        </div>
       </div>
 
       {error && <div className="error-banner">{error}</div>}
