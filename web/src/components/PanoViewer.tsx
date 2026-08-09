@@ -112,11 +112,12 @@ export default function PanoViewer({ url }: PanoViewerProps) {
         camera.updateProjectionMatrix();
         renderer.setSize(container.clientWidth, container.clientHeight);
       };
-      window.addEventListener("resize", onResize);
+      const resizeObserver = new ResizeObserver(onResize);
+      resizeObserver.observe(container);
 
       return () => {
         cancelAnimationFrame(animationId);
-        window.removeEventListener("resize", onResize);
+        resizeObserver.disconnect();
         container.removeEventListener("pointerdown", onPointerDown);
         container.removeEventListener("pointermove", onPointerMove);
         container.removeEventListener("pointerup", onPointerUp);
