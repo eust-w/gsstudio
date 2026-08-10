@@ -1,10 +1,17 @@
 # syntax=docker/dockerfile:1
-# GSStudio a800-v33: replenish untried high-quality trajectories after alignment rejection.
+# GSStudio a800-v36: automatic recovery, repeatable source retries, and
+# reproducible dependency-audit remediation.
 # Keeping CUDA extensions and model runtimes in the v22 base makes this release
 # fast and avoids recompiling HY-World during a safety/quality-only rollout.
 FROM ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22
 
 USER root
+
+# Patch only the audited generic Python packages.  The model/runtime packages
+# stay in the proven CUDA base to avoid a hidden model-stack upgrade.
+COPY deploy/requirements-security.txt /tmp/requirements-security.txt
+RUN pip install --no-cache-dir --index-url https://pypi.org/simple --upgrade -r /tmp/requirements-security.txt \
+    && rm /tmp/requirements-security.txt
 
 # WorldNav depends on both the native SpatialIndex library and its Python
 # binding.  Build-time and startup checks prevent the upstream silent fallback.
@@ -33,6 +40,13 @@ COPY deploy/scripts/patch_hyworld_video_filter.py /tmp/patch_hyworld_video_filte
 RUN python /tmp/patch_hyworld_video_filter.py \
         /opt/hyworld2/hyworld2/worldgen/video_gen.py \
     && rm /tmp/patch_hyworld_video_filter.py
+
+# Render only the new conservative camera paths created during recovery;
+# rerendering every original WorldNav path defeats the bounded GPU budget.
+COPY deploy/scripts/patch_hyworld_render_filter.py /tmp/patch_hyworld_render_filter.py
+RUN python /tmp/patch_hyworld_render_filter.py \
+        /opt/hyworld2/hyworld2/worldgen/traj_render.py \
+    && rm /tmp/patch_hyworld_render_filter.py
 
 # Replace the public application surface and API/worker implementation.
 COPY web/dist/ /app/web/dist/

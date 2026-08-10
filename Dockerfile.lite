@@ -18,7 +18,10 @@ WORKDIR /app
 
 # Install server dependencies
 COPY server/ ./server/
-RUN pip install --no-cache-dir fastapi "uvicorn[standard]" python-multipart aiofiles websockets pydantic
+COPY deploy/requirements-security.txt /tmp/requirements-security.txt
+RUN pip install --no-cache-dir --index-url https://pypi.org/simple fastapi "uvicorn[standard]" python-multipart aiofiles websockets pydantic \
+    && pip install --no-cache-dir --index-url https://pypi.org/simple --upgrade -r /tmp/requirements-security.txt \
+    && rm /tmp/requirements-security.txt
 
 # Copy pre-built frontend (build locally with: cd web && npm install && npm run build)
 COPY web/dist/ ./web/dist/

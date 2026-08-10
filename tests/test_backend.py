@@ -169,6 +169,315 @@ class TestCheckpointResume:
         assert "Navmesh Error" in stage["error"]
         assert any(artifact["name"] == "quality_report.json" for artifact in task["artifacts"])
 
+    def test_worker_runs_auto_recovery_initial_batch_and_stops_after_six_accepted(self, cfg, monkeypatch):
+        import server.pipeline.worker as worker_module
+
+        task_dir = cfg.task_dir("auto-recovery")
+        scene_dir = task_dir / "scene"
+        logs_dir = task_dir / "logs"
+        logs_dir.mkdir(parents=True)
+        scene_dir.mkdir(parents=True)
+        (task_dir / "quality_report.json").write_text(json.dumps({
+            "planning": {
+                "trajectories": [
+                    {"id": f"view{index}/traj0", "kind": "regular"}
+                    for index in range(8)
+                ]
+            }
+        }))
+
+        async def successful_worldstereo(*, log_file, **_kwargs):
+            manifest = json.loads((task_dir / "video_trajectory_whitelist.json").read_text())
+            lines = []
+            for trajectory_id in manifest["candidate_trajectory_ids"]:
+                lines.extend([
+                    f"{trajectory_id} (2 frames): k=[0.9,1.0], b=[0.0,0.1], max_abs_dev=[0.01,0.02], max_rel_dev=[1.0%,10.0%]",
+                    f"[Alignment Rank0] [Frame {trajectory_id}/000000] [Success] Guidance mask ratio: 0.9200, depth percentile error ratio: 0.02000",
+                    f"[Alignment Rank0] [Frame {trajectory_id}/000020] [Success] Guidance mask ratio: 0.9100, depth percentile error ratio: 0.03000",
+                ])
+            log_file.write_text("\n".join(lines))
+            return True, ""
+
+        monkeypatch.setattr(worker_module, "run_stage", successful_worldstereo)
+        async def run_auto_recovery():
+            return await PipelineWorker(cfg)._run_auto_high_quality_video_recovery(
+                task_dir=task_dir,
+                scene_dir=scene_dir,
+                log_file=logs_dir / "video_gen.log",
+                cmd=["worldstereo"],
+                env={},
+                cwd=task_dir,
+                cancel_event=asyncio.Event(),
+                task_type="worldgen_from_pano",
+                recovery_policy="auto",
+                render_spec=None,
+            )
+        success, error = asyncio.run(run_auto_recovery())
+
+        assert success is True
+        assert error == ""
+        recovery = json.loads((task_dir / "auto_recovery.json").read_text())
+        assert recovery["state"] == "accepted"
+        assert recovery["generated_video_trajectory_count"] == 8
+        assert len(recovery["accepted_trajectory_ids"]) == 8
+
+    def test_execute_task_routes_high_auto_policy_to_auto_recovery_worker(self, cfg, monkeypatch):
+        import server.pipeline.worker as worker_module
+
+        cfg.MOCK_PIPELINE = False
+        task_id = create_task(
+            cfg.DB_PATH,
+            name="automatic-recovery",
+            task_type="worldgen_from_pano",
+            config={"quality_preset": "high", "recovery_policy": "auto"},
+        )
+        monkeypatch.setattr(
+            worker_module,
+            "get_worldgen_commands",
+            lambda **_kwargs: [("video_gen", ["fake"], {}, Path("/tmp"))],
+        )
+        called = {"auto": False}
+
+        async def auto_recovery(**_kwargs):
+            called["auto"] = True
+            return True, ""
+
+        async def legacy_recovery(**_kwargs):
+            raise AssertionError("automatic policy must not run the legacy replenishment loop")
+
+        worker = PipelineWorker(cfg)
+        monkeypatch.setattr(worker, "_run_auto_high_quality_video_recovery", auto_recovery)
+        monkeypatch.setattr(worker, "_run_high_quality_video_recovery", legacy_recovery)
+
+        asyncio.run(worker.execute_task(task_id))
+
+        assert called["auto"] is True
+        assert get_task(cfg.DB_PATH, task_id)["status"] == TaskStatus.COMPLETED.value
+
+    def test_auto_worker_uses_rescue_before_normal_backlog_after_two_acceptances(self, cfg, monkeypatch):
+        import server.pipeline.worker as worker_module
+
+        cfg.MANAGE_VLLM = False
+        task_dir = cfg.task_dir("auto-rescue")
+        logs_dir = task_dir / "logs"
+        scene_dir = task_dir / "scene"
+        logs_dir.mkdir(parents=True)
+        scene_dir.mkdir(parents=True)
+        (task_dir / "quality_report.json").write_text(json.dumps({
+            "planning": {"trajectories": [
+                {"id": f"view{index}/traj0", "kind": "regular"} for index in range(12)
+            ]}
+        }))
+        calls: list[tuple[str, list[str]]] = []
+
+        async def fake_stage(*, stage_name, log_file, **_kwargs):
+            manifest = json.loads((task_dir / "video_trajectory_whitelist.json").read_text())
+            candidate_ids = manifest["candidate_trajectory_ids"]
+            calls.append((stage_name, candidate_ids))
+            if stage_name == "traj_render":
+                return True, ""
+            accepted_count = 2 if len([item for item in calls if item[0] == "video_gen"]) == 1 else 6
+            with open(log_file, "a") as log:
+                for index, trajectory_id in enumerate(candidate_ids):
+                    guidance = 0.92 if index < accepted_count else 0.10
+                    log.write(
+                        f"{trajectory_id} (2 frames): k=[0.9,1.0], b=[0.0,0.1], max_abs_dev=[0.01,0.02], max_rel_dev=[1.0%,10.0%]\n"
+                        f"[Alignment Rank0] [Frame {trajectory_id}/000000] [Success] "
+                        f"Guidance mask ratio: {guidance:.4f}, depth percentile error ratio: 0.02000\n"
+                        f"[Alignment Rank0] [Frame {trajectory_id}/000020] [Success] "
+                        f"Guidance mask ratio: {guidance:.4f}, depth percentile error ratio: 0.02000\n"
+                    )
+            return True, ""
+
+        monkeypatch.setattr(worker_module, "run_stage", fake_stage)
+        monkeypatch.setattr(
+            worker_module,
+            "create_conservative_rescue_trajectories",
+            lambda _scene_dir, *, round_number: [
+                {"id": f"view_recovery_r{round_number}_{index}/traj0", "kind": "regular"}
+                for index in range(6)
+            ],
+        )
+
+        async def run_recovery():
+            return await PipelineWorker(cfg)._run_auto_high_quality_video_recovery(
+                task_dir=task_dir,
+                scene_dir=scene_dir,
+                log_file=logs_dir / "video_gen.log",
+                cmd=["worldstereo"],
+                env={},
+                cwd=task_dir,
+                cancel_event=asyncio.Event(),
+                task_type="worldgen_from_pano",
+                recovery_policy="auto",
+                render_spec=(["renderer"], {}, task_dir),
+            )
+        success, error = asyncio.run(run_recovery())
+
+        assert success, error
+        assert [(stage, len(batch)) for stage, batch in calls] == [
+            ("video_gen", 8),
+            ("traj_render", 6),
+            ("video_gen", 6),
+        ]
+        assert calls[1][1] == [f"view_recovery_r1_{index}/traj0" for index in range(6)]
+
+    def test_auto_worker_uses_next_seed_for_generated_source_after_two_failed_rescue_rounds(self, cfg, monkeypatch):
+        from server.pipeline.recovery import (
+            complete_auto_recovery_batch,
+            prepare_auto_recovery,
+            schedule_auto_recovery_batch,
+        )
+
+        cfg.MANAGE_VLLM = False
+        task_dir = cfg.task_dir("auto-regenerate")
+        task_dir.mkdir(parents=True)
+        planning = {"trajectories": [{"id": f"view{index}/traj0", "kind": "regular"} for index in range(8)]}
+        (task_dir / "quality_report.json").write_text(json.dumps({"planning": planning}))
+        first = prepare_auto_recovery(task_dir, planning=planning, task_type="worldgen", recovery_policy="auto")
+        complete_auto_recovery_batch(task_dir, alignment={"accepted_trajectory_ids": []}, duration_seconds=1)
+        prepare_auto_recovery(task_dir, planning=planning, task_type="worldgen", recovery_policy="auto")
+        schedule_auto_recovery_batch(task_dir, phase="rescue_1", candidate_ids=[f"view_recovery_r1_{i}/traj0" for i in range(6)])
+        complete_auto_recovery_batch(task_dir, alignment={"accepted_trajectory_ids": []}, duration_seconds=1)
+        prepare_auto_recovery(task_dir, planning=planning, task_type="worldgen", recovery_policy="auto")
+        schedule_auto_recovery_batch(task_dir, phase="rescue_2", candidate_ids=[f"view_recovery_r2_{i}/traj0" for i in range(6)])
+        complete_auto_recovery_batch(task_dir, alignment={"accepted_trajectory_ids": []}, duration_seconds=1)
+        assert prepare_auto_recovery(task_dir, planning=planning, task_type="worldgen", recovery_policy="auto")["state"] == "needs_regeneration"
+
+        called: dict[str, object] = {}
+
+        async def regenerated_attempt(**kwargs):
+            called.update(kwargs)
+            return True, ""
+
+        worker = PipelineWorker(cfg)
+        monkeypatch.setattr(worker, "_run_regenerated_source_attempt", regenerated_attempt)
+
+        async def run_auto_recovery():
+            return await worker._run_auto_high_quality_video_recovery(
+                task_dir=task_dir,
+                scene_dir=task_dir / "scene",
+                log_file=task_dir / "logs" / "video_gen.log",
+                cmd=["worldstereo"],
+                env={},
+                cwd=task_dir,
+                cancel_event=asyncio.Event(),
+                task_type="worldgen",
+                recovery_policy="auto",
+                render_spec=None,
+                input_dir=task_dir / "input",
+                task_config={"seed": 1024},
+            )
+        success, error = asyncio.run(run_auto_recovery())
+
+        assert success, error
+        assert called["seed"] == 1025
+
+    def test_resumed_source_regeneration_continues_with_gs_data_and_training(self, cfg, monkeypatch):
+        import server.pipeline.worker as worker_module
+
+        cfg.MOCK_PIPELINE = False
+        task_id = create_task(
+            cfg.DB_PATH,
+            name="resumed-source-regeneration",
+            task_type="worldgen",
+            config={"quality_preset": "high", "recovery_policy": "auto", "seed": 1024},
+        )
+        task_dir = cfg.task_dir(task_id)
+        task_dir.mkdir(parents=True)
+        (task_dir / "auto_recovery.json").write_text(json.dumps({
+            "version": 1,
+            "state": "regenerating_panorama",
+            "source_attempt": 1,
+            "source_seed": 1025,
+            "active_scene_relpath": "recovery_attempts/attempt-001/scene",
+        }))
+        monkeypatch.setattr(
+            worker_module,
+            "get_worldgen_commands",
+            lambda **_kwargs: [
+                ("panogen", ["panogen"], {}, Path("/tmp")),
+                ("traj_generate", ["traj"], {}, Path("/tmp")),
+                ("traj_render", ["render"], {}, Path("/tmp")),
+                ("video_gen", ["video"], {}, Path("/tmp")),
+                ("gen_gs_data", ["data"], {}, Path("/tmp")),
+                ("gs_training", ["train"], {}, Path("/tmp")),
+            ],
+        )
+        worker = PipelineWorker(cfg)
+        resumed: dict[str, object] = {}
+
+        async def regenerate(**kwargs):
+            resumed.update(kwargs)
+            return True, ""
+
+        called_stages: list[str] = []
+
+        async def fake_stage(*, stage_name, **_kwargs):
+            called_stages.append(stage_name)
+            return True, ""
+
+        monkeypatch.setattr(worker, "_run_regenerated_source_attempt", regenerate)
+        monkeypatch.setattr(worker_module, "run_stage", fake_stage)
+
+        asyncio.run(worker.execute_task(task_id))
+
+        assert resumed["resume"] is True
+        assert resumed["seed"] == 1025
+        assert called_stages == ["gen_gs_data", "gs_training"]
+        assert get_task(cfg.DB_PATH, task_id)["status"] == TaskStatus.COMPLETED.value
+
+    def test_replacement_panorama_resume_never_runs_panogen_and_continues_training(self, cfg, monkeypatch):
+        import server.pipeline.worker as worker_module
+
+        cfg.MOCK_PIPELINE = False
+        task_id = create_task(
+            cfg.DB_PATH,
+            name="replacement-panorama",
+            task_type="worldgen_from_pano",
+            config={"quality_preset": "high", "recovery_policy": "auto"},
+        )
+        task_dir = cfg.task_dir(task_id)
+        task_dir.mkdir(parents=True)
+        (task_dir / "auto_recovery.json").write_text(json.dumps({
+            "version": 1,
+            "state": "replacing_panorama_source",
+            "source_attempt": 1,
+            "active_scene_relpath": "recovery_attempts/attempt-001/scene",
+        }))
+        monkeypatch.setattr(
+            worker_module,
+            "get_worldgen_commands",
+            lambda **_kwargs: [
+                ("traj_generate", ["traj"], {}, Path("/tmp")),
+                ("traj_render", ["render"], {}, Path("/tmp")),
+                ("video_gen", ["video"], {}, Path("/tmp")),
+                ("gen_gs_data", ["data"], {}, Path("/tmp")),
+                ("gs_training", ["train"], {}, Path("/tmp")),
+            ],
+        )
+        worker = PipelineWorker(cfg)
+        resumed: dict[str, object] = {}
+
+        async def replacement(**kwargs):
+            resumed.update(kwargs)
+            return True, ""
+
+        called_stages: list[str] = []
+
+        async def fake_stage(*, stage_name, **_kwargs):
+            called_stages.append(stage_name)
+            return True, ""
+
+        monkeypatch.setattr(worker, "_run_replacement_panorama_attempt", replacement)
+        monkeypatch.setattr(worker_module, "run_stage", fake_stage)
+
+        asyncio.run(worker.execute_task(task_id))
+
+        assert resumed["resume"] is True
+        assert called_stages == ["gen_gs_data", "gs_training"]
+        assert get_task(cfg.DB_PATH, task_id)["status"] == TaskStatus.COMPLETED.value
+
     def test_worker_preserves_cancelled_terminal_status_when_a_stage_stops(self, cfg, monkeypatch):
         import server.pipeline.worker as worker_module
 
@@ -241,7 +550,7 @@ class TestCheckpointResume:
         success, error = asyncio.run(run_recovery())
 
         assert success, error
-        assert [len(batch) for batch in calls] == [16, 8]
+        assert [len(batch) for batch in calls] == [8, 8]
         recovery = json.loads((task_dir / "video_recovery.json").read_text())
         assert recovery["status"] == "accepted"
         assert len(recovery["accepted_trajectory_ids"]) == 6
@@ -428,6 +737,33 @@ class TestDeploymentContract:
         subprocess.run([sys.executable, str(patch_script), str(upstream)], check=True)
         assert upstream.read_text() == patched
 
+    def test_render_filter_patch_limits_rendering_to_new_recovery_candidates(self, tmp_path):
+        upstream = tmp_path / "traj_render.py"
+        upstream.write_text(
+            "import argparse\nimport json\n"
+            "parser = argparse.ArgumentParser()\n"
+            "parser.add_argument(\"--target_path\", default=None, type=str, help=\"target path\")\n"
+            "traj_list = (glob(f\"{scene_path}/render_results/view*/traj*\") +\n"
+            "             glob(f\"{scene_path}/render_results/target*/traj*\"))\n"
+            "for traj_path in traj_list:\n"
+            "    if not os.path.exists(f\"{traj_path}/camera.json\"):\n"
+            "        continue\n"
+            "    pass\n"
+            "total_render_list = glob(f\"{scene_path}/render_results/*/traj*/render.mp4\")\n"
+        )
+        patch_script = Path(__file__).parents[1] / "deploy/scripts/patch_hyworld_render_filter.py"
+
+        subprocess.run([sys.executable, str(patch_script), str(upstream)], check=True)
+        patched = upstream.read_text()
+
+        assert "--trajectory_whitelist" in patched
+        assert "candidate_trajectory_ids" in patched
+        assert "No trajectory paths matched" in patched
+        assert "--skip_exist" in patched
+
+        subprocess.run([sys.executable, str(patch_script), str(upstream)], check=True)
+        assert upstream.read_text() == patched
+
     def test_image_and_startup_preflight_require_rtree(self):
         dockerfile = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
         entrypoint = (Path(__file__).parents[1] / "deploy/scripts/entrypoint.sh").read_text()
@@ -449,15 +785,21 @@ class TestDeploymentContract:
         assert "patch_hyworld_video_filter.py" in dockerfile
         assert "/opt/hyworld2/hyworld2/worldgen/video_gen.py" in dockerfile
 
-    def test_gpu_rollout_manifests_target_the_immutable_v33_image(self):
+    def test_image_patches_upstream_trajectory_rendering_for_recovery_whitelists(self):
+        dockerfile = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
+
+        assert "patch_hyworld_render_filter.py" in dockerfile
+        assert "/opt/hyworld2/hyworld2/worldgen/traj_render.py" in dockerfile
+
+    def test_gpu_rollout_manifests_target_the_immutable_v34_image(self):
         root = Path(__file__).parents[1]
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v33" in deployment
-        assert "gsstudio:a800-v33" in build
-        assert "gsstudio:a800-v32" not in deployment
-        assert "gsstudio:a800-v32" not in build
+        assert "gsstudio:a800-v36" in deployment
+        assert "gsstudio:a800-v36" in build
+        assert "gsstudio:a800-v35" not in deployment
+        assert "gsstudio:a800-v35" not in build
         assert "gsstudio:a800-v22" not in deployment
         assert "gsstudio:a800-v22" not in build
 
@@ -519,7 +861,7 @@ class TestDeploymentContract:
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
 
         assert "FROM ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22" in source
-        assert "GSStudio a800-v32" in source
+        assert "GSStudio a800-v36" in source
 
     def test_image_patches_worldstereo_transformer_for_local_only_loading(self):
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
@@ -614,9 +956,126 @@ class TestAPI:
         assert task["config"] == {
             "prompt": "form prompt wins",
             "quality_preset": "high",
+            "recovery_policy": "auto",
             "seed": 17,
             "worldstereo_model_type": "worldstereo-memory",
         }
+
+    def test_task_quality_endpoint_returns_compact_auto_recovery_state(self, client):
+        from server.config import Config
+
+        task_id = client.post("/api/tasks", data={
+            "type": "worldrecon",
+            "name": "quality-status",
+            "config": "{}",
+        }).json()["task_id"]
+        task_dir = Config().task_dir(task_id)
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / "auto_recovery.json").write_text(json.dumps({
+            "version": 1,
+            "state": "generating_rescue",
+            "phase": "rescue_1",
+            "rescue_round": 1,
+            "source_attempt": 0,
+            "minimum_accepted_trajectories": 6,
+            "accepted_trajectory_ids": ["view1/traj0", "view2/traj1"],
+            "attempted_trajectory_ids": ["view0/traj0"],
+            "pending_candidate_trajectory_ids": ["view_recovery_r1_0/traj0"],
+            "generated_video_trajectory_count": 8,
+            "video_seconds": 9.0,
+            "limits": {"maximum_video_trajectories": 40, "maximum_video_seconds": 7200},
+            "terminal_reason": None,
+            "updated_at": "2026-08-11T00:00:00Z",
+        }))
+
+        response = client.get(f"/api/tasks/{task_id}/quality")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "available": True,
+            "state": "generating_rescue",
+            "phase": "rescue_1",
+            "rescue_round": 1,
+            "source_attempt": 0,
+            "accepted_trajectories": 2,
+            "required_trajectories": 6,
+            "attempted_trajectories": 1,
+            "pending_trajectories": 1,
+            "generated_video_trajectories": 8,
+            "video_seconds": 9.0,
+            "limits": {"maximum_video_trajectories": 40, "maximum_video_seconds": 7200},
+            "terminal_reason": None,
+            "updated_at": "2026-08-11T00:00:00Z",
+        }
+
+    def test_retry_source_advances_generated_seed_without_relaxing_quality_policy(self, client, cfg):
+        task_id = create_task(
+            cfg.DB_PATH,
+            name="source-retry",
+            task_type="worldgen",
+            config={"quality_preset": "high", "recovery_policy": "auto", "seed": 1024},
+        )
+        update_task(cfg.DB_PATH, task_id, status=TaskStatus.FAILED.value, error="source_quality_blocked")
+        task_dir = cfg.task_dir(task_id)
+        task_dir.mkdir(parents=True)
+        (task_dir / "auto_recovery.json").write_text(json.dumps({
+            "version": 1,
+            "task_type": "worldgen",
+            "state": "quality_blocked",
+            "source_attempt": 0,
+            "attempt_history": [],
+            "accepted_trajectory_ids": [],
+            "attempted_trajectory_ids": [],
+            "batches": [],
+            "minimum_accepted_trajectories": 6,
+            "limits": {},
+        }))
+
+        response = client.post(f"/api/tasks/{task_id}/retry-source")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "pending"
+        report = json.loads((task_dir / "auto_recovery.json").read_text())
+        assert report["state"] == "regenerating_panorama"
+        assert report["source_seed"] == 1025
+        assert get_task(cfg.DB_PATH, task_id)["config"]["recovery_policy"] == "auto"
+
+    def test_retry_source_requires_and_preserves_a_replacement_panorama(self, client, cfg):
+        task_id = create_task(
+            cfg.DB_PATH,
+            name="panorama-source-retry",
+            task_type="worldgen_from_pano",
+            config={"quality_preset": "high", "recovery_policy": "auto"},
+        )
+        update_task(cfg.DB_PATH, task_id, status=TaskStatus.FAILED.value, error="source_quality_blocked")
+        task_dir = cfg.task_dir(task_id)
+        task_dir.mkdir(parents=True)
+        (task_dir / "auto_recovery.json").write_text(json.dumps({
+            "version": 1,
+            "task_type": "worldgen_from_pano",
+            "state": "source_quality_blocked",
+            "source_attempt": 0,
+            "attempt_history": [],
+            "accepted_trajectory_ids": [],
+            "attempted_trajectory_ids": [],
+            "batches": [],
+            "minimum_accepted_trajectories": 6,
+            "limits": {},
+        }))
+
+        missing = client.post(f"/api/tasks/{task_id}/retry-source")
+        response = client.post(
+            f"/api/tasks/{task_id}/retry-source",
+            files={"panorama": ("replacement.png", b"replacement-panorama", "image/png")},
+        )
+
+        assert missing.status_code == 400
+        assert response.status_code == 200
+        report = json.loads((task_dir / "auto_recovery.json").read_text())
+        assert report["state"] == "replacing_panorama_source"
+        assert (
+            task_dir / "recovery_attempts" / "attempt-001" / "scene" / "panorama.png"
+        ).read_bytes() == b"replacement-panorama"
 
     def test_worldgen_rejects_invalid_quality_preset(self, client, monkeypatch):
         monkeypatch.setenv("HF_TOKEN", "test-token")
