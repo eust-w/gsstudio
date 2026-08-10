@@ -22,8 +22,12 @@ RESUME_GUARD_PATTERN = re.compile(
     r'(?m)^(?P<indent>\s*)if os\.path\.exists\(f"\{scene\}/render_results/'
     r'generation_bank_\{args\.model_type\}/aligned_pcd\.ply"\) and args\.skip_exist:\s*$'
 )
+WORLD_MIRROR_PATTERN = re.compile(
+    r'(?m)^(?P<indent>\s*)memory_bank\.apply_worldmirror\(skip_exist=True\)\s*$'
+)
 CANDIDATE_SENTINEL = "# GSStudio video candidate whitelist patch"
 RESUME_SENTINEL = "GSStudio whitelist resume patch"
+WORLD_MIRROR_SENTINEL = "GSStudio whitelist world-mirror refresh patch"
 
 
 def _insert_after(pattern: re.Pattern[str], source: str, insertion_for_indent) -> str:
@@ -77,6 +81,22 @@ def patch(source: str) -> str:
             f'and not args.trajectory_whitelist:  # {RESUME_SENTINEL}'
         )
         source = source[:guard.start()] + replacement + source[guard.end():]
+
+    # A resumed candidate set can contain videos that were not part of the
+    # previous WorldMirror run.  Reusing its cameras/name map then causes the
+    # alignment phase to look up absent frame keys.  Keep per-video output
+    # reuse, but rebuild WorldMirror whenever an explicit candidate manifest
+    # is active so its depth cache exactly matches the current render list.
+    if WORLD_MIRROR_SENTINEL not in source:
+        world_mirror = WORLD_MIRROR_PATTERN.search(source)
+        if not world_mirror:
+            raise RuntimeError("Expected upstream WorldMirror invocation not found")
+        replacement = (
+            f"{world_mirror.group('indent')}memory_bank.apply_worldmirror(\n"
+            f"{world_mirror.group('indent')}    skip_exist=not bool(args.trajectory_whitelist),  # {WORLD_MIRROR_SENTINEL}\n"
+            f"{world_mirror.group('indent')})"
+        )
+        source = source[:world_mirror.start()] + replacement + source[world_mirror.end():]
     return source
 
 
