@@ -34,6 +34,26 @@ export interface TaskDetail extends Task {
   error?: string;
 }
 
+export interface TaskQualityRecovery {
+  available: boolean;
+  state?: string;
+  phase?: string | null;
+  rescue_round?: number | null;
+  source_attempt?: number;
+  accepted_trajectories?: number;
+  required_trajectories?: number;
+  attempted_trajectories?: number;
+  pending_trajectories?: number;
+  generated_video_trajectories?: number;
+  video_seconds?: number;
+  limits?: {
+    maximum_video_trajectories?: number;
+    maximum_video_seconds?: number;
+  };
+  terminal_reason?: string | null;
+  updated_at?: string;
+}
+
 export interface GpuInfo {
   index: number;
   name: string;
@@ -81,6 +101,12 @@ export async function getTask(id: string): Promise<TaskDetail> {
   return resp.json();
 }
 
+export async function getTaskQuality(id: string): Promise<TaskQualityRecovery> {
+  const resp = await fetch(`${API_BASE}/tasks/${id}/quality`);
+  if (!resp.ok) throw new Error(`Quality status failed: ${resp.statusText}`);
+  return resp.json();
+}
+
 export async function cancelTask(id: string): Promise<void> {
   const resp = await fetch(`${API_BASE}/tasks/${id}/cancel`, { method: "POST" });
   if (!resp.ok) throw new Error(`Cancel failed: ${resp.statusText}`);
@@ -89,6 +115,13 @@ export async function cancelTask(id: string): Promise<void> {
 export async function retryTask(id: string): Promise<void> {
   const resp = await fetch(`${API_BASE}/tasks/${id}/retry`, { method: "POST" });
   if (!resp.ok) throw new Error(`Retry failed: ${resp.statusText}`);
+}
+
+export async function retryTaskSource(id: string, panorama?: File): Promise<void> {
+  const body = panorama ? new FormData() : undefined;
+  if (body && panorama) body.set("panorama", panorama);
+  const resp = await fetch(`${API_BASE}/tasks/${id}/retry-source`, { method: "POST", body });
+  if (!resp.ok) throw new Error(`Source retry failed: ${resp.statusText}`);
 }
 
 export async function updateTask(id: string, updates: { name: string }): Promise<TaskDetail> {

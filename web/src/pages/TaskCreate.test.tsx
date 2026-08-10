@@ -41,7 +41,9 @@ describe("TaskCreate quality configuration", () => {
     expect(JSON.parse(formData.get("config") as string)).toEqual({
       prompt: "form prompt",
       quality_preset: "high",
+      recovery_policy: "auto",
       seed: 17,
     });
+    expect(screen.getByText(/automatically tries safe recovery paths/i)).toBeInTheDocument();
   });
 });
