@@ -132,7 +132,11 @@ export default function SplatViewer({ url, metadataUrl, collisionMeshUrl, onLoad
 
     const controls = new PointerLockControls(camera, renderer.domElement);
     controlsRef.current = controls;
-    const pointerLockSupported = supportsPointerLock(renderer.domElement, renderer.domElement.ownerDocument);
+    const pointerLockSupported = supportsPointerLock(
+      renderer.domElement,
+      renderer.domElement.ownerDocument,
+      window,
+    );
     setPointerLockAvailable(pointerLockSupported);
     const onPointerLock = () => setKeyboardActive(true);
     const onPointerUnlock = () => {
