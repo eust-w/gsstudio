@@ -14,6 +14,21 @@ echo =======================================
 
 mkdir -p $GSSTUDIO_DATA_DIR $GSSTUDIO_HF_HOME /var/log/supervisor
 
+# world_gs_trainer constructs a VGG16 perceptual-loss network.  Its weights
+# must be available before a task starts: an on-demand download wastes GPU
+# time, races across DDP workers, and makes an otherwise offline task depend
+# on external network access.
+TORCH_HOME="${TORCH_HOME:-/models/torch-cache}"
+export TORCH_HOME
+VGG16_CHECKPOINT="$TORCH_HOME/hub/checkpoints/vgg16-397923af.pth"
+VGG16_SHA256="397923af8e79cdbb6a7127f12361acd7a2f83e06b05044ddf496e83de57a5bf0"
+mkdir -p "$TORCH_HOME/hub/checkpoints"
+if [ ! -s "$VGG16_CHECKPOINT" ] || ! printf '%s  %s\n' "$VGG16_SHA256" "$VGG16_CHECKPOINT" | sha256sum --check --status; then
+    echo "ERROR: VGG16 offline preflight failed: missing or invalid $VGG16_CHECKPOINT" >&2
+    exit 1
+fi
+echo "VGG16 offline preflight OK"
+
 # `traj_generate.py` currently catches a missing rtree dependency and exits
 # successfully.  Fail before accepting work instead of creating a silent
 # low-quality task.

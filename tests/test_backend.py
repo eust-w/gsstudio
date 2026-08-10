@@ -210,6 +210,7 @@ class TestWorldgenCommands:
             task_type="worldgen_from_pano",
         )
         by_stage = {name: command for name, command, _, _ in commands}
+        env_by_stage = {name: env for name, _, env, _ in commands}
 
         assert by_stage["video_gen"][by_stage["video_gen"].index("--model_type") + 1] == "worldstereo-memory"
         assert by_stage["video_gen"][by_stage["video_gen"].index("--trajectory_whitelist") + 1] == str(
@@ -224,6 +225,7 @@ class TestWorldgenCommands:
         assert by_stage["gs_training"][by_stage["gs_training"].index("--strategy.refine-start-iter") + 1] == "200"
         assert by_stage["gs_training"][by_stage["gs_training"].index("--strategy.refine-stop-iter") + 1] == "1000"
         assert by_stage["gs_training"][by_stage["gs_training"].index("--strategy.refine-every") + 1] == "133"
+        assert env_by_stage["gs_training"]["TORCH_HOME"] == "/models/torch-cache"
 
     def test_fast_quality_keeps_dmd_model_type_in_every_downstream_stage(self, tmp_path):
         commands = get_worldgen_commands(
@@ -396,13 +398,13 @@ class TestDeploymentContract:
         assert "patch_hyworld_video_filter.py" in dockerfile
         assert "/opt/hyworld2/hyworld2/worldgen/video_gen.py" in dockerfile
 
-    def test_gpu_rollout_manifests_target_the_immutable_v31_image(self):
+    def test_gpu_rollout_manifests_target_the_immutable_v32_image(self):
         root = Path(__file__).parents[1]
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v31" in deployment
-        assert "gsstudio:a800-v31" in build
+        assert "gsstudio:a800-v32" in deployment
+        assert "gsstudio:a800-v32" in build
         assert "gsstudio:a800-v22" not in deployment
         assert "gsstudio:a800-v22" not in build
 
@@ -417,6 +419,20 @@ class TestDeploymentContract:
 
         assert "naver-iv/zim-anything-vitl" in source
         assert "IDEA-Research/grounding-dino-tiny" in source
+
+    def test_prefetch_and_startup_preflight_pin_the_vgg16_loss_checkpoint(self):
+        root = Path(__file__).parents[1]
+        prefetch = (root / "deploy/scripts/prefetch_models.sh").read_text()
+        entrypoint = (root / "deploy/scripts/entrypoint.sh").read_text()
+        deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
+
+        assert "TORCH_HOME" in prefetch
+        assert "download_url_to_file" in prefetch
+        assert "vgg16-397923af.pth" in prefetch
+        assert 'TORCH_HOME="${TORCH_HOME:-/models/torch-cache}"' in entrypoint
+        assert "VGG16 offline preflight OK" in entrypoint
+        assert "397923af8e79cdbb6a7127f12361acd7a2f83e06b05044ddf496e83de57a5bf0" in entrypoint
+        assert 'value: "/models/torch-cache"' in deployment
 
     def test_prefetch_includes_worldstereo_base_model_components(self):
         source = (Path(__file__).parents[1] / "deploy/scripts/prefetch_models.sh").read_text()
@@ -450,7 +466,7 @@ class TestDeploymentContract:
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
 
         assert "FROM ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22" in source
-        assert "GSStudio a800-v31" in source
+        assert "GSStudio a800-v32" in source
 
     def test_image_patches_worldstereo_transformer_for_local_only_loading(self):
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
