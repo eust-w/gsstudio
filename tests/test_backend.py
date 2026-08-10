@@ -3,6 +3,7 @@ import asyncio
 import base64
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -135,8 +136,112 @@ class TestCheckpointResume:
         assert "panogen" in VLLM_FREE_STAGES
         assert "video_gen" in VLLM_FREE_STAGES
 
+    def test_worker_marks_silent_navmesh_error_as_failed_stage(self, cfg, monkeypatch):
+        import server.pipeline.worker as worker_module
+
+        cfg.MOCK_PIPELINE = False
+
+        task_id = create_task(
+            cfg.DB_PATH,
+            name="silent-navmesh-error",
+            task_type="worldgen_from_pano",
+            config={"quality_preset": "high"},
+        )
+
+        monkeypatch.setattr(
+            worker_module,
+            "get_worldgen_commands",
+            lambda **_kwargs: [("traj_generate", ["fake"], {}, Path("/tmp"))],
+        )
+
+        async def successful_process_with_bad_log(*, log_file, **_kwargs):
+            log_file.write_text("Navmesh Error: No module named 'rtree'\n")
+            return True, None
+
+        monkeypatch.setattr(worker_module, "run_stage", successful_process_with_bad_log)
+
+        asyncio.run(PipelineWorker(cfg).execute_task(task_id))
+
+        task = get_task(cfg.DB_PATH, task_id)
+        assert task["status"] == TaskStatus.FAILED.value
+        stage = next(stage for stage in task["stages"] if stage["name"] == "traj_generate")
+        assert stage["status"] == StageStatus.FAILED.value
+        assert "Navmesh Error" in stage["error"]
+        assert any(artifact["name"] == "quality_report.json" for artifact in task["artifacts"])
+
+    def test_worker_preserves_cancelled_terminal_status_when_a_stage_stops(self, cfg, monkeypatch):
+        import server.pipeline.worker as worker_module
+
+        cfg.MOCK_PIPELINE = False
+        task_id = create_task(
+            cfg.DB_PATH,
+            name="cancelled-worldgen",
+            task_type="worldgen_from_pano",
+            config={"quality_preset": "high"},
+        )
+        monkeypatch.setattr(
+            worker_module,
+            "get_worldgen_commands",
+            lambda **_kwargs: [("traj_generate", ["fake"], {}, Path("/tmp"))],
+        )
+
+        async def cancelled_stage(*, cancel_event, **_kwargs):
+            cancel_event.set()
+            return False, "Cancelled by user"
+
+        monkeypatch.setattr(worker_module, "run_stage", cancelled_stage)
+
+        asyncio.run(PipelineWorker(cfg).execute_task(task_id))
+
+        assert get_task(cfg.DB_PATH, task_id)["status"] == TaskStatus.CANCELLED.value
+
 
 class TestWorldgenCommands:
+    def test_high_quality_uses_full_model_whitelist_and_fixed_training_schedule(self, tmp_path):
+        commands = get_worldgen_commands(
+            task_dir=tmp_path / "task",
+            scene_dir=tmp_path / "scene",
+            input_dir=tmp_path / "input",
+            config={"quality_preset": "high", "num_gpus": 5},
+            hyworld_repo=Path("/opt/hyworld2"),
+            vllm_host="localhost",
+            vllm_port=8100,
+            vllm_model="Qwen/Qwen3-VL-8B-Instruct",
+            task_type="worldgen_from_pano",
+        )
+        by_stage = {name: command for name, command, _, _ in commands}
+
+        assert by_stage["video_gen"][by_stage["video_gen"].index("--model_type") + 1] == "worldstereo-memory"
+        assert by_stage["video_gen"][by_stage["video_gen"].index("--trajectory_whitelist") + 1] == str(
+            tmp_path / "task" / "video_trajectory_whitelist.json"
+        )
+        assert "--skip_exist" in by_stage["video_gen"]
+        assert by_stage["gen_gs_data"][by_stage["gen_gs_data"].index("--result_name") + 1] == "worldstereo-memory"
+        assert by_stage["gen_gs_data"][by_stage["gen_gs_data"].index("--trajectory_whitelist") + 1] == str(
+            tmp_path / "task" / "trajectory_whitelist.json"
+        )
+        assert by_stage["gs_training"][by_stage["gs_training"].index("--max_steps") + 1] == "2000"
+        assert by_stage["gs_training"][by_stage["gs_training"].index("--strategy.refine-start-iter") + 1] == "200"
+        assert by_stage["gs_training"][by_stage["gs_training"].index("--strategy.refine-stop-iter") + 1] == "1000"
+        assert by_stage["gs_training"][by_stage["gs_training"].index("--strategy.refine-every") + 1] == "133"
+
+    def test_fast_quality_keeps_dmd_model_type_in_every_downstream_stage(self, tmp_path):
+        commands = get_worldgen_commands(
+            task_dir=tmp_path / "task",
+            scene_dir=tmp_path / "scene",
+            input_dir=tmp_path / "input",
+            config={"quality_preset": "fast"},
+            hyworld_repo=Path("/opt/hyworld2"),
+            vllm_host="localhost",
+            vllm_port=8100,
+            vllm_model="Qwen/Qwen3-VL-8B-Instruct",
+            task_type="worldgen_from_pano",
+        )
+        by_stage = {name: command for name, command, _, _ in commands}
+
+        assert by_stage["video_gen"][by_stage["video_gen"].index("--model_type") + 1] == "worldstereo-memory-dmd"
+        assert by_stage["gen_gs_data"][by_stage["gen_gs_data"].index("--result_name") + 1] == "worldstereo-memory-dmd"
+
     def test_panogen_uses_isolated_runtime_and_supported_attention(self, tmp_path):
         commands = get_worldgen_commands(
             task_dir=tmp_path / "task",
@@ -227,6 +332,72 @@ class TestFrontendViewerContract:
 
 
 class TestDeploymentContract:
+    def test_quality_filter_patch_adds_a_trajectory_whitelist_to_upstream_gs_data(self, tmp_path):
+        upstream = tmp_path / "gen_gs_data.py"
+        upstream.write_text(
+            "import argparse\nimport json\n"
+            "parser = argparse.ArgumentParser()\n"
+            "parser.add_argument('--result_name', '-n', type=str, default='worldstereo-memory-dmd')\n"
+            "video_paths = sorted(video_paths, key=lambda x: (x.split(\"/\")[-3], x.split(\"/\")[-2]))\n"
+            "video_paths = video_paths[rank::world_size]\n"
+        )
+        patch_script = Path(__file__).parents[1] / "deploy/scripts/patch_hyworld_quality_filter.py"
+
+        subprocess.run([sys.executable, str(patch_script), str(upstream)], check=True)
+        patched = upstream.read_text()
+
+        assert "--trajectory_whitelist" in patched
+        assert "accepted_trajectory_ids" in patched
+        assert "Skipping all videos is not allowed" in patched
+
+    def test_video_filter_patch_limits_worldstereo_to_planned_candidates(self, tmp_path):
+        upstream = tmp_path / "video_gen.py"
+        upstream.write_text(
+            "import argparse\nimport json\n"
+            "parser = argparse.ArgumentParser()\n"
+            "parser.add_argument(\"--target_path\", default=None, type=str, help=\"target path\")\n"
+            "render_list = sort_trajs(f\"{scene}/render_results\")\n"
+        )
+        patch_script = Path(__file__).parents[1] / "deploy/scripts/patch_hyworld_video_filter.py"
+
+        subprocess.run([sys.executable, str(patch_script), str(upstream)], check=True)
+        patched = upstream.read_text()
+
+        assert "--trajectory_whitelist" in patched
+        assert "candidate_trajectory_ids" in patched
+        assert "No trajectory renderings matched" in patched
+
+    def test_image_and_startup_preflight_require_rtree(self):
+        dockerfile = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
+        entrypoint = (Path(__file__).parents[1] / "deploy/scripts/entrypoint.sh").read_text()
+
+        assert "libspatialindex-dev" in dockerfile
+        assert "pip install --no-cache-dir rtree" in dockerfile
+        assert "import rtree" in dockerfile
+        assert "import rtree" in entrypoint
+
+    def test_image_patches_upstream_gs_data_for_quality_whitelists(self):
+        dockerfile = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
+
+        assert "patch_hyworld_quality_filter.py" in dockerfile
+        assert "/opt/hyworld2/hyworld2/worldgen/gen_gs_data.py" in dockerfile
+
+    def test_image_patches_upstream_video_generation_for_candidate_whitelists(self):
+        dockerfile = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
+
+        assert "patch_hyworld_video_filter.py" in dockerfile
+        assert "/opt/hyworld2/hyworld2/worldgen/video_gen.py" in dockerfile
+
+    def test_gpu_rollout_manifests_target_the_immutable_v23_image(self):
+        root = Path(__file__).parents[1]
+        deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
+        build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
+
+        assert "gsstudio:a800-v27" in deployment
+        assert "gsstudio:a800-v27" in build
+        assert "gsstudio:a800-v22" not in deployment
+        assert "gsstudio:a800-v22" not in build
+
     def test_entrypoint_maps_upstream_hf_cache_to_persistent_hub(self):
         source = (Path(__file__).parents[1] / "deploy/scripts/entrypoint.sh").read_text()
 
@@ -251,13 +422,27 @@ class TestDeploymentContract:
             "image_processor/*",
             "tokenizer/*",
             "vae/*",
+            "scheduler/*",
         ):
             assert component in source
 
-    def test_image_forces_cuda_build_for_pytorch3d(self):
+    def test_startup_preflight_rejects_an_incomplete_full_worldstereo_cache(self):
+        source = (Path(__file__).parents[1] / "deploy/scripts/entrypoint.sh").read_text()
+
+        assert "WorldStereo offline preflight" in source
+        assert "scheduler/scheduler_config.json" in source
+        assert "worldstereo-memory/model.safetensors" in source
+
+    def test_kubernetes_prefetch_includes_full_worldstereo_weights_for_high_quality(self):
+        source = (Path(__file__).parents[1] / "deploy/scripts/prefetch_models.sh").read_text()
+
+        assert "('hanshanxue/WorldStereo', None)" in source
+
+    def test_quality_overlay_inherits_verified_cuda_runtime(self):
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
 
-        assert 'FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="8.0" MAX_JOBS=8 pip install' in source
+        assert "FROM ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22" in source
+        assert "GSStudio a800-v27" in source
 
     def test_image_patches_worldstereo_transformer_for_local_only_loading(self):
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
@@ -332,6 +517,45 @@ class TestAPI:
         resp = client.get(f"/api/tasks/{task_id}")
         assert resp.status_code == 200
         assert resp.json()["name"] == "test-api-task"
+
+    def test_worldgen_form_prompt_overrides_advanced_config_and_persists_high_defaults(self, client, monkeypatch):
+        monkeypatch.setenv("HF_TOKEN", "test-token")
+
+        resp = client.post(
+            "/api/tasks",
+            data={
+                "type": "worldgen",
+                "name": "quality-config",
+                "prompt": "form prompt wins",
+                "config": json.dumps({"prompt": "advanced prompt", "seed": "17"}),
+            },
+            files={"image": ("input.png", b"image-bytes", "image/png")},
+        )
+
+        assert resp.status_code == 201
+        task = client.get(f"/api/tasks/{resp.json()['task_id']}").json()
+        assert task["config"] == {
+            "prompt": "form prompt wins",
+            "quality_preset": "high",
+            "seed": 17,
+            "worldstereo_model_type": "worldstereo-memory",
+        }
+
+    def test_worldgen_rejects_invalid_quality_preset(self, client, monkeypatch):
+        monkeypatch.setenv("HF_TOKEN", "test-token")
+
+        resp = client.post(
+            "/api/tasks",
+            data={
+                "type": "worldgen",
+                "name": "bad-quality-config",
+                "config": json.dumps({"quality_preset": "ultra"}),
+            },
+            files={"image": ("input.png", b"image-bytes", "image/png")},
+        )
+
+        assert resp.status_code == 400
+        assert "quality_preset" in resp.json()["detail"]
 
     @pytest.mark.parametrize(
         ("task_type", "upload_field"),

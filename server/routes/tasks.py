@@ -15,6 +15,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, Response, Uploa
 from ..config import Config
 from ..db import create_task, delete_task, get_task, list_tasks, update_task
 from ..models import TaskDetail, TaskListResponse, TaskResponse, TaskStatus, TaskUpdate
+from ..pipeline.quality import normalize_worldgen_config
 from ..pipeline.stage_runner import stream_log
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,13 @@ async def create_task_endpoint(
         config_dict = json.loads(config)
     except json.JSONDecodeError:
         raise HTTPException(400, "Invalid JSON in config field")
+    if not isinstance(config_dict, dict):
+        raise HTTPException(400, "config field must contain a JSON object")
+    if type in ("worldgen", "worldgen_from_pano"):
+        try:
+            config_dict = normalize_worldgen_config(config_dict, form_prompt=prompt)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     # Create task in DB
     task_id = create_task(cfg.DB_PATH, name=name, task_type=type, config=config_dict)

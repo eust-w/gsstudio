@@ -1,26 +1,102 @@
 import { useEffect, useRef, useState } from "react";
 import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
 import * as THREE from "three";
-import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { PointerLockControls } from "three/examples/jsm/controls/PointerLockControls.js";
+import { PLYLoader } from "three/examples/jsm/loaders/PLYLoader.js";
+import { MeshBVH, acceleratedRaycast } from "three-mesh-bvh";
 import { areSplatWorkersIdle, disposeSplatResourcesWhenIdle } from "./splatCleanup";
-import { isEditableTarget, moveCamera } from "./splatNavigation";
+import { isEditableTarget } from "./splatNavigation";
+import {
+  clampToNavigationBounds,
+  initialCameraPose,
+  moveOnGround,
+  parseViewerMetadata,
+  supportsPointerLock,
+  ViewerMetadata,
+} from "./splatFirstPerson";
+
+THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
 interface SplatViewerProps {
   url: string;
+  metadataUrl?: string;
+  collisionMeshUrl?: string;
   onLoad?: () => void;
   onError?: (err: Error) => void;
 }
 
-export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) {
+type NavigationStatus = "loading" | "ready" | "unavailable" | "error";
+
+function safeFallbackPose(mesh: SplatMesh, camera: THREE.PerspectiveCamera): () => void {
+  const bounds = mesh.getBoundingBox();
+  const center = bounds.getCenter(new THREE.Vector3());
+  const diagonal = Math.max(bounds.getSize(new THREE.Vector3()).length(), 1);
+  const lookAt = center.clone().add(new THREE.Vector3(0, 0, -1));
+  return () => {
+    camera.fov = 70;
+    camera.up.set(0, 1, 0);
+    // Keeping a legacy task at the point-cloud center is intentionally safer
+    // than the former bounding-box exterior guess for indoor scenes.
+    camera.position.copy(center);
+    camera.near = Math.max(diagonal / 10000, 0.001);
+    camera.far = Math.max(diagonal * 100, 1000);
+    camera.lookAt(lookAt);
+    camera.updateProjectionMatrix();
+  };
+}
+
+function resolveCollision(
+  current: THREE.Vector3,
+  candidate: THREE.Vector3,
+  metadata: ViewerMetadata,
+  collisionMesh: THREE.Mesh | null,
+  raycaster: THREE.Raycaster,
+): THREE.Vector3 {
+  const bounded = clampToNavigationBounds(current, candidate, metadata);
+  if (!collisionMesh) return bounded;
+
+  const up = metadata.upDirection;
+  const horizontalMove = bounded.clone().sub(current).projectOnPlane(up);
+  if (horizontalMove.lengthSq() > 0) {
+    const moveDistance = horizontalMove.length();
+    raycaster.set(current.clone().addScaledVector(up, Math.max(metadata.humanScale * 0.05, 0.02)), horizontalMove.normalize());
+    raycaster.near = 0.02;
+    raycaster.far = moveDistance + Math.max(metadata.humanScale * 0.2, 0.05);
+    const wallHit = raycaster.intersectObject(collisionMesh, false)[0];
+    if (wallHit) return current.clone();
+  }
+
+  // Re-anchor the camera eye on the simplified collision mesh when a nearby
+  // ground surface is present.  Vertical motion itself stays disabled.
+  const eyeHeight = Math.max(metadata.humanScale * 1.6, 0.4);
+  raycaster.set(bounded.clone().addScaledVector(up, eyeHeight), up.clone().negate());
+  raycaster.near = 0;
+  raycaster.far = eyeHeight * 2;
+  const groundHit = raycaster.intersectObject(collisionMesh, false)[0];
+  if (groundHit) {
+    return groundHit.point.clone().addScaledVector(up, eyeHeight);
+  }
+  return bounded;
+}
+
+export default function SplatViewer({ url, metadataUrl, collisionMeshUrl, onLoad, onError }: SplatViewerProps) {
   const viewerRef = useRef<HTMLDivElement>(null);
   const canvasContainerRef = useRef<HTMLDivElement>(null);
   const pressedKeysRef = useRef(new Set<string>());
-  const moveSpeedRef = useRef(1);
+  const controlsRef = useRef<PointerLockControls | null>(null);
+  const resetViewRef = useRef<() => void>(() => {});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [progress, setProgress] = useState(0);
   const [loadedBytes, setLoadedBytes] = useState(0);
   const [keyboardActive, setKeyboardActive] = useState(false);
+  const [pointerLockAvailable, setPointerLockAvailable] = useState(true);
+  const [navigationStatus, setNavigationStatus] = useState<NavigationStatus>(
+    collisionMeshUrl ? "loading" : "unavailable",
+  );
+  const [metadataMode, setMetadataMode] = useState<"loading" | "official" | "fallback">(
+    metadataUrl ? "loading" : "fallback",
+  );
 
   useEffect(() => {
     const container = canvasContainerRef.current;
@@ -28,24 +104,52 @@ export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) 
     if (!container || !viewer || !url) return;
 
     let disposed = false;
+    let metadata: ViewerMetadata | null = null;
+    let fallbackReset: (() => void) | null = null;
+    let collisionMesh: THREE.Mesh | null = null;
+    let collisionReady = false;
+    let splatReady = false;
+    const raycaster = new THREE.Raycaster();
+    (raycaster as THREE.Raycaster & { firstHitOnly?: boolean }).firstHitOnly = true;
+
     setLoading(true);
     setError("");
     setProgress(0);
     setLoadedBytes(0);
+    setNavigationStatus(collisionMeshUrl ? "loading" : "unavailable");
+    setMetadataMode(metadataUrl ? "loading" : "fallback");
 
     const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(60, 1, 0.01, 10000);
-    camera.position.set(0, 0, 5);
-    camera.up.set(0, -1, 0);
+    const camera = new THREE.PerspectiveCamera(70, 1, 0.01, 10000);
+    camera.position.set(0, 0, 0);
+    camera.up.set(0, 1, 0);
 
     const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true });
     renderer.setClearColor(0x000000, 0);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     container.appendChild(renderer.domElement);
 
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.08;
+    const controls = new PointerLockControls(camera, renderer.domElement);
+    controlsRef.current = controls;
+    const pointerLockSupported = supportsPointerLock(renderer.domElement, renderer.domElement.ownerDocument);
+    setPointerLockAvailable(pointerLockSupported);
+    const onPointerLock = () => setKeyboardActive(true);
+    const onPointerUnlock = () => {
+      pressedKeysRef.current.clear();
+      setKeyboardActive(false);
+    };
+    // PointerLockControls logs an error on `pointerlockerror`.  Intercept it
+    // in capture phase so embedded browsers degrade to focused WASD controls
+    // without a noisy console error, while normal browsers still lock the
+    // cursor when the capability is present.
+    const onPointerLockError = (event: Event) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (!disposed) setPointerLockAvailable(false);
+    };
+    controls.addEventListener("lock", onPointerLock);
+    controls.addEventListener("unlock", onPointerUnlock);
+    renderer.domElement.ownerDocument.addEventListener("pointerlockerror", onPointerLockError, true);
 
     const spark = new SparkRenderer({
       renderer,
@@ -54,6 +158,21 @@ export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) 
     });
     scene.add(spark);
 
+    const applyInitialPose = () => {
+      if (!splatReady) return;
+      if (metadata) {
+        const pose = initialCameraPose(metadata);
+        camera.position.copy(pose.position);
+        camera.up.copy(pose.up);
+        camera.fov = pose.fov;
+        camera.lookAt(pose.lookAt);
+        camera.updateProjectionMatrix();
+      } else {
+        fallbackReset?.();
+      }
+    };
+    resetViewRef.current = applyInitialPose;
+
     const handleError = (cause: unknown) => {
       if (disposed) return;
       const nextError = cause instanceof Error ? cause : new Error(String(cause));
@@ -61,6 +180,45 @@ export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) 
       setLoading(false);
       onError?.(nextError);
     };
+
+    if (metadataUrl) {
+      void fetch(metadataUrl, { credentials: "same-origin" })
+        .then((response) => {
+          if (!response.ok) throw new Error(`metadata request failed (${response.status})`);
+          return response.json();
+        })
+        .then((payload) => {
+          if (disposed) return;
+          metadata = parseViewerMetadata(payload);
+          setMetadataMode(metadata ? "official" : "fallback");
+          applyInitialPose();
+        })
+        .catch(() => {
+          if (!disposed) setMetadataMode("fallback");
+        });
+    }
+
+    if (collisionMeshUrl) {
+      new PLYLoader().load(
+        collisionMeshUrl,
+        (geometry) => {
+          if (disposed) {
+            geometry.dispose();
+            return;
+          }
+          geometry.computeVertexNormals();
+          geometry.boundsTree = new MeshBVH(geometry);
+          collisionMesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial());
+          collisionMesh.updateMatrixWorld(true);
+          collisionReady = true;
+          setNavigationStatus("ready");
+        },
+        undefined,
+        () => {
+          if (!disposed) setNavigationStatus("error");
+        },
+      );
+    }
 
     const splat = new SplatMesh({
       url,
@@ -74,16 +232,9 @@ export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) 
       },
       onLoad: (mesh) => {
         if (disposed) return;
-        const bounds = mesh.getBoundingBox();
-        const center = bounds.getCenter(new THREE.Vector3());
-        const diagonal = Math.max(bounds.getSize(new THREE.Vector3()).length(), 1);
-        moveSpeedRef.current = Math.max(diagonal * 0.3, 0.1);
-        controls.target.copy(center);
-        camera.position.copy(center).add(new THREE.Vector3(0, 0, diagonal * 1.2));
-        camera.near = Math.max(diagonal / 10000, 0.001);
-        camera.far = Math.max(diagonal * 100, 1000);
-        camera.updateProjectionMatrix();
-        controls.update();
+        fallbackReset = safeFallbackPose(mesh, camera);
+        splatReady = true;
+        applyInitialPose();
         setProgress(100);
         setLoading(false);
         onLoad?.();
@@ -105,23 +256,39 @@ export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) 
     resizeObserver.observe(container);
     const navigationCodes = new Set(["KeyW", "KeyA", "KeyS", "KeyD", "ShiftLeft", "ShiftRight"]);
     const keyboardControlsActive = () => (
-      document.activeElement === viewer || Boolean(document.fullscreenElement?.contains(viewer))
+      controls.isLocked || document.activeElement === viewer || Boolean(document.fullscreenElement?.contains(viewer))
     );
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (!navigationCodes.has(event.code) || !keyboardControlsActive() || isEditableTarget(event.target)) return;
+      if (!keyboardControlsActive() || isEditableTarget(event.target)) return;
+      if (event.code === "KeyR") {
+        event.preventDefault();
+        resetViewRef.current();
+        return;
+      }
+      if (!navigationCodes.has(event.code) || !collisionReady) return;
       event.preventDefault();
       pressedKeysRef.current.add(event.code);
       setKeyboardActive(true);
     };
     const handleKeyUp = (event: KeyboardEvent) => {
-      if (!navigationCodes.has(event.code)) return;
-      pressedKeysRef.current.delete(event.code);
+      if (navigationCodes.has(event.code)) pressedKeysRef.current.delete(event.code);
     };
     const clearPressedKeys = () => pressedKeysRef.current.clear();
+    const activatePointerLock = () => {
+      viewer.focus({ preventScroll: true });
+      if (!controls.isLocked && pointerLockSupported && renderer.domElement.isConnected) {
+        try {
+          controls.lock();
+        } catch {
+          setPointerLockAvailable(false);
+        }
+      }
+    };
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("keyup", handleKeyUp);
     window.addEventListener("blur", clearPressedKeys);
     document.addEventListener("visibilitychange", clearPressedKeys);
+    viewer.addEventListener("pointerdown", activatePointerLock);
 
     let previousFrameTime = 0;
     renderer.setAnimationLoop((frameTime) => {
@@ -129,20 +296,38 @@ export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) 
         ? 0
         : Math.min((frameTime - previousFrameTime) / 1000, 0.1);
       previousFrameTime = frameTime;
-      moveCamera(camera, controls.target, pressedKeysRef.current, deltaSeconds, moveSpeedRef.current);
-      controls.update();
+      if (collisionReady && metadata && pressedKeysRef.current.size > 0) {
+        const candidate = moveOnGround(
+          camera.position,
+          camera.getWorldDirection(new THREE.Vector3()),
+          metadata.upDirection,
+          pressedKeysRef.current,
+          deltaSeconds,
+          metadata.humanScale,
+        );
+        camera.position.copy(resolveCollision(camera.position, candidate, metadata, collisionMesh, raycaster));
+      }
       renderer.render(scene, camera);
     });
 
     return () => {
       disposed = true;
       pressedKeysRef.current.clear();
+      resetViewRef.current = () => {};
+      controlsRef.current = null;
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
       window.removeEventListener("blur", clearPressedKeys);
       document.removeEventListener("visibilitychange", clearPressedKeys);
+      viewer.removeEventListener("pointerdown", activatePointerLock);
       resizeObserver.disconnect();
       renderer.setAnimationLoop(null);
+      controls.removeEventListener("lock", onPointerLock);
+      controls.removeEventListener("unlock", onPointerUnlock);
+      renderer.domElement.ownerDocument.removeEventListener("pointerlockerror", onPointerLockError, true);
+      controls.disconnect();
+      collisionMesh?.geometry.dispose();
+      (collisionMesh?.material as THREE.Material | undefined)?.dispose();
       spark.autoUpdate = false;
       if (spark.updateTimeoutId !== -1) {
         window.clearTimeout(spark.updateTimeoutId);
@@ -168,9 +353,18 @@ export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) 
         },
       );
     };
-  }, [url, onLoad, onError]);
+  }, [url, metadataUrl, collisionMeshUrl, onLoad, onError]);
 
   const loadedMegabytes = loadedBytes / 1024 / 1024;
+  const navigationHint = navigationStatus === "ready"
+    ? pointerLockAvailable
+      ? "Click to lock mouse | WASD move | Shift boost | R reset view"
+      : "Click viewer to focus | WASD move | Shift boost | R reset view"
+    : navigationStatus === "loading"
+      ? "Preparing collision mesh… WASD is temporarily disabled"
+      : navigationStatus === "error"
+        ? "Collision mesh failed to load — WASD is disabled"
+        : "Collision mesh unavailable — WASD is disabled";
 
   return (
     <div
@@ -178,13 +372,12 @@ export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) 
       className={`splat-viewer ${keyboardActive ? "keyboard-active" : ""}`}
       tabIndex={0}
       data-keyboard-viewer
-      aria-label="Interactive 3D model viewer. Use WASD to move and Shift to move faster."
+      aria-label="Interactive first-person 3D model viewer. Use WASD to move, Shift to move faster, and R to reset the view."
       onFocus={() => setKeyboardActive(true)}
       onBlur={() => {
         pressedKeysRef.current.clear();
         setKeyboardActive(false);
       }}
-      onPointerDown={() => viewerRef.current?.focus({ preventScroll: true })}
     >
       <div ref={canvasContainerRef} className="splat-canvas" />
       {loading && (
@@ -204,7 +397,17 @@ export default function SplatViewer({ url, onLoad, onError }: SplatViewerProps) 
         </div>
       )}
       {!loading && !error && (
-        <div className="splat-hint">Click to control | WASD move | Shift boost | Drag to look | Scroll to zoom</div>
+        <>
+          <div className="splat-hint">{navigationHint} · {metadataMode === "official" ? "official scene pose" : "safe legacy pose"}</div>
+          <button
+            type="button"
+            className="splat-reset-button"
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={() => resetViewRef.current()}
+          >
+            Reset view (R)
+          </button>
+        </>
       )}
     </div>
   );

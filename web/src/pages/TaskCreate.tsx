@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { createTask } from "../api";
 
 type TabType = "worldgen" | "worldgen_from_pano" | "worldrecon";
+type QualityPreset = "high" | "fast";
 
 const TABS: { key: TabType; label: string; description: string }[] = [
   {
@@ -27,6 +28,7 @@ export default function TaskCreate() {
   const [activeTab, setActiveTab] = useState<TabType>("worldgen");
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [qualityPreset, setQualityPreset] = useState<QualityPreset>("high");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [configJson, setConfigJson] = useState("{}");
   const [submitting, setSubmitting] = useState(false);
@@ -63,12 +65,22 @@ export default function TaskCreate() {
       return;
     }
 
-    // Validate JSON config
+    // Parse and merge advanced config. Form values intentionally win so the
+    // visible prompt/quality choice can never be lost behind a stale JSON blob.
+    let mergedConfig: Record<string, unknown>;
     try {
-      JSON.parse(configJson);
+      const parsed = JSON.parse(configJson);
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+        throw new Error("Config must be an object");
+      }
+      mergedConfig = { ...parsed };
     } catch {
       setError("Invalid JSON in config");
       return;
+    }
+    if (activeTab === "worldgen" || activeTab === "worldgen_from_pano") {
+      mergedConfig.quality_preset = qualityPreset;
+      if (prompt.trim()) mergedConfig.prompt = prompt.trim();
     }
 
     setSubmitting(true);
@@ -78,7 +90,7 @@ export default function TaskCreate() {
       formData.set("type", activeTab);
       formData.set("name", name.trim() || `task-${Date.now()}`);
       if (prompt.trim()) formData.set("prompt", prompt.trim());
-      formData.set("config", configJson);
+      formData.set("config", JSON.stringify(mergedConfig));
 
       if (panoramaFile) formData.set("panorama", panoramaFile);
       if (imageFile) formData.set("image", imageFile);
@@ -119,8 +131,9 @@ export default function TaskCreate() {
       {error && <div className="error-banner">{error}</div>}
 
       <div className="form-section">
-        <label className="form-label">Task Name</label>
+        <label className="form-label" htmlFor="task-name">Task Name</label>
         <input
+          id="task-name"
           type="text"
           className="form-input"
           placeholder={`task-${Date.now()}`}
@@ -132,8 +145,9 @@ export default function TaskCreate() {
       {activeTab === "worldgen" && (
         <>
           <div className="form-section">
-            <label className="form-label">Text Prompt</label>
+            <label className="form-label" htmlFor="task-prompt">Text Prompt</label>
             <textarea
+              id="task-prompt"
               className="form-textarea"
               rows={4}
               placeholder="A futuristic city with tall buildings, neon lights, and flying cars..."
@@ -192,6 +206,22 @@ export default function TaskCreate() {
         </>
       )}
 
+      {(activeTab === "worldgen" || activeTab === "worldgen_from_pano") && (
+        <div className="form-section">
+          <label className="form-label" htmlFor="quality-preset">Quality preset</label>
+          <select
+            id="quality-preset"
+            className="form-input"
+            value={qualityPreset}
+            onChange={(event) => setQualityPreset(event.target.value as QualityPreset)}
+          >
+            <option value="high">High quality — full WorldStereo, quality gates, longer runtime</option>
+            <option value="fast">Fast — 4-step WorldStereo DMD</option>
+          </select>
+          <p className="form-help">High quality is the default and uses the complete model plus trajectory quality checks.</p>
+        </div>
+      )}
+
       <div className="form-section">
         <button
           className="btn btn-secondary"
@@ -201,6 +231,8 @@ export default function TaskCreate() {
         </button>
         {showAdvanced && (
           <textarea
+            id="advanced-config"
+            aria-label="Advanced JSON config"
             className="form-textarea config-editor"
             rows={6}
             value={configJson}
