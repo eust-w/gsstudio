@@ -97,8 +97,9 @@ class TestTrajectoryPlanValidation:
         navmesh = scene_dir / "navmesh"
         navmesh.mkdir(parents=True)
         (navmesh / "reconstruct_pairs.json").write_text("[]")
-        for index in range(4):
+        for index in range(8):
             _write_camera(scene_dir, f"view{index}", "traj0")
+        for index in range(4):
             _write_camera(scene_dir, f"target_object_{index}", "traj0")
             _write_camera(scene_dir, f"wonder_{index}", "traj0")
             _write_camera(scene_dir, f"reconstruct_{index}", "traj0")
@@ -109,7 +110,7 @@ class TestTrajectoryPlanValidation:
         candidates = select_high_quality_video_candidates(report["planning"])
         manifest = write_video_trajectory_candidates(tmp_path, candidates)
 
-        assert len(candidates) == 12
+        assert len(candidates) == 16
         assert {candidate["kind"] for candidate in candidates} == {
             "regular", "surround", "exploration", "reconstruction",
         }
@@ -117,7 +118,7 @@ class TestTrajectoryPlanValidation:
             kind: sum(candidate["kind"] == kind for candidate in candidates)
             for kind in {candidate["kind"] for candidate in candidates}
         } == {
-            "regular": 4,
+            "regular": 8,
             "surround": 2,
             "exploration": 2,
             "reconstruction": 4,
