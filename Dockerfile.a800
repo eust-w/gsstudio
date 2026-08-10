@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# GSStudio a800-v32: pin the perceptual-loss checkpoint for offline 3DGS runs.
+# GSStudio a800-v33: replenish untried high-quality trajectories after alignment rejection.
 # Keeping CUDA extensions and model runtimes in the v22 base makes this release
 # fast and avoids recompiling HY-World during a safety/quality-only rollout.
 FROM ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22
