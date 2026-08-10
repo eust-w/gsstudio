@@ -195,6 +195,57 @@ class TestCheckpointResume:
 
         assert get_task(cfg.DB_PATH, task_id)["status"] == TaskStatus.CANCELLED.value
 
+    def test_worker_replenishes_high_quality_video_candidates_until_six_pass(self, cfg, monkeypatch):
+        import server.pipeline.worker as worker_module
+
+        cfg.MOCK_PIPELINE = False
+        task_dir = cfg.task_dir("video-recovery")
+        logs_dir = task_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        trajectories = [
+            *({"id": f"view{index}/traj0", "kind": "regular"} for index in range(9)),
+            *({"id": f"target_{index}/traj0", "kind": "surround"} for index in range(8)),
+            *({"id": f"wonder_{index}/traj0", "kind": "exploration"} for index in range(6)),
+            *({"id": f"reconstruct_{index}/traj0", "kind": "reconstruction"} for index in range(8)),
+        ]
+        (task_dir / "quality_report.json").write_text(json.dumps({"planning": {"trajectories": trajectories}}))
+        calls: list[list[str]] = []
+
+        async def fake_video_stage(*, log_file, **_kwargs):
+            manifest = json.loads((task_dir / "video_trajectory_whitelist.json").read_text())
+            candidate_ids = manifest["candidate_trajectory_ids"]
+            calls.append(candidate_ids)
+            accepted_count = 2 if len(calls) == 1 else 4
+            with open(log_file, "a") as log:
+                for index, trajectory_id in enumerate(candidate_ids):
+                    guidance = 0.92 if index < accepted_count else 0.10
+                    log.write(
+                        f"[Alignment Rank0] [Frame {trajectory_id}/000000] [Success] "
+                        f"Guidance mask ratio: {guidance:.4f}, depth percentile error ratio: 0.02000\\n"
+                    )
+            return True, ""
+
+        monkeypatch.setattr(worker_module, "run_stage", fake_video_stage)
+
+        async def run_recovery():
+            return await PipelineWorker(cfg)._run_high_quality_video_recovery(
+                task_dir=task_dir,
+                scene_dir=task_dir / "scene",
+                log_file=logs_dir / "video_gen.log",
+                cmd=["fake"],
+                env={},
+                cwd=Path("/tmp"),
+                cancel_event=asyncio.Event(),
+            )
+
+        success, error = asyncio.run(run_recovery())
+
+        assert success, error
+        assert [len(batch) for batch in calls] == [16, 8]
+        recovery = json.loads((task_dir / "video_recovery.json").read_text())
+        assert recovery["status"] == "accepted"
+        assert len(recovery["accepted_trajectory_ids"]) == 6
+
 
 class TestWorldgenCommands:
     def test_high_quality_uses_full_model_whitelist_and_fixed_training_schedule(self, tmp_path):
@@ -398,13 +449,15 @@ class TestDeploymentContract:
         assert "patch_hyworld_video_filter.py" in dockerfile
         assert "/opt/hyworld2/hyworld2/worldgen/video_gen.py" in dockerfile
 
-    def test_gpu_rollout_manifests_target_the_immutable_v32_image(self):
+    def test_gpu_rollout_manifests_target_the_immutable_v33_image(self):
         root = Path(__file__).parents[1]
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v32" in deployment
-        assert "gsstudio:a800-v32" in build
+        assert "gsstudio:a800-v33" in deployment
+        assert "gsstudio:a800-v33" in build
+        assert "gsstudio:a800-v32" not in deployment
+        assert "gsstudio:a800-v32" not in build
         assert "gsstudio:a800-v22" not in deployment
         assert "gsstudio:a800-v22" not in build
 

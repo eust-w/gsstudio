@@ -108,6 +108,7 @@ describe("TaskDetail", () => {
 
     expect(await screen.findByText("worldstereo-memory")).toBeInTheDocument();
     expect(screen.getByText(/minimum 8 valid trajectories/i)).toBeInTheDocument();
+    expect(screen.getByText(/adds untried trajectories in batches of 8/i)).toBeInTheDocument();
     expect(screen.getByText(/5 GPUs.*2,000 steps.*200.*1000.*133/i)).toBeInTheDocument();
   });
 
