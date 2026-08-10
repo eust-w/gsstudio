@@ -49,7 +49,13 @@ export interface TaskQualityRecovery {
   limits?: {
     maximum_video_trajectories?: number;
     maximum_video_seconds?: number;
+    maximum_source_regenerations?: number;
   };
+  delivery_tier?: "strict_3d" | "degraded_3d" | "panorama_only" | null;
+  best_source_attempt?: number;
+  quality_warning?: string | null;
+  recovery_exhausted?: boolean;
+  transient_retry_count?: number;
   terminal_reason?: string | null;
   updated_at?: string;
 }

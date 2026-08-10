@@ -44,6 +44,7 @@ describe("TaskCreate quality configuration", () => {
       recovery_policy: "auto",
       seed: 17,
     });
-    expect(screen.getByText(/automatically tries safe recovery paths/i)).toBeInTheDocument();
+    expect(screen.getByText(/valid image always returns a usable result/i)).toBeInTheDocument();
+    expect(screen.getByText(/3D tier depends on how many trajectories pass/i)).toBeInTheDocument();
   });
 });

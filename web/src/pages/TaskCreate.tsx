@@ -219,7 +219,7 @@ export default function TaskCreate() {
             <option value="high">High quality — full WorldStereo, quality gates, longer runtime</option>
             <option value="fast">Fast — 4-step WorldStereo DMD</option>
           </select>
-          <p className="form-help">High quality is the default and uses the complete model plus trajectory quality checks. It automatically tries safe recovery paths before asking you to replace the source.</p>
+          <p className="form-help">High quality is the default and uses the complete model plus strict trajectory checks. A valid image always returns a usable result; the 3D tier depends on how many trajectories pass. Automatic recovery tries safe paths and deterministic source seeds without weakening the quality gates.</p>
         </div>
       )}
 

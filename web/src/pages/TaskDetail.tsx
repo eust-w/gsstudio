@@ -41,6 +41,8 @@ function recoveryLabel(state?: string): string {
       return "Processing replacement panorama";
     case "accepted":
       return "Quality gate passed";
+    case "completed":
+      return "Best valid result delivered";
     case "source_quality_blocked":
     case "quality_blocked":
       return "Source needs replacement";
@@ -51,13 +53,26 @@ function recoveryLabel(state?: string): string {
   }
 }
 
+function deliveryTierLabel(tier?: TaskQualityRecovery["delivery_tier"]): string | null {
+  switch (tier) {
+    case "strict_3d":
+      return "High-quality 3D";
+    case "degraded_3d":
+      return "Degraded 3D";
+    case "panorama_only":
+      return "Panorama result";
+    default:
+      return null;
+  }
+}
+
 export default function TaskDetail() {
   const { taskId } = useParams<{ taskId: string }>();
   const navigate = useNavigate();
   const [task, setTask] = useState<TaskDetailType | null>(null);
   const [recovery, setRecovery] = useState<TaskQualityRecovery | null>(null);
   const [error, setError] = useState("");
-  const [activePreview, setActivePreview] = useState<string>("3dgs");
+  const [activePreview, setActivePreview] = useState<string>("");
   const [cancelling, setCancelling] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draftName, setDraftName] = useState("");
@@ -79,10 +94,17 @@ export default function TaskDetail() {
         setRecovery(null);
       }
       setActivePreview((current) => {
+        const hasSpz = data.artifacts.some((artifact) => artifact.name.toLowerCase().endsWith(".spz"));
+        const has3d = data.artifacts.some((artifact) => artifact.type === "3dgs");
+        const hasVideo = data.artifacts.some((artifact) => artifact.type === "video");
+        const hasPanorama = data.artifacts.some(
+          (artifact) => artifact.type === "image" && artifact.name.includes("pano"),
+        );
         const available = [
-          data.artifacts.some((artifact) => artifact.type === "3dgs") && "3dgs",
-          data.artifacts.some((artifact) => artifact.type === "video") && "video",
-          data.artifacts.some((artifact) => artifact.type === "image" && artifact.name.includes("pano")) && "panorama",
+          hasSpz && "3dgs",
+          hasPanorama && "panorama",
+          hasVideo && "video",
+          has3d && !hasSpz && "3dgs",
         ].filter(Boolean) as string[];
         return available.includes(current) ? current : (available[0] ?? current);
       });
@@ -189,8 +211,12 @@ export default function TaskDetail() {
 
   const canCancel = task.status === "pending" || task.status === "running";
   const canRetrySource =
-    (task.status === "failed" || task.status === "cancelled") &&
-    (recovery?.state === "source_quality_blocked" || recovery?.state === "quality_blocked");
+    ((task.status === "failed" || task.status === "cancelled") &&
+      (recovery?.state === "source_quality_blocked" || recovery?.state === "quality_blocked")) ||
+    (task.status === "completed" &&
+      Boolean(recovery?.recovery_exhausted) &&
+      recovery?.delivery_tier !== "strict_3d");
+  const tierLabel = deliveryTierLabel(recovery?.delivery_tier);
   const previewLabels: Record<string, string> = {
     "3dgs": "3D Model",
     video: "Video",
@@ -268,14 +294,27 @@ export default function TaskDetail() {
           {recovery?.available && (
             <section className="quality-summary recovery-summary" aria-label="Automatic recovery status">
               <h3>Automatic recovery</h3>
+              {tierLabel && (
+                <div className={`delivery-tier delivery-tier-${recovery.delivery_tier}`}>
+                  <span>Delivery</span>
+                  <strong>{tierLabel}</strong>
+                </div>
+              )}
               <p><span className="quality-label">Current action</span> {recoveryLabel(recovery.state)}</p>
               <p><span className="quality-label">Quality gate</span> {recovery.accepted_trajectories ?? 0} of {recovery.required_trajectories ?? 6} accepted</p>
-              <p><span className="quality-label">WorldStereo budget</span> {recovery.generated_video_trajectories ?? 0} of {recovery.limits?.maximum_video_trajectories ?? 40} WorldStereo trajectories</p>
-              <p><span className="quality-label">Time budget</span> {Math.round((recovery.video_seconds ?? 0) / 60)} of {Math.round((recovery.limits?.maximum_video_seconds ?? 7200) / 60)} minutes</p>
+              <p><span className="quality-label">WorldStereo budget</span> {recovery.generated_video_trajectories ?? 0} of {recovery.limits?.maximum_video_trajectories ?? 56} WorldStereo trajectories</p>
+              <p><span className="quality-label">Time budget</span> {Math.round((recovery.video_seconds ?? 0) / 60)} of {Math.round((recovery.limits?.maximum_video_seconds ?? 10800) / 60)} minutes</p>
+              {typeof recovery.best_source_attempt === "number" && (
+                <p><span className="quality-label">Best source attempt</span> {recovery.best_source_attempt}</p>
+              )}
+              {typeof recovery.transient_retry_count === "number" && recovery.transient_retry_count > 0 && (
+                <p><span className="quality-label">Infrastructure retries</span> {recovery.transient_retry_count}</p>
+              )}
               {typeof recovery.pending_trajectories === "number" && recovery.pending_trajectories > 0 && (
                 <p><span className="quality-label">Pending</span> {recovery.pending_trajectories} trajectories</p>
               )}
               {recovery.terminal_reason && <p className="recovery-diagnosis">{recovery.terminal_reason}</p>}
+              {recovery.quality_warning && <p className="quality-warning">{recovery.quality_warning}</p>}
               {canRetrySource && (
                 <div className="source-retry-controls">
                   {task.type === "worldgen_from_pano" && (

@@ -145,6 +145,93 @@ describe("TaskDetail", () => {
     expect(screen.getByText(/8 of 40 WorldStereo trajectories/i)).toBeInTheDocument();
   });
 
+  it("shows degraded 3D delivery, best attempt, warning, and v37 budget", async () => {
+    getTaskQualityMock.mockResolvedValue({
+      available: true,
+      state: "completed",
+      delivery_tier: "degraded_3d",
+      best_source_attempt: 1,
+      quality_warning: "Only 5 trajectories passed; 3D coverage is reduced.",
+      recovery_exhausted: true,
+      transient_retry_count: 2,
+      accepted_trajectories: 5,
+      required_trajectories: 6,
+      generated_video_trajectories: 31,
+      video_seconds: 4000,
+      limits: {
+        maximum_video_trajectories: 56,
+        maximum_video_seconds: 10800,
+        maximum_source_regenerations: 2,
+      },
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes>
+          <Route path="/tasks/:taskId" element={<TaskDetail />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("Degraded 3D")).toBeInTheDocument();
+    expect(screen.getByText("Best source attempt").closest("p")).toHaveTextContent("1");
+    expect(screen.getByText(/31 of 56 WorldStereo trajectories/i)).toBeInTheDocument();
+    expect(screen.getByText(/Only 5 trajectories passed/i)).toBeInTheDocument();
+    expect(screen.getByText("Infrastructure retries").closest("p")).toHaveTextContent("2");
+  });
+
+  it("defaults a panorama-only completed result to panorama and never renders an empty 3D viewer", async () => {
+    getTaskMock.mockResolvedValue({
+      ...taskFixture,
+      artifacts: [
+        { name: "panorama.png", path: "output/panorama.png", type: "image", size: 256 },
+        { name: "render.mp4", path: "output/render.mp4", type: "video", size: 2048 },
+      ],
+    });
+    getTaskQualityMock.mockResolvedValue({
+      available: true,
+      state: "completed",
+      delivery_tier: "panorama_only",
+      quality_warning: "3D training was safely skipped.",
+      accepted_trajectories: 3,
+      required_trajectories: 6,
+      generated_video_trajectories: 20,
+      video_seconds: 1800,
+      limits: { maximum_video_trajectories: 56, maximum_video_seconds: 10800 },
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes>
+          <Route path="/tasks/:taskId" element={<TaskDetail />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("Panorama result")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Panorama" })).toHaveClass("active");
+    expect(screen.queryByTestId("splat-viewer")).not.toBeInTheDocument();
+    expect(screen.getByText(/3D training was safely skipped/i)).toBeInTheDocument();
+  });
+
+  it("prefers panorama over PLY when no streaming SPZ is available", async () => {
+    getTaskMock.mockResolvedValue({
+      ...taskFixture,
+      artifacts: taskFixture.artifacts.filter((artifact) => artifact.name !== "gaussians.spz"),
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes>
+          <Route path="/tasks/:taskId" element={<TaskDetail />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await screen.findByRole("button", { name: "Panorama" });
+    expect(screen.getByRole("button", { name: "Panorama" })).toHaveClass("active");
+  });
+
   it("offers a failed panorama task a replacement-source retry", async () => {
     getTaskMock.mockResolvedValue({
       ...taskFixture,
