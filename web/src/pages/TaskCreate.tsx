@@ -80,6 +80,7 @@ export default function TaskCreate() {
     }
     if (activeTab === "worldgen" || activeTab === "worldgen_from_pano") {
       mergedConfig.quality_preset = qualityPreset;
+      mergedConfig.recovery_policy = qualityPreset === "high" ? "auto" : "off";
       if (prompt.trim()) mergedConfig.prompt = prompt.trim();
     }
 
@@ -218,7 +219,7 @@ export default function TaskCreate() {
             <option value="high">High quality — full WorldStereo, quality gates, longer runtime</option>
             <option value="fast">Fast — 4-step WorldStereo DMD</option>
           </select>
-          <p className="form-help">High quality is the default and uses the complete model plus trajectory quality checks.</p>
+          <p className="form-help">High quality is the default and uses the complete model plus trajectory quality checks. It automatically tries safe recovery paths before asking you to replace the source.</p>
         </div>
       )}
 

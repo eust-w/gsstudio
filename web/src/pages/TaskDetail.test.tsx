@@ -6,9 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import TaskDetail, { preferredSplatArtifact } from "./TaskDetail";
 
-const { deleteTaskMock, getTaskMock, updateTaskMock } = vi.hoisted(() => ({
+const { deleteTaskMock, getTaskMock, getTaskQualityMock, retryTaskSourceMock, updateTaskMock } = vi.hoisted(() => ({
   deleteTaskMock: vi.fn().mockResolvedValue(undefined),
   getTaskMock: vi.fn(),
+  getTaskQualityMock: vi.fn().mockResolvedValue({ available: false }),
+  retryTaskSourceMock: vi.fn().mockResolvedValue(undefined),
   updateTaskMock: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -42,6 +44,8 @@ vi.mock("../api", () => ({
   deleteTask: deleteTaskMock,
   getArtifactUrl: (_taskId: string, path: string) => `/api/artifacts/${path}`,
   getTask: getTaskMock,
+  getTaskQuality: getTaskQualityMock,
+  retryTaskSource: retryTaskSourceMock,
   updateTask: updateTaskMock,
 }));
 
@@ -108,8 +112,73 @@ describe("TaskDetail", () => {
 
     expect(await screen.findByText("worldstereo-memory")).toBeInTheDocument();
     expect(screen.getByText(/minimum 8 valid trajectories/i)).toBeInTheDocument();
-    expect(screen.getByText(/adds untried trajectories in batches of 8/i)).toBeInTheDocument();
+    expect(screen.getByText(/starts with 8 regular-first candidates/i)).toBeInTheDocument();
     expect(screen.getByText(/5 GPUs.*2,000 steps.*200.*1000.*133/i)).toBeInTheDocument();
+  });
+
+  it("shows live conservative-recovery progress and its GPU budget", async () => {
+    getTaskQualityMock.mockResolvedValue({
+      available: true,
+      state: "generating_rescue",
+      phase: "rescue_1",
+      rescue_round: 1,
+      accepted_trajectories: 2,
+      required_trajectories: 6,
+      attempted_trajectories: 8,
+      pending_trajectories: 6,
+      generated_video_trajectories: 8,
+      video_seconds: 120,
+      limits: { maximum_video_trajectories: 40, maximum_video_seconds: 7200 },
+      terminal_reason: null,
+    });
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes>
+          <Route path="/tasks/:taskId" element={<TaskDetail />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole("heading", { name: "Automatic recovery" })).toBeInTheDocument();
+    expect(screen.getByText(/Conservative safe trajectories/i)).toBeInTheDocument();
+    expect(screen.getByText(/2 of 6 accepted/i)).toBeInTheDocument();
+    expect(screen.getByText(/8 of 40 WorldStereo trajectories/i)).toBeInTheDocument();
+  });
+
+  it("offers a failed panorama task a replacement-source retry", async () => {
+    getTaskMock.mockResolvedValue({
+      ...taskFixture,
+      type: "worldgen_from_pano",
+      status: "failed",
+      error: "source_quality_blocked",
+    });
+    getTaskQualityMock.mockResolvedValue({
+      available: true,
+      state: "source_quality_blocked",
+      phase: null,
+      accepted_trajectories: 2,
+      required_trajectories: 6,
+      attempted_trajectories: 20,
+      pending_trajectories: 0,
+      generated_video_trajectories: 20,
+      video_seconds: 600,
+      limits: { maximum_video_trajectories: 40, maximum_video_seconds: 7200 },
+      terminal_reason: "Upload a replacement panorama to retry.",
+    });
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes>
+          <Route path="/tasks/:taskId" element={<TaskDetail />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByRole("heading", { name: "Automatic recovery" });
+
+    const panorama = new File(["new panorama"], "replacement.png", { type: "image/png" });
+    fireEvent.change(screen.getByLabelText("Replacement panorama"), { target: { files: [panorama] } });
+    fireEvent.click(screen.getByRole("button", { name: "Retry with replacement panorama" }));
+
+    await waitFor(() => expect(retryTaskSourceMock).toHaveBeenCalledWith("recon-task", panorama));
   });
 
   it("defaults to 3D and exposes fullscreen for every preview type", async () => {
