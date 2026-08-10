@@ -4,7 +4,10 @@ from __future__ import annotations
 from typing import Optional
 
 import asyncio
+import json
 import logging
+import shutil
+import time
 import urllib.request
 from pathlib import Path
 
@@ -18,6 +21,18 @@ from .quality import (
     enforce_alignment_quality,
     postvalidate_worldgen_stage,
     prepare_high_quality_video_recovery,
+)
+from .recovery import (
+    AutoRecoveryError,
+    active_scene_dir,
+    begin_source_regeneration,
+    complete_auto_recovery_batch,
+    create_conservative_rescue_trajectories,
+    prepare_auto_recovery,
+    promote_recovered_scene,
+    schedule_auto_recovery_batch,
+    set_active_scene,
+    write_auto_video_trajectory_candidates,
 )
 from .worldgen import get_stage_names, get_worldgen_commands
 from .worldrecon import get_worldrecon_commands
@@ -173,12 +188,21 @@ class PipelineWorker:
         for d in (task_dir, scene_dir, input_dir, output_dir, logs_dir):
             d.mkdir(parents=True, exist_ok=True)
 
+        # A source-regeneration attempt may survive a pod restart before it is
+        # promoted.  Resume its isolated scene rather than accidentally
+        # returning to the rejected source in the canonical scene directory.
+        scene_dir = active_scene_dir(task_dir, scene_dir)
+
         task_type = task["type"]
         task_config = task.get("config", {})
         task_config.setdefault("hf_home", self.config.HF_HOME)
         task_config.setdefault("num_gpus", self.config.NUM_GPUS)
         task_config.setdefault("panogen_python", self.config.PANOGEN_PYTHON)
         task_config.setdefault("quality_preset", "high")
+        task_config.setdefault(
+            "recovery_policy",
+            "auto" if task_config["quality_preset"] == "high" else "off",
+        )
 
         stage_names = get_stage_names(task_type)
         set_task_stages(self.config.DB_PATH, task_id, stage_names)
@@ -229,6 +253,50 @@ class PipelineWorker:
         self, task_id, task_type, task_config, task_dir, scene_dir, input_dir, logs_dir, cancel_event
     ):
         """Execute real pipeline stages."""
+        regenerated_source_stages: set[str] = set()
+        recovery_path = task_dir / "auto_recovery.json"
+        recovery_state = {}
+        if recovery_path.is_file():
+            try:
+                recovery_state = json.loads(recovery_path.read_text())
+            except json.JSONDecodeError:
+                recovery_state = {}
+        if task_type == "worldgen" and recovery_state.get("state") == "regenerating_panorama":
+            seed = int(recovery_state.get("source_seed", task_config.get("seed", 1024)))
+            success, error = await self._run_regenerated_source_attempt(
+                task_dir=task_dir,
+                source_scene_dir=self.config.task_scene_dir(task_id),
+                input_dir=input_dir,
+                task_config=task_config,
+                seed=seed,
+                cancel_event=cancel_event,
+                resume=True,
+            )
+            if not success:
+                raise RuntimeError(error)
+            # The regenerated source already completed these four stages in
+            # its isolated attempt directory.  Mark them as durable root
+            # checkpoints so the resumed task proceeds directly to GS data
+            # preparation and training instead of returning success early.
+            regenerated_source_stages = {"panogen", "traj_generate", "traj_render", "video_gen"}
+            for stage_name in regenerated_source_stages:
+                (task_dir / f".stage_{stage_name}_done").touch()
+            scene_dir = self.config.task_scene_dir(task_id)
+        elif task_type == "worldgen_from_pano" and recovery_state.get("state") == "replacing_panorama_source":
+            success, error = await self._run_replacement_panorama_attempt(
+                task_dir=task_dir,
+                source_scene_dir=self.config.task_scene_dir(task_id),
+                input_dir=input_dir,
+                task_config=task_config,
+                cancel_event=cancel_event,
+                resume=True,
+            )
+            if not success:
+                raise RuntimeError(error)
+            regenerated_source_stages = {"traj_generate", "traj_render", "video_gen"}
+            for stage_name in regenerated_source_stages:
+                (task_dir / f".stage_{stage_name}_done").touch()
+            scene_dir = self.config.task_scene_dir(task_id)
         if task_type in ("worldgen", "worldgen_from_pano"):
             commands = get_worldgen_commands(
                 task_dir=task_dir,
@@ -251,6 +319,11 @@ class PipelineWorker:
         else:
             raise ValueError(f"Unknown task type: {task_type}")
 
+        render_spec = next(
+            ((command, command_env, command_cwd) for name, command, command_env, command_cwd in commands if name == "traj_render"),
+            None,
+        )
+
         for stage_name, cmd, env, cwd in commands:
             if cancel_event.is_set():
                 return
@@ -259,6 +332,11 @@ class PipelineWorker:
             marker = task_dir / f".stage_{stage_name}_done"
             if marker.exists():
                 logger.info("Stage %s already completed, skipping", stage_name)
+                if stage_name in regenerated_source_stages:
+                    # The stage did not run in this root log file, but it
+                    # succeeded in the promoted isolated source attempt.
+                    update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.COMPLETED)
+                    continue
                 # Re-run output validation on resume.  This regenerates
                 # quality manifests introduced by a later release and never
                 # lets an old silent success bypass the current policy.
@@ -299,15 +377,31 @@ class PipelineWorker:
             # videos into later 3DGS stages.
             if stage_name == "video_gen" and task_config["quality_preset"] == "high":
                 try:
-                    success, error = await self._run_high_quality_video_recovery(
-                        task_dir=task_dir,
-                        scene_dir=scene_dir,
-                        log_file=log_file,
-                        cmd=cmd,
-                        env=env,
-                        cwd=cwd,
-                        cancel_event=cancel_event,
-                    )
+                    if task_config.get("recovery_policy") == "auto":
+                        success, error = await self._run_auto_high_quality_video_recovery(
+                            task_dir=task_dir,
+                            scene_dir=scene_dir,
+                            log_file=log_file,
+                            cmd=cmd,
+                            env=env,
+                            cwd=cwd,
+                            cancel_event=cancel_event,
+                            task_type=task_type,
+                            recovery_policy="auto",
+                            render_spec=render_spec,
+                            input_dir=input_dir,
+                            task_config=task_config,
+                        )
+                    else:
+                        success, error = await self._run_high_quality_video_recovery(
+                            task_dir=task_dir,
+                            scene_dir=scene_dir,
+                            log_file=log_file,
+                            cmd=cmd,
+                            env=env,
+                            cwd=cwd,
+                            cancel_event=cancel_event,
+                        )
                 except QualityGateError as exc:
                     update_stage(
                         self.config.DB_PATH,
@@ -454,6 +548,365 @@ class PipelineWorker:
 
         return False, "Cancelled by user"
 
+    async def _run_auto_high_quality_video_recovery(
+        self,
+        *,
+        task_dir: Path,
+        scene_dir: Path,
+        log_file: Path,
+        cmd: list[str],
+        env: dict[str, str],
+        cwd: Path,
+        cancel_event: asyncio.Event,
+        task_type: str,
+        recovery_policy: str,
+        render_spec: tuple[list[str], dict[str, str], Path] | None,
+        input_dir: Path | None = None,
+        task_config: dict | None = None,
+    ) -> tuple[bool, str]:
+        """Run the persistent recovery state machine around WorldStereo.
+
+        Normal batches reuse the standard video invocation.  Rescue batches
+        first render only their new safe camera paths, then use the identical
+        alignment gate and downstream whitelist as normal trajectories.
+        """
+        try:
+            quality_report = json.loads((task_dir / "quality_report.json").read_text())
+            planning = quality_report["planning"]
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise QualityGateError("Automatic recovery requires a planning quality report") from exc
+        if not isinstance(planning, dict):
+            raise QualityGateError("Automatic recovery planning report is invalid")
+
+        while not cancel_event.is_set():
+            recovery = prepare_auto_recovery(
+                task_dir,
+                planning=planning,
+                task_type=task_type,
+                recovery_policy=recovery_policy,
+            )
+            state = recovery["state"]
+            if state == "accepted":
+                return True, ""
+            if state == "needs_rescue":
+                round_number = recovery.get("rescue_round")
+                try:
+                    candidates = create_conservative_rescue_trajectories(
+                        scene_dir,
+                        round_number=int(round_number),
+                    )
+                    recovery = schedule_auto_recovery_batch(
+                        task_dir,
+                        phase=f"rescue_{round_number}",
+                        candidate_ids=[candidate["id"] for candidate in candidates],
+                    )
+                    write_auto_video_trajectory_candidates(
+                        task_dir, recovery["pending_candidate_trajectory_ids"]
+                    )
+                except (AutoRecoveryError, TypeError, ValueError) as exc:
+                    return False, str(exc)
+
+                if render_spec is None:
+                    return False, "Automatic recovery cannot render rescue trajectories without a render command"
+                render_cmd, render_env, render_cwd = render_spec
+                render_cmd = [
+                    *render_cmd,
+                    "--trajectory_whitelist", str(task_dir / "video_trajectory_whitelist.json"),
+                    "--skip_exist",
+                ]
+                render_log = log_file.parent / f"traj_render_recovery_r{round_number}.log"
+                await self._start_vllm()
+                rendered, render_error = await run_stage(
+                    stage_name="traj_render",
+                    cmd=render_cmd,
+                    env=render_env,
+                    log_file=render_log,
+                    cwd=render_cwd,
+                    cancel_event=cancel_event,
+                )
+                if not rendered:
+                    return False, render_error
+                await self._stop_vllm()
+                continue
+            if state == "needs_regeneration":
+                if task_type != "worldgen" or input_dir is None or task_config is None:
+                    return False, "Automatic recovery requires a regenerated panorama attempt"
+                base_seed = int(task_config.get("seed", 1024))
+                seed = base_seed + int(recovery.get("source_attempt", 0)) + 1
+                return await self._run_regenerated_source_attempt(
+                    task_dir=task_dir,
+                    source_scene_dir=scene_dir,
+                    input_dir=input_dir,
+                    task_config=task_config,
+                    seed=seed,
+                    cancel_event=cancel_event,
+                    resume=False,
+                )
+            if state in {"source_quality_blocked", "quality_blocked", "budget_exhausted"}:
+                return False, str(recovery.get("terminal_reason") or "Automatic recovery did not satisfy the quality gate")
+            if state == "disabled":
+                return False, "Automatic recovery is disabled"
+
+            candidate_ids = recovery.get("pending_candidate_trajectory_ids", [])
+            if not candidate_ids:
+                return False, f"Automatic recovery entered unexpected state: {state}"
+            write_auto_video_trajectory_candidates(task_dir, candidate_ids)
+            expected_ids = [*recovery.get("attempted_trajectory_ids", []), *candidate_ids]
+            phase = recovery.get("phase") or "unknown"
+            with open(log_file, "a") as log:
+                log.write(
+                    f"[Auto Recovery] {phase}: generating {len(candidate_ids)} trajectories "
+                    f"({len(recovery.get('accepted_trajectory_ids', []))}/"
+                    f"{recovery.get('minimum_accepted_trajectories', 6)} accepted so far)\n"
+                )
+            started = time.monotonic()
+            success, error = await run_stage(
+                stage_name="video_gen",
+                cmd=cmd,
+                env=env,
+                log_file=log_file,
+                cwd=cwd,
+                cancel_event=cancel_event,
+            )
+            if not success:
+                return False, error
+            alignment = postvalidate_worldgen_stage(
+                "video_gen",
+                task_dir=task_dir,
+                scene_dir=scene_dir,
+                log_file=log_file,
+                quality_preset="high",
+                expected_trajectory_ids=expected_ids,
+                enforce_alignment=False,
+            )
+            if not isinstance(alignment, dict):
+                raise QualityGateError("Video alignment report was not produced")
+            complete_auto_recovery_batch(
+                task_dir,
+                alignment=alignment,
+                duration_seconds=time.monotonic() - started,
+            )
+
+        return False, "Cancelled by user"
+
+    async def _run_regenerated_source_attempt(
+        self,
+        *,
+        task_dir: Path,
+        source_scene_dir: Path,
+        input_dir: Path,
+        task_config: dict,
+        seed: int,
+        cancel_event: asyncio.Event,
+        resume: bool,
+    ) -> tuple[bool, str]:
+        """Run one source-isolated panorama attempt and promote only on success."""
+        recovery_root = task_dir / "recovery_attempts"
+        recovery_root.mkdir(parents=True, exist_ok=True)
+        report = json.loads((task_dir / "auto_recovery.json").read_text())
+        source_attempt = int(report.get("source_attempt", 0))
+        if not resume:
+            source_attempt += 1
+        attempt_dir = recovery_root / f"attempt-{source_attempt:03d}"
+        attempt_scene_dir = attempt_dir / "scene"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        attempt_scene_dir.mkdir(parents=True, exist_ok=True)
+        scene_relpath = str(attempt_scene_dir.relative_to(task_dir))
+        if not resume:
+            archive_reports = recovery_root / "attempt-000" / "reports"
+            archive_reports.mkdir(parents=True, exist_ok=True)
+            for name in (
+                "quality_report.json",
+                "alignment_quality.json",
+                "trajectory_whitelist.json",
+                "video_trajectory_whitelist.json",
+                "auto_recovery.json",
+            ):
+                report_path = task_dir / name
+                archive_path = archive_reports / name
+                if report_path.is_file() and not archive_path.exists():
+                    shutil.copy2(report_path, archive_path)
+            begin_source_regeneration(task_dir, seed=seed, scene_relpath=scene_relpath)
+
+        attempt_config = dict(task_config)
+        attempt_config["seed"] = seed
+        commands = get_worldgen_commands(
+            task_dir=task_dir,
+            scene_dir=attempt_scene_dir,
+            input_dir=input_dir,
+            config=attempt_config,
+            hyworld_repo=self.config.HYWORLD_REPO,
+            vllm_host=self.config.VLLM_HOST,
+            vllm_port=self.config.VLLM_PORT,
+            vllm_model=self.config.VLLM_MODEL,
+            task_type="worldgen",
+        )
+        by_stage = {name: (command, env, cwd) for name, command, env, cwd in commands}
+        for stage_name in ("panogen", "traj_generate", "traj_render"):
+            marker = attempt_dir / f".stage_{stage_name}_done"
+            if marker.exists():
+                continue
+            if cancel_event.is_set():
+                return False, "Cancelled by user"
+            command, env, cwd = by_stage[stage_name]
+            if stage_name == "panogen":
+                await self._stop_vllm()
+            elif stage_name == "traj_generate":
+                await self._start_vllm()
+            log_file = task_dir / "logs" / f"recovery_attempt_{source_attempt:03d}_{stage_name}.log"
+            success, error = await run_stage(
+                stage_name=stage_name,
+                cmd=command,
+                env=env,
+                log_file=log_file,
+                cwd=cwd,
+                cancel_event=cancel_event,
+            )
+            if not success:
+                return False, error
+            if stage_name == "traj_generate":
+                try:
+                    postvalidate_worldgen_stage(
+                        stage_name,
+                        task_dir=task_dir,
+                        scene_dir=attempt_scene_dir,
+                        log_file=log_file,
+                        quality_preset="high",
+                    )
+                except QualityGateError as exc:
+                    return False, str(exc)
+            marker.touch()
+
+        await self._stop_vllm()
+        video_cmd, video_env, video_cwd = by_stage["video_gen"]
+        render_cmd, render_env, render_cwd = by_stage["traj_render"]
+        success, error = await self._run_auto_high_quality_video_recovery(
+            task_dir=task_dir,
+            scene_dir=attempt_scene_dir,
+            log_file=task_dir / "logs" / f"recovery_attempt_{source_attempt:03d}_video_gen.log",
+            cmd=video_cmd,
+            env=video_env,
+            cwd=video_cwd,
+            cancel_event=cancel_event,
+            task_type="worldgen",
+            recovery_policy="auto",
+            render_spec=(render_cmd, render_env, render_cwd),
+            input_dir=input_dir,
+            task_config=attempt_config,
+        )
+        if not success:
+            return False, error
+
+        try:
+            promote_recovered_scene(
+                task_dir,
+                source_attempt=source_attempt,
+                regenerated_scene_dir=attempt_scene_dir,
+                canonical_scene_dir=source_scene_dir,
+            )
+            set_active_scene(task_dir, "scene")
+        except AutoRecoveryError as exc:
+            return False, str(exc)
+        return True, ""
+
+    async def _run_replacement_panorama_attempt(
+        self,
+        *,
+        task_dir: Path,
+        source_scene_dir: Path,
+        input_dir: Path,
+        task_config: dict,
+        cancel_event: asyncio.Event,
+        resume: bool,
+    ) -> tuple[bool, str]:
+        """Run a user-supplied panorama retry without ever invoking panogen."""
+        try:
+            report = json.loads((task_dir / "auto_recovery.json").read_text())
+            source_attempt = int(report["source_attempt"])
+            scene_relpath = str(report["active_scene_relpath"])
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            return False, f"Replacement panorama recovery report is invalid: {exc}"
+        if not resume or report.get("state") != "replacing_panorama_source":
+            return False, "Replacement panorama retry was not requested by the recovery state machine"
+        attempt_scene_dir = task_dir / scene_relpath
+        if not (attempt_scene_dir / "panorama.png").is_file():
+            return False, "Replacement panorama is missing; upload a source image before retrying"
+
+        commands = get_worldgen_commands(
+            task_dir=task_dir,
+            scene_dir=attempt_scene_dir,
+            input_dir=input_dir,
+            config=task_config,
+            hyworld_repo=self.config.HYWORLD_REPO,
+            vllm_host=self.config.VLLM_HOST,
+            vllm_port=self.config.VLLM_PORT,
+            vllm_model=self.config.VLLM_MODEL,
+            task_type="worldgen_from_pano",
+        )
+        by_stage = {name: (command, env, cwd) for name, command, env, cwd in commands}
+        for stage_name in ("traj_generate", "traj_render"):
+            marker = attempt_scene_dir.parent / f".stage_{stage_name}_done"
+            if marker.exists():
+                continue
+            if cancel_event.is_set():
+                return False, "Cancelled by user"
+            command, env, cwd = by_stage[stage_name]
+            if stage_name == "traj_generate":
+                await self._start_vllm()
+            log_file = task_dir / "logs" / f"replacement_attempt_{source_attempt:03d}_{stage_name}.log"
+            success, error = await run_stage(
+                stage_name=stage_name,
+                cmd=command,
+                env=env,
+                log_file=log_file,
+                cwd=cwd,
+                cancel_event=cancel_event,
+            )
+            if not success:
+                return False, error
+            try:
+                postvalidate_worldgen_stage(
+                    stage_name,
+                    task_dir=task_dir,
+                    scene_dir=attempt_scene_dir,
+                    log_file=log_file,
+                    quality_preset="high",
+                )
+            except QualityGateError as exc:
+                return False, str(exc)
+            marker.touch()
+
+        await self._stop_vllm()
+        video_cmd, video_env, video_cwd = by_stage["video_gen"]
+        render_cmd, render_env, render_cwd = by_stage["traj_render"]
+        success, error = await self._run_auto_high_quality_video_recovery(
+            task_dir=task_dir,
+            scene_dir=attempt_scene_dir,
+            log_file=task_dir / "logs" / f"replacement_attempt_{source_attempt:03d}_video_gen.log",
+            cmd=video_cmd,
+            env=video_env,
+            cwd=video_cwd,
+            cancel_event=cancel_event,
+            task_type="worldgen_from_pano",
+            recovery_policy="auto",
+            render_spec=(render_cmd, render_env, render_cwd),
+            input_dir=input_dir,
+            task_config=task_config,
+        )
+        if not success:
+            return False, error
+        try:
+            promote_recovered_scene(
+                task_dir,
+                source_attempt=source_attempt,
+                regenerated_scene_dir=attempt_scene_dir,
+                canonical_scene_dir=source_scene_dir,
+            )
+            set_active_scene(task_dir, "scene")
+        except AutoRecoveryError as exc:
+            return False, str(exc)
+        return True, ""
+
     async def _execute_mock(self, task_id, stage_names, cancel_event, task_dir, logs_dir):
         """Mock pipeline for local development."""
         for stage_name in stage_names:
@@ -521,6 +974,8 @@ class PipelineWorker:
                 "trajectory_whitelist.json",
                 "video_trajectory_whitelist.json",
                 "video_recovery.json",
+                "auto_recovery.json",
+                "source_promotion.json",
             ):
                 report = task_dir / name
                 if report.is_file():
