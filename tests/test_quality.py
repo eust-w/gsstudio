@@ -57,6 +57,17 @@ class TestTaskQualityConfig:
         assert config["quality_preset"] == "fast"
         assert config["worldstereo_model_type"] == "worldstereo-memory-dmd"
 
+    def test_high_quality_defaults_to_automatic_recovery_and_fast_disables_it(self):
+        high = normalize_worldgen_config({}, form_prompt=None)
+        fast = normalize_worldgen_config({"quality_preset": "fast", "recovery_policy": "auto"}, form_prompt=None)
+
+        assert high["recovery_policy"] == "auto"
+        assert fast["recovery_policy"] == "off"
+
+    def test_rejects_unknown_recovery_policy(self):
+        with pytest.raises(ValueError, match="recovery_policy"):
+            normalize_worldgen_config({"recovery_policy": "unbounded"}, form_prompt=None)
+
     def test_rejects_unknown_quality_preset(self):
         with pytest.raises(ValueError, match="quality_preset"):
             normalize_worldgen_config({"quality_preset": "ultra"}, form_prompt=None)
@@ -97,7 +108,7 @@ class TestTrajectoryPlanValidation:
 
         assert report["planning"]["collision_dropped_count"] == 2
 
-    def test_high_quality_video_candidates_include_alignment_recovery_capacity(self, tmp_path):
+    def test_high_quality_video_candidates_start_with_eight_regular_first_paths(self, tmp_path):
         scene_dir = tmp_path / "scene"
         navmesh = scene_dir / "navmesh"
         navmesh.mkdir(parents=True)
@@ -115,19 +126,8 @@ class TestTrajectoryPlanValidation:
         candidates = select_high_quality_video_candidates(report["planning"])
         manifest = write_video_trajectory_candidates(tmp_path, candidates)
 
-        assert len(candidates) == 16
-        assert {candidate["kind"] for candidate in candidates} == {
-            "regular", "surround", "exploration", "reconstruction",
-        }
-        assert {
-            kind: sum(candidate["kind"] == kind for candidate in candidates)
-            for kind in {candidate["kind"] for candidate in candidates}
-        } == {
-            "regular": 8,
-            "surround": 2,
-            "exploration": 2,
-            "reconstruction": 4,
-        }
+        assert len(candidates) == 8
+        assert {candidate["kind"] for candidate in candidates} == {"regular"}
         assert json.loads(manifest.read_text())["candidate_trajectory_ids"] == [
             candidate["id"] for candidate in candidates
         ]
@@ -243,7 +243,7 @@ class TestHighQualityVideoRecovery:
     def test_replenishes_untried_candidates_after_legacy_alignment_failure(self, tmp_path):
         planning = self._planning()
         ranked = rank_high_quality_video_candidates(planning)
-        initial_ids = [candidate["id"] for candidate in ranked[:16]]
+        initial_ids = [candidate["id"] for candidate in ranked[:8]]
         accepted_ids = ["view0/traj0", "view1/traj0"]
 
         (tmp_path / "quality_report.json").write_text(
@@ -273,7 +273,7 @@ class TestHighQualityVideoRecovery:
         assert not set(recovery["next_candidate_trajectory_ids"]).intersection(initial_ids)
         assert recovery["next_candidate_trajectory_ids"][:2] == [
             "view8/traj0",
-            "target_2/traj0",
+            "target_0/traj0",
         ]
         manifest = json.loads((tmp_path / "video_trajectory_whitelist.json").read_text())
         assert manifest["candidate_trajectory_ids"] == recovery["next_candidate_trajectory_ids"]
@@ -288,7 +288,7 @@ class TestHighQualityVideoRecovery:
         retry = prepare_high_quality_video_recovery(tmp_path)
 
         assert first["status"] == "initial"
-        assert len(first["next_candidate_trajectory_ids"]) == 16
+        assert len(first["next_candidate_trajectory_ids"]) == 8
         assert retry["next_candidate_trajectory_ids"] == first["next_candidate_trajectory_ids"]
 
         alignment = {
