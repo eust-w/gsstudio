@@ -25,29 +25,15 @@ QUALITY_PRESETS = {
         "minimum_accepted_trajectories": 0,
     },
 }
-# A first batch must retain coverage of the four WorldNav path classes, but
-# the recorded alignment gate can reject an entire class (for example, a poor
-# guidance mask on every exploratory route).  Sixteen candidates retain every
-# regular WorldNav path before spending the remaining budget on diverse routes.
-# Indoor jobs commonly have the most stable guidance on regular paths, giving
-# the six-path training gate real recovery capacity without weakening any threshold.
-# The first generation pass is deliberately bounded, but a task must be able
-# to replenish that pass from the planner's remaining valid routes when the
-# alignment gate rejects too many of them.  The total budget is large enough
-# to exhaust every route in ordinary indoor scenes (including the 31-route
-# failure that motivated this recovery path) without turning an unexpectedly
-# large planner output into unbounded GPU work.
-HIGH_VIDEO_CANDIDATE_LIMIT = 16
+# High-quality auto recovery starts with the smallest useful WorldStereo
+# batch.  Regular views have the most reliable guidance for indoor scenes;
+# non-regular WorldNav paths remain available later but no longer consume a
+# full-model pass before low acceptance can be detected.
+HIGH_VIDEO_CANDIDATE_LIMIT = 8
 HIGH_VIDEO_CANDIDATE_BUDGET = 32
 HIGH_VIDEO_RECOVERY_BATCH_SIZE = 8
 VIDEO_RECOVERY_REPORT_NAME = "video_recovery.json"
 VIDEO_CANDIDATE_KIND_ORDER = ("regular", "surround", "exploration", "reconstruction")
-HIGH_VIDEO_CANDIDATE_QUOTAS = {
-    "regular": 8,
-    "surround": 2,
-    "exploration": 2,
-    "reconstruction": 4,
-}
 
 PLANNING_ERROR_PATTERNS = (
     re.compile(r"navmesh\s+error", re.IGNORECASE),
@@ -90,6 +76,13 @@ def normalize_worldgen_config(
         raise ValueError(f"quality_preset must be one of: {choices}")
     normalized["quality_preset"] = quality_preset
     normalized["worldstereo_model_type"] = QUALITY_PRESETS[quality_preset]["worldstereo_model_type"]
+
+    recovery_policy = normalized.get("recovery_policy", "auto")
+    if recovery_policy not in {"auto", "off"}:
+        raise ValueError("recovery_policy must be one of: auto, off")
+    # Fast DMD intentionally remains the inexpensive non-gated path.  It must
+    # never silently opt into the high-quality recovery loop.
+    normalized["recovery_policy"] = "off" if quality_preset == "fast" else recovery_policy
 
     if form_prompt is not None and form_prompt.strip():
         normalized["prompt"] = form_prompt.strip()
@@ -201,38 +194,22 @@ def validate_trajectory_plan(
 
 
 def select_high_quality_video_candidates(planning: dict[str, Any]) -> list[dict[str, Any]]:
-    """Bound full-WorldStereo inference while retaining alignment recovery capacity.
-
-    Full WorldStereo uses all sequence-parallel ranks for a single trajectory.
-    Rendering every possible path is therefore serial.  Select a deterministic
-    sixteen-path set: two surround/exploration paths preserve diverse coverage,
-    while eight regular and four reconstruction paths provide enough independent
-    high-guidance alternatives to satisfy the stricter six-path alignment gate
-    when a whole exploratory class is rejected.
-    """
+    """Select the initial eight full-WorldStereo candidates, regular first."""
     trajectories = sorted(planning.get("trajectories", []), key=lambda item: item["id"])
     by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for trajectory in trajectories:
         by_kind[trajectory["kind"]].append(trajectory)
 
-    selected: list[dict[str, Any]] = []
-    for kind in VIDEO_CANDIDATE_KIND_ORDER:
-        selected.extend(by_kind[kind][:HIGH_VIDEO_CANDIDATE_QUOTAS[kind]])
-    if len(selected) < HIGH_VIDEO_CANDIDATE_LIMIT:
-        selected_ids = {trajectory["id"] for trajectory in selected}
-        selected.extend(
-            trajectory
-            for trajectory in trajectories
-            if trajectory["id"] not in selected_ids
-        )
+    selected = list(by_kind["regular"])
+    for kind in ("surround", "reconstruction", "exploration"):
+        selected.extend(by_kind[kind])
     return selected[:HIGH_VIDEO_CANDIDATE_LIMIT]
 
 
 def rank_high_quality_video_candidates(planning: dict[str, Any]) -> list[dict[str, Any]]:
     """Return every valid path in deterministic high-quality priority order.
 
-    The initial batch keeps the existing type-balanced quota.  Replenishment
-    then tries untested regular routes first, followed by surround,
+    The initial batch and replenishment both prefer regular routes, followed by surround,
     exploration, and reconstruction routes.  This makes indoor recovery
     favor the paths with the most stable camera guidance without pretending
     that a rejected route is acceptable.
