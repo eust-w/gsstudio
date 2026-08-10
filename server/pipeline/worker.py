@@ -12,7 +12,13 @@ from ..config import Config
 from ..db import get_task, list_tasks, set_task_stages, update_stage, update_task
 from ..models import StageStatus, TaskStatus
 from .stage_runner import run_stage
-from .quality import QualityGateError, postvalidate_worldgen_stage
+from .quality import (
+    QualityGateError,
+    complete_high_quality_video_recovery,
+    enforce_alignment_quality,
+    postvalidate_worldgen_stage,
+    prepare_high_quality_video_recovery,
+)
 from .worldgen import get_stage_names, get_worldgen_commands
 from .worldrecon import get_worldrecon_commands
 
@@ -286,6 +292,41 @@ class PipelineWorker:
             log_file = logs_dir / f"{stage_name}.log"
             update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.RUNNING)
 
+            # A full WorldStereo pass may have enough technically valid
+            # planned routes but too few alignment-approved ones.  Refill from
+            # untested routes in bounded batches before rejecting the task;
+            # this never relaxes the quality thresholds or feeds rejected
+            # videos into later 3DGS stages.
+            if stage_name == "video_gen" and task_config["quality_preset"] == "high":
+                try:
+                    success, error = await self._run_high_quality_video_recovery(
+                        task_dir=task_dir,
+                        scene_dir=scene_dir,
+                        log_file=log_file,
+                        cmd=cmd,
+                        env=env,
+                        cwd=cwd,
+                        cancel_event=cancel_event,
+                    )
+                except QualityGateError as exc:
+                    update_stage(
+                        self.config.DB_PATH,
+                        task_id,
+                        stage_name,
+                        StageStatus.FAILED,
+                        error=str(exc),
+                    )
+                    raise RuntimeError(f"Stage {stage_name} failed quality validation: {exc}") from exc
+
+                if success:
+                    marker.touch()
+                    update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.COMPLETED)
+                    continue
+                if cancel_event.is_set():
+                    return
+                update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.FAILED, error=error)
+                raise RuntimeError(f"Stage {stage_name} failed: {error}")
+
             success, error = await run_stage(
                 stage_name=stage_name,
                 cmd=cmd,
@@ -330,6 +371,88 @@ class PipelineWorker:
             # Restore vLLM once panogen (the only full-VRAM stage) finishes.
             if stage_name == "panogen":
                 await self._start_vllm()
+
+    async def _run_high_quality_video_recovery(
+        self,
+        *,
+        task_dir: Path,
+        scene_dir: Path,
+        log_file: Path,
+        cmd: list[str],
+        env: dict[str, str],
+        cwd: Path,
+        cancel_event: asyncio.Event,
+    ) -> tuple[bool, str]:
+        """Run/replenish high-quality WorldStereo candidates until the gate passes.
+
+        The manifest is rewritten for each new batch, while ``run_stage``
+        appends to one durable log.  This lets alignment validation assess the
+        union of prior and supplemental trajectories and makes retry resume
+        from the next untested routes after a gate-only failure.
+        """
+        while not cancel_event.is_set():
+            recovery = prepare_high_quality_video_recovery(task_dir)
+            candidate_ids = recovery["next_candidate_trajectory_ids"]
+            expected_ids = [
+                *recovery["attempted_trajectory_ids"],
+                *candidate_ids,
+            ]
+            if not candidate_ids:
+                alignment = postvalidate_worldgen_stage(
+                    "video_gen",
+                    task_dir=task_dir,
+                    scene_dir=scene_dir,
+                    log_file=log_file,
+                    quality_preset="high",
+                    expected_trajectory_ids=expected_ids,
+                    enforce_alignment=False,
+                )
+                if not isinstance(alignment, dict):
+                    raise QualityGateError("Video alignment report was not produced")
+                enforce_alignment_quality(
+                    alignment,
+                    quality_preset="high",
+                    candidate_budget=recovery["candidate_budget"],
+                )
+                return True, ""
+
+            round_number = len(recovery["batches"]) + 1
+            with open(log_file, "a") as log:
+                log.write(
+                    f"[Quality Recovery] round {round_number}: generating "
+                    f"{len(candidate_ids)} untested trajectories "
+                    f"({len(recovery['accepted_trajectory_ids'])}/"
+                    f"{recovery['minimum_accepted_trajectories']} accepted so far)\n"
+                )
+
+            success, error = await run_stage(
+                stage_name="video_gen",
+                cmd=cmd,
+                env=env,
+                log_file=log_file,
+                cwd=cwd,
+                cancel_event=cancel_event,
+            )
+            if not success:
+                return False, error
+
+            alignment = postvalidate_worldgen_stage(
+                "video_gen",
+                task_dir=task_dir,
+                scene_dir=scene_dir,
+                log_file=log_file,
+                quality_preset="high",
+                expected_trajectory_ids=expected_ids,
+                enforce_alignment=False,
+            )
+            if not isinstance(alignment, dict):
+                raise QualityGateError("Video alignment report was not produced")
+            completed = complete_high_quality_video_recovery(task_dir, alignment)
+            if completed["status"] == "accepted":
+                enforce_alignment_quality(alignment, quality_preset="high")
+                return True, ""
+
+        return False, "Cancelled by user"
 
     async def _execute_mock(self, task_id, stage_names, cancel_event, task_dir, logs_dir):
         """Mock pipeline for local development."""
@@ -397,6 +520,7 @@ class PipelineWorker:
                 "alignment_quality.json",
                 "trajectory_whitelist.json",
                 "video_trajectory_whitelist.json",
+                "video_recovery.json",
             ):
                 report = task_dir / name
                 if report.is_file():
