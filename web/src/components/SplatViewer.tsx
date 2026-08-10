@@ -11,6 +11,7 @@ import {
   initialCameraPose,
   moveOnGround,
   parseViewerMetadata,
+  requestPointerLockSafely,
   supportsPointerLock,
   ViewerMetadata,
 } from "./splatFirstPerson";
@@ -277,11 +278,7 @@ export default function SplatViewer({ url, metadataUrl, collisionMeshUrl, onLoad
     const activatePointerLock = () => {
       viewer.focus({ preventScroll: true });
       if (!controls.isLocked && pointerLockSupported && renderer.domElement.isConnected) {
-        try {
-          controls.lock();
-        } catch {
-          setPointerLockAvailable(false);
-        }
+        requestPointerLockSafely(renderer.domElement, () => setPointerLockAvailable(false));
       }
     };
     window.addEventListener("keydown", handleKeyDown);

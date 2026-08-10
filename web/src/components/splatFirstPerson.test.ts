@@ -5,6 +5,7 @@ import * as THREE from "three";
 import {
   clampToNavigationBounds,
   initialCameraPose,
+  requestPointerLockSafely,
   supportsPointerLock,
   moveOnGround,
   parseViewerMetadata,
@@ -44,6 +45,20 @@ describe("first-person movement", () => {
         { exitPointerLock: () => {} },
       ),
     ).toBe(true);
+  });
+
+  it("handles a rejected Pointer Lock promise without an unhandled browser error", async () => {
+    let unavailable = 0;
+    requestPointerLockSafely(
+      {
+        requestPointerLock: () => Promise.reject(new DOMException("invalid document", "WrongDocumentError")),
+      },
+      () => { unavailable += 1; },
+    );
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(unavailable).toBe(1);
   });
 
   it("moves on an arbitrary ground plane and applies the Shift multiplier", () => {
