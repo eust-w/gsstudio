@@ -7,11 +7,16 @@ from pathlib import Path
 import pytest
 
 from server.pipeline.quality import (
+    HIGH_VIDEO_CANDIDATE_BUDGET,
+    HIGH_VIDEO_RECOVERY_BATCH_SIZE,
     QualityGateError,
     build_alignment_quality,
+    complete_high_quality_video_recovery,
     enforce_alignment_quality,
     normalize_worldgen_config,
     postvalidate_worldgen_stage,
+    prepare_high_quality_video_recovery,
+    rank_high_quality_video_candidates,
     select_high_quality_video_candidates,
     validate_trajectory_plan,
     write_video_trajectory_candidates,
@@ -219,3 +224,82 @@ class TestAlignmentQuality:
         assert manifest["accepted_trajectory_ids"] == [f"view{index}/traj0" for index in range(6)]
         report = json.loads((tmp_path / "quality_report.json").read_text())
         assert report["alignment"]["accepted_trajectory_ids"] == manifest["accepted_trajectory_ids"]
+
+
+class TestHighQualityVideoRecovery:
+    @staticmethod
+    def _planning() -> dict:
+        trajectories = []
+        for index in range(9):
+            trajectories.append({"id": f"view{index}/traj0", "kind": "regular"})
+        for index in range(8):
+            trajectories.append({"id": f"target_{index}/traj0", "kind": "surround"})
+        for index in range(6):
+            trajectories.append({"id": f"wonder_{index}/traj0", "kind": "exploration"})
+        for index in range(8):
+            trajectories.append({"id": f"reconstruct_{index}/traj0", "kind": "reconstruction"})
+        return {"trajectories": trajectories}
+
+    def test_replenishes_untried_candidates_after_legacy_alignment_failure(self, tmp_path):
+        planning = self._planning()
+        ranked = rank_high_quality_video_candidates(planning)
+        initial_ids = [candidate["id"] for candidate in ranked[:16]]
+        accepted_ids = ["view0/traj0", "view1/traj0"]
+
+        (tmp_path / "quality_report.json").write_text(
+            json.dumps({"planning": planning}, indent=2) + "\n"
+        )
+        (tmp_path / "alignment_quality.json").write_text(
+            json.dumps(
+                {
+                    "accepted_trajectory_ids": accepted_ids,
+                    "trajectories": {trajectory_id: {} for trajectory_id in initial_ids},
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        write_video_trajectory_candidates(
+            tmp_path,
+            [candidate for candidate in ranked if candidate["id"] in initial_ids],
+        )
+
+        recovery = prepare_high_quality_video_recovery(tmp_path)
+
+        assert recovery["status"] == "recovering"
+        assert recovery["candidate_budget"] == min(HIGH_VIDEO_CANDIDATE_BUDGET, len(ranked))
+        assert recovery["accepted_trajectory_ids"] == accepted_ids
+        assert len(recovery["next_candidate_trajectory_ids"]) == HIGH_VIDEO_RECOVERY_BATCH_SIZE
+        assert not set(recovery["next_candidate_trajectory_ids"]).intersection(initial_ids)
+        assert recovery["next_candidate_trajectory_ids"][:2] == [
+            "view8/traj0",
+            "target_2/traj0",
+        ]
+        manifest = json.loads((tmp_path / "video_trajectory_whitelist.json").read_text())
+        assert manifest["candidate_trajectory_ids"] == recovery["next_candidate_trajectory_ids"]
+
+    def test_recovery_keeps_a_pending_batch_on_retry_then_records_its_result(self, tmp_path):
+        planning = self._planning()
+        (tmp_path / "quality_report.json").write_text(
+            json.dumps({"planning": planning}, indent=2) + "\n"
+        )
+
+        first = prepare_high_quality_video_recovery(tmp_path)
+        retry = prepare_high_quality_video_recovery(tmp_path)
+
+        assert first["status"] == "initial"
+        assert len(first["next_candidate_trajectory_ids"]) == 16
+        assert retry["next_candidate_trajectory_ids"] == first["next_candidate_trajectory_ids"]
+
+        alignment = {
+            "accepted_trajectory_ids": first["next_candidate_trajectory_ids"][:6],
+            "trajectories": {
+                trajectory_id: {"accepted": trajectory_id in first["next_candidate_trajectory_ids"][:6]}
+                for trajectory_id in first["next_candidate_trajectory_ids"]
+            },
+        }
+        completed = complete_high_quality_video_recovery(tmp_path, alignment)
+
+        assert completed["status"] == "accepted"
+        assert completed["pending_candidate_trajectory_ids"] == []
+        assert completed["attempted_trajectory_ids"] == first["next_candidate_trajectory_ids"]

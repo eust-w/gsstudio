@@ -199,6 +199,7 @@ export default function TaskDetail() {
               {task.config.quality_preset === "high" ? (
                 <>
                   <p><span className="quality-label">Trajectory gate</span> minimum 8 valid trajectories; at least 6 alignment-approved trajectories</p>
+                  <p><span className="quality-label">Recovery</span> adds untried trajectories in batches of 8 when needed (up to 32 planned candidates); rejected trajectories never enter 3DGS</p>
                   <p><span className="quality-label">Training</span> 5 GPUs · 2,000 steps · refine 200 / 1000 / 133</p>
                 </>
               ) : (
