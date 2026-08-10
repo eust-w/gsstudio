@@ -27,13 +27,14 @@ QUALITY_PRESETS = {
 }
 # A first batch must retain coverage of the four WorldNav path classes, but
 # the recorded alignment gate can reject an entire class (for example, a poor
-# guidance mask on every exploratory route).  Twelve candidates leave enough
-# independently-planned regular/reconstruction capacity to still meet the
-# six-path training gate without weakening any threshold.
-HIGH_VIDEO_CANDIDATE_LIMIT = 12
+# guidance mask on every exploratory route).  Sixteen candidates retain every
+# regular WorldNav path before spending the remaining budget on diverse routes.
+# Indoor jobs commonly have the most stable guidance on regular paths, giving
+# the six-path training gate real recovery capacity without weakening any threshold.
+HIGH_VIDEO_CANDIDATE_LIMIT = 16
 VIDEO_CANDIDATE_KIND_ORDER = ("regular", "surround", "exploration", "reconstruction")
 HIGH_VIDEO_CANDIDATE_QUOTAS = {
-    "regular": 4,
+    "regular": 8,
     "surround": 2,
     "exploration": 2,
     "reconstruction": 4,
@@ -195,8 +196,8 @@ def select_high_quality_video_candidates(planning: dict[str, Any]) -> list[dict[
 
     Full WorldStereo uses all sequence-parallel ranks for a single trajectory.
     Rendering every possible path is therefore serial.  Select a deterministic
-    twelve-path set: two surround/exploration paths preserve diverse coverage,
-    while four regular/reconstruction paths provide enough independent
+    sixteen-path set: two surround/exploration paths preserve diverse coverage,
+    while eight regular and four reconstruction paths provide enough independent
     high-guidance alternatives to satisfy the stricter six-path alignment gate
     when a whole exploratory class is rejected.
     """
