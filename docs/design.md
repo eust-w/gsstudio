@@ -33,9 +33,19 @@ Single-pod deployment: API server + Pipeline Worker + vLLM sidecar, sharing 5 GP
 Task: pending -> running -> completed | failed | cancelled
 Stage: pending -> running -> completed | failed | skipped
 
+For valid world-generation input, strict trajectory quality changes the
+delivery tier rather than the task status: six accepted paths produce
+`strict_3d`, four or five produce whitelist-only `degraded_3d`, and fewer than
+four produce `panorama_only` with downstream 3D stages skipped. All three are
+top-level `completed` results.
+
 ### Checkpoint Resume
 
 Each stage writes a completion marker to the task scene directory. On retry, completed stages are skipped.
+High-quality tasks additionally keep atomic `auto_recovery.json` version 2
+journals with pending batches, source attempts, best-attempt scoring, budgets,
+delivery tier, and transient retry counts. The global recovery ceiling is 56
+WorldStereo paths, 180 minutes, and two deterministic regenerated sources.
 
 ## Model Weights (pre-downloaded to PVC)
 
