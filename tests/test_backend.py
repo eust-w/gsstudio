@@ -370,6 +370,9 @@ class TestDeploymentContract:
         assert "No trajectory renderings matched" in patched
         assert "and not args.trajectory_whitelist" in patched
 
+        subprocess.run([sys.executable, str(patch_script), str(upstream)], check=True)
+        assert upstream.read_text() == patched
+
     def test_image_and_startup_preflight_require_rtree(self):
         dockerfile = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
         entrypoint = (Path(__file__).parents[1] / "deploy/scripts/entrypoint.sh").read_text()
