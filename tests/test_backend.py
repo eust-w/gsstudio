@@ -839,13 +839,13 @@ class TestDeploymentContract:
         assert "patch_hyworld_render_filter.py" in dockerfile
         assert "/opt/hyworld2/hyworld2/worldgen/traj_render.py" in dockerfile
 
-    def test_gpu_rollout_manifests_target_the_immutable_v34_image(self):
+    def test_gpu_rollout_manifests_target_the_immutable_v37_image(self):
         root = Path(__file__).parents[1]
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v36" in deployment
-        assert "gsstudio:a800-v36" in build
+        assert "gsstudio:a800-v37" in deployment
+        assert "gsstudio:a800-v37" in build
         assert "gsstudio:a800-v35" not in deployment
         assert "gsstudio:a800-v35" not in build
         assert "gsstudio:a800-v22" not in deployment
@@ -909,7 +909,7 @@ class TestDeploymentContract:
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
 
         assert "FROM ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22" in source
-        assert "GSStudio a800-v36" in source
+        assert "GSStudio a800-v37" in source
 
     def test_image_patches_worldstereo_transformer_for_local_only_loading(self):
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()

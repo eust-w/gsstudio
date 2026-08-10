@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
-# GSStudio a800-v36: automatic recovery, repeatable source retries, and
-# reproducible dependency-audit remediation.
+# GSStudio a800-v37: effective-input delivery tiers, durable best-attempt
+# recovery, repeatable source retries, and dependency-audit remediation.
 # Keeping CUDA extensions and model runtimes in the v22 base makes this release
 # fast and avoids recompiling HY-World during a safety/quality-only rollout.
 FROM ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22
