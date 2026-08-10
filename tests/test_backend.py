@@ -1050,6 +1050,45 @@ class TestAPI:
         assert report["source_seed"] == 1025
         assert get_task(cfg.DB_PATH, task_id)["config"]["recovery_policy"] == "auto"
 
+    def test_completed_degraded_delivery_can_request_a_higher_quality_source(self, client, cfg):
+        task_id = create_task(
+            cfg.DB_PATH,
+            name="degraded-source-retry",
+            task_type="worldgen",
+            config={"quality_preset": "high", "recovery_policy": "auto", "seed": 1024},
+        )
+        update_task(cfg.DB_PATH, task_id, status=TaskStatus.COMPLETED.value)
+        task_dir = cfg.task_dir(task_id)
+        task_dir.mkdir(parents=True)
+        (task_dir / "auto_recovery.json").write_text(json.dumps({
+            "version": 2,
+            "task_type": "worldgen",
+            "state": "completed",
+            "delivery_tier": "degraded_3d",
+            "recovery_exhausted": True,
+            "source_attempt": 2,
+            "attempt_history": [],
+            "source_attempts": [],
+            "accepted_trajectory_ids": [f"view{i}/traj0" for i in range(5)],
+            "attempted_trajectory_ids": [],
+            "pending_candidate_trajectory_ids": [],
+            "batches": [],
+            "generated_video_trajectory_count": 40,
+            "video_seconds": 7000,
+            "minimum_accepted_trajectories": 6,
+            "limits": {},
+        }))
+
+        response = client.post(f"/api/tasks/{task_id}/retry-source")
+
+        assert response.status_code == 200
+        report = json.loads((task_dir / "auto_recovery.json").read_text())
+        assert report["state"] == "regenerating_panorama"
+        assert report["source_attempt"] == 3
+        assert report["source_seed"] == 1027
+        assert report["delivery_tier"] is None
+        assert report["recovery_exhausted"] is False
+
     def test_retry_source_requires_and_preserves_a_replacement_panorama(self, client, cfg):
         task_id = create_task(
             cfg.DB_PATH,

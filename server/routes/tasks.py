@@ -248,7 +248,14 @@ async def retry_task_source_endpoint(
         raise HTTPException(404, "Task not found")
     if task["type"] not in ("worldgen", "worldgen_from_pano"):
         raise HTTPException(409, "Only World Generation tasks support source retry")
-    if task["status"] not in (TaskStatus.FAILED.value, TaskStatus.CANCELLED.value):
+    task_dir = cfg.task_dir(task_id)
+    current = auto_recovery_summary(task_dir)
+    completed_recovery_retry = (
+        task["status"] == TaskStatus.COMPLETED.value
+        and current.get("recovery_exhausted") is True
+        and current.get("delivery_tier") in {"degraded_3d", "panorama_only"}
+    )
+    if task["status"] not in (TaskStatus.FAILED.value, TaskStatus.CANCELLED.value) and not completed_recovery_retry:
         raise HTTPException(409, f"Cannot replace the source in status: {task['status']}")
     config = dict(task.get("config") or {})
     if config.get("quality_preset", "high") != "high" or config.get("recovery_policy", "auto") != "auto":
@@ -258,9 +265,7 @@ async def retry_task_source_endpoint(
     if panorama is not None and not (panorama.content_type or "").startswith("image/"):
         raise HTTPException(400, "Replacement panorama must be an image")
 
-    task_dir = cfg.task_dir(task_id)
     try:
-        current = auto_recovery_summary(task_dir)
         if not current.get("available"):
             raise AutoRecoveryError("Source retry requires an automatic recovery report")
         source_attempt = int(current.get("source_attempt", 0))

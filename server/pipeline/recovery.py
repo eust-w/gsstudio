@@ -650,6 +650,10 @@ def request_source_retry(
     # 120-minute allowance accumulated by automatic recovery.
     report["batches"] = []
     report["terminal_reason"] = None
+    report["delivery_tier"] = None
+    report["quality_warning"] = None
+    report["recovery_exhausted"] = False
+    report.pop("best_scene_relpath", None)
     report["manual_source_retry"] = True
     if task_type == "worldgen":
         if seed is None:

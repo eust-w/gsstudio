@@ -645,6 +645,30 @@ body {
   color: #fbbf24 !important;
 }
 
+.delivery-tier {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  padding: 9px 11px;
+  border: 1px solid rgba(96, 165, 250, 0.35);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.45);
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+}
+
+.delivery-tier strong {
+  color: #86efac;
+}
+
+.delivery-tier-degraded_3d strong,
+.delivery-tier-panorama_only strong,
+.quality-warning {
+  color: #fbbf24 !important;
+}
+
 .source-retry-controls {
   display: flex;
   flex-direction: column;
