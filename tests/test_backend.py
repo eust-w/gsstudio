@@ -359,6 +359,7 @@ class TestDeploymentContract:
             "render_list = sort_trajs(f\"{scene}/render_results\")\n"
             "if os.path.exists(f\"{scene}/render_results/generation_bank_{args.model_type}/aligned_pcd.ply\") and args.skip_exist:\n"
             "    continue\n"
+            "memory_bank.apply_worldmirror(skip_exist=True)\n"
         )
         patch_script = Path(__file__).parents[1] / "deploy/scripts/patch_hyworld_video_filter.py"
 
@@ -369,6 +370,7 @@ class TestDeploymentContract:
         assert "candidate_trajectory_ids" in patched
         assert "No trajectory renderings matched" in patched
         assert "and not args.trajectory_whitelist" in patched
+        assert "skip_exist=not bool(args.trajectory_whitelist)" in patched
 
         subprocess.run([sys.executable, str(patch_script), str(upstream)], check=True)
         assert upstream.read_text() == patched
@@ -394,13 +396,13 @@ class TestDeploymentContract:
         assert "patch_hyworld_video_filter.py" in dockerfile
         assert "/opt/hyworld2/hyworld2/worldgen/video_gen.py" in dockerfile
 
-    def test_gpu_rollout_manifests_target_the_immutable_v29_image(self):
+    def test_gpu_rollout_manifests_target_the_immutable_v30_image(self):
         root = Path(__file__).parents[1]
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v29" in deployment
-        assert "gsstudio:a800-v29" in build
+        assert "gsstudio:a800-v30" in deployment
+        assert "gsstudio:a800-v30" in build
         assert "gsstudio:a800-v22" not in deployment
         assert "gsstudio:a800-v22" not in build
 
@@ -448,7 +450,7 @@ class TestDeploymentContract:
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
 
         assert "FROM ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22" in source
-        assert "GSStudio a800-v29" in source
+        assert "GSStudio a800-v30" in source
 
     def test_image_patches_worldstereo_transformer_for_local_only_loading(self):
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
