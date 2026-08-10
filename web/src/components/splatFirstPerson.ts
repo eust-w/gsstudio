@@ -10,7 +10,17 @@ const BOOST_MULTIPLIER = 3;
 export function supportsPointerLock(
   target: { requestPointerLock?: unknown },
   ownerDocument: { exitPointerLock?: unknown },
+  browsingContext?: { top?: unknown; parent?: unknown },
 ): boolean {
+  // Pointer Lock is not reliably permitted for a nested/hosted document.
+  // In particular, the browser automation host exposes the API surface but
+  // logs a WrongDocumentError before a catch handler can suppress it.
+  if (
+    browsingContext
+    && (browsingContext.top !== browsingContext || browsingContext.parent !== browsingContext)
+  ) {
+    return false;
+  }
   return typeof target.requestPointerLock === "function"
     && typeof ownerDocument.exitPointerLock === "function";
 }

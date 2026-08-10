@@ -45,6 +45,24 @@ describe("first-person movement", () => {
         { exitPointerLock: () => {} },
       ),
     ).toBe(true);
+
+    const standalone: { top?: unknown; parent?: unknown } = {};
+    standalone.top = standalone;
+    standalone.parent = standalone;
+    expect(
+      supportsPointerLock(
+        { requestPointerLock: () => {} },
+        { exitPointerLock: () => {} },
+        standalone,
+      ),
+    ).toBe(true);
+    expect(
+      supportsPointerLock(
+        { requestPointerLock: () => {} },
+        { exitPointerLock: () => {} },
+        { top: standalone, parent: standalone },
+      ),
+    ).toBe(false);
   });
 
   it("handles a rejected Pointer Lock promise without an unhandled browser error", async () => {
