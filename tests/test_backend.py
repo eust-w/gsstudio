@@ -479,6 +479,53 @@ class TestCheckpointResume:
         assert called_stages == ["gen_gs_data", "gs_training"]
         assert get_task(cfg.DB_PATH, task_id)["status"] == TaskStatus.COMPLETED.value
 
+    def test_panorama_delivery_completes_with_3d_stages_explicitly_skipped(self, cfg, monkeypatch):
+        import server.pipeline.worker as worker_module
+
+        cfg.MOCK_PIPELINE = False
+        task_id = create_task(
+            cfg.DB_PATH,
+            name="panorama-delivery",
+            task_type="worldgen_from_pano",
+            config={"quality_preset": "high", "recovery_policy": "auto"},
+        )
+        task_dir = cfg.task_dir(task_id)
+        task_dir.mkdir(parents=True)
+        warning = "Only 3 trajectories passed; 3D training was safely skipped."
+        (task_dir / "auto_recovery.json").write_text(json.dumps({
+            "version": 2,
+            "state": "completed",
+            "delivery_tier": "panorama_only",
+            "quality_warning": warning,
+            "limits": {},
+        }))
+        monkeypatch.setattr(
+            worker_module,
+            "get_worldgen_commands",
+            lambda **_kwargs: [
+                ("gen_gs_data", ["data"], {}, Path("/tmp")),
+                ("gs_training", ["train"], {}, Path("/tmp")),
+            ],
+        )
+        monkeypatch.setattr(worker_module, "get_stage_names", lambda _task_type: ["gen_gs_data", "gs_training"])
+        called_stages: list[str] = []
+
+        async def fake_stage(*, stage_name, **_kwargs):
+            called_stages.append(stage_name)
+            return True, ""
+
+        monkeypatch.setattr(worker_module, "run_stage", fake_stage)
+
+        asyncio.run(PipelineWorker(cfg).execute_task(task_id))
+
+        task = get_task(cfg.DB_PATH, task_id)
+        assert task["status"] == TaskStatus.COMPLETED.value
+        assert called_stages == []
+        assert [(stage["name"], stage["status"], stage["error"]) for stage in task["stages"]] == [
+            ("gen_gs_data", "skipped", warning),
+            ("gs_training", "skipped", warning),
+        ]
+
     def test_worker_preserves_cancelled_terminal_status_when_a_stage_stops(self, cfg, monkeypatch):
         import server.pipeline.worker as worker_module
 
