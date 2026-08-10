@@ -357,6 +357,8 @@ class TestDeploymentContract:
             "parser = argparse.ArgumentParser()\n"
             "parser.add_argument(\"--target_path\", default=None, type=str, help=\"target path\")\n"
             "render_list = sort_trajs(f\"{scene}/render_results\")\n"
+            "if os.path.exists(f\"{scene}/render_results/generation_bank_{args.model_type}/aligned_pcd.ply\") and args.skip_exist:\n"
+            "    continue\n"
         )
         patch_script = Path(__file__).parents[1] / "deploy/scripts/patch_hyworld_video_filter.py"
 
@@ -366,6 +368,7 @@ class TestDeploymentContract:
         assert "--trajectory_whitelist" in patched
         assert "candidate_trajectory_ids" in patched
         assert "No trajectory renderings matched" in patched
+        assert "and not args.trajectory_whitelist" in patched
 
     def test_image_and_startup_preflight_require_rtree(self):
         dockerfile = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
@@ -388,13 +391,13 @@ class TestDeploymentContract:
         assert "patch_hyworld_video_filter.py" in dockerfile
         assert "/opt/hyworld2/hyworld2/worldgen/video_gen.py" in dockerfile
 
-    def test_gpu_rollout_manifests_target_the_immutable_v23_image(self):
+    def test_gpu_rollout_manifests_target_the_immutable_v28_image(self):
         root = Path(__file__).parents[1]
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v27" in deployment
-        assert "gsstudio:a800-v27" in build
+        assert "gsstudio:a800-v28" in deployment
+        assert "gsstudio:a800-v28" in build
         assert "gsstudio:a800-v22" not in deployment
         assert "gsstudio:a800-v22" not in build
 
@@ -442,7 +445,7 @@ class TestDeploymentContract:
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
 
         assert "FROM ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22" in source
-        assert "GSStudio a800-v27" in source
+        assert "GSStudio a800-v28" in source
 
     def test_image_patches_worldstereo_transformer_for_local_only_loading(self):
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()

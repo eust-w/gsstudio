@@ -15,6 +15,28 @@ export function supportsPointerLock(
     && typeof ownerDocument.exitPointerLock === "function";
 }
 
+/**
+ * Modern Chromium can reject Pointer Lock as a Promise (rather than throw
+ * synchronously) when a page lives in an embedded document. Three's
+ * PointerLockControls ignores that return value, leaving an unhandled
+ * WrongDocumentError in the console. Request it directly and consume both
+ * failure forms so focused WASD remains a quiet fallback.
+ */
+export function requestPointerLockSafely(
+  target: { requestPointerLock?: () => unknown },
+  onUnavailable: () => void,
+): void {
+  if (typeof target.requestPointerLock !== "function") {
+    onUnavailable();
+    return;
+  }
+  try {
+    Promise.resolve(target.requestPointerLock()).catch(onUnavailable);
+  } catch {
+    onUnavailable();
+  }
+}
+
 export interface ViewerMetadata {
   centerPoint: THREE.Vector3;
   facingDirection: THREE.Vector3;

@@ -18,7 +18,12 @@ ARGUMENT_PATTERN = re.compile(
 SORT_PATTERN = re.compile(
     r'(?m)^(?P<indent>\s*)render_list = sort_trajs\(f"\{scene\}/render_results"\)\n'
 )
-SENTINEL = "# GSStudio video candidate whitelist patch"
+RESUME_GUARD_PATTERN = re.compile(
+    r'(?m)^(?P<indent>\s*)if os\.path\.exists\(f"\{scene\}/render_results/'
+    r'generation_bank_\{args\.model_type\}/aligned_pcd\.ply"\) and args\.skip_exist:\s*$'
+)
+CANDIDATE_SENTINEL = "# GSStudio video candidate whitelist patch"
+RESUME_SENTINEL = "GSStudio whitelist resume patch"
 
 
 def _insert_after(pattern: re.Pattern[str], source: str, insertion_for_indent) -> str:
@@ -30,35 +35,48 @@ def _insert_after(pattern: re.Pattern[str], source: str, insertion_for_indent) -
 
 
 def patch(source: str) -> str:
-    if SENTINEL in source:
-        return source
+    if CANDIDATE_SENTINEL not in source:
+        source = _insert_after(
+            ARGUMENT_PATTERN,
+            source,
+            lambda indent: (
+                f'{indent}parser.add_argument("--trajectory_whitelist", type=str, default=None, '
+                'help="JSON file containing planned high-quality trajectory ids")\n'
+            ),
+        )
+        source = _insert_after(
+            SORT_PATTERN,
+            source,
+            lambda indent: (
+                f"{indent}{CANDIDATE_SENTINEL}\n"
+                f"{indent}if args.trajectory_whitelist:\n"
+                f"{indent}    with open(args.trajectory_whitelist, 'r') as whitelist_file:\n"
+                f"{indent}        whitelist = json.load(whitelist_file)\n"
+                f"{indent}    candidate_trajectory_ids = set(whitelist.get('candidate_trajectory_ids', []))\n"
+                f"{indent}    render_list = [\n"
+                f"{indent}        render_path for render_path in render_list\n"
+                f"{indent}        if '/'.join(render_path.replace('\\\\', '/').split('/')[-3:-1]) in candidate_trajectory_ids\n"
+                f"{indent}    ]\n"
+                f"{indent}    rank0_log(f'[Quality] Using {{len(render_list)}} planned high-quality trajectories')\n"
+                f"{indent}    if not render_list:\n"
+                f"{indent}        raise RuntimeError('No trajectory renderings matched the high-quality candidate whitelist')\n"
+            ),
+        )
 
-    source = _insert_after(
-        ARGUMENT_PATTERN,
-        source,
-        lambda indent: (
-            f'{indent}parser.add_argument("--trajectory_whitelist", type=str, default=None, '
-            'help="JSON file containing planned high-quality trajectory ids")\n'
-        ),
-    )
-    source = _insert_after(
-        SORT_PATTERN,
-        source,
-        lambda indent: (
-            f"{indent}{SENTINEL}\n"
-            f"{indent}if args.trajectory_whitelist:\n"
-            f"{indent}    with open(args.trajectory_whitelist, 'r') as whitelist_file:\n"
-            f"{indent}        whitelist = json.load(whitelist_file)\n"
-            f"{indent}    candidate_trajectory_ids = set(whitelist.get('candidate_trajectory_ids', []))\n"
-            f"{indent}    render_list = [\n"
-            f"{indent}        render_path for render_path in render_list\n"
-            f"{indent}        if '/'.join(render_path.replace('\\\\', '/').split('/')[-3:-1]) in candidate_trajectory_ids\n"
-            f"{indent}    ]\n"
-            f"{indent}    rank0_log(f'[Quality] Using {{len(render_list)}} planned high-quality trajectories')\n"
-            f"{indent}    if not render_list:\n"
-            f"{indent}        raise RuntimeError('No trajectory renderings matched the high-quality candidate whitelist')\n"
-        ),
-    )
+    # Upstream treats one old aligned_pcd as proof that every trajectory is
+    # generated.  That is invalid after the candidate manifest grows: retain
+    # per-trajectory `--skip_exist` reuse below, but rebuild the scene memory
+    # bank so only the newly requested paths are rendered.
+    if RESUME_SENTINEL not in source:
+        guard = RESUME_GUARD_PATTERN.search(source)
+        if not guard:
+            raise RuntimeError("Expected upstream aligned_pcd resume guard not found")
+        replacement = (
+            f'{guard.group("indent")}if os.path.exists(f"{{scene}}/render_results/'
+            f'generation_bank_{{args.model_type}}/aligned_pcd.ply") and args.skip_exist '
+            f'and not args.trajectory_whitelist:  # {RESUME_SENTINEL}'
+        )
+        source = source[:guard.start()] + replacement + source[guard.end():]
     return source
 
 
