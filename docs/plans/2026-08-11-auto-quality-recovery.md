@@ -65,3 +65,36 @@ Implementation note: `a800-v34` was built as the initial immutable rollout.
 The final source-retry archival edge-case fix and reproducible Python-audit
 remediation are released as immutable `a800-v36`; it keeps the same
 `a800-v33` rollback target and never retags v34.
+
+## Effective-input delivery upgrade (a800-v37)
+
+The v37 policy keeps every per-trajectory gate unchanged while making content
+quality a delivery decision instead of a task failure:
+
+- `strict_3d`: six or more strictly accepted trajectories.
+- `degraded_3d`: four or five strictly accepted trajectories; GS preparation
+  receives only the accepted whitelist and the UI reports reduced coverage.
+- `panorama_only`: zero to three strictly accepted trajectories; panorama,
+  generated videos, and diagnostics are delivered, while GS preparation and
+  training are explicitly marked skipped.
+
+The recovery journal migrates in place to version 2. It retains every completed
+batch and expands the task-wide ceiling to 56 WorldStereo trajectories, 180
+minutes, and two deterministic regenerated sources. Each source attempt is
+isolated and scored by accepted count, quality margin, then earlier attempt;
+only the best scene is promoted.
+
+Rescue construction now uses every `kind=regular` trajectory named by the
+planning report, including `traj2` and nonstandard trajectory names. Camera
+poses must be finite and orthonormal, the source start frame must exist, and a
+rejected/invalid planning entry is ignored. Existing partial rescue directories
+are recovered by their `recovery_source_trajectory` metadata and keep their
+indices. A batch requests `min(6, max(2, missing + 1))` candidates, uses fewer
+when fewer are safe, and journals `rescue_skipped` rather than failing when none
+exist.
+
+Network, NCCL, connection, and timeout failures receive two infrastructure
+retries after 30 and 120 seconds. Configuration errors, missing models, invalid
+arguments, and exhausted transient retries remain real system failures. The
+deployment target is immutable `a800-v37`; because v36 was not deployed, the
+production rollback target is the currently running `a800-v34`.
