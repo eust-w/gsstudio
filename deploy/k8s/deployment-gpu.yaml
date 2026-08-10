@@ -23,7 +23,7 @@ spec:
         kubernetes.io/hostname: "192.168.80.136"
       containers:
         - name: gsstudio
-          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v31
+          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v32
           imagePullPolicy: IfNotPresent
           command: ["/app/entrypoint.sh"]
           ports:
@@ -58,6 +58,8 @@ spec:
               value: "/models/hf-cache"
             - name: HF_HOME
               value: "/models/hf-cache"
+            - name: TORCH_HOME
+              value: "/models/torch-cache"
             - name: HF_HUB_OFFLINE
               value: "1"
             - name: TRANSFORMERS_OFFLINE
