@@ -457,6 +457,13 @@ body {
   transition: border-color 0.2s;
 }
 
+.form-help {
+  margin: 7px 0 0;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
 .form-input:focus,
 .form-textarea:focus {
   outline: none;
@@ -604,6 +611,30 @@ body {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+.quality-summary {
+  background: rgba(30, 58, 120, 0.26);
+  border: 1px solid rgba(96, 165, 250, 0.28);
+  border-radius: 10px;
+  padding: 16px 18px;
+}
+
+.quality-summary h3 {
+  margin: 0 0 10px;
+  font-size: 0.98rem;
+}
+
+.quality-summary p {
+  margin: 6px 0;
+  color: var(--text-secondary);
+  font-size: 0.83rem;
+  line-height: 1.4;
+}
+
+.quality-label {
+  color: var(--text-primary);
+  font-weight: 600;
 }
 
 /* Stage Progress */
@@ -1001,6 +1032,27 @@ body {
   white-space: nowrap;
 }
 
+.splat-reset-button {
+  position: absolute;
+  top: 12px;
+  right: 128px;
+  z-index: 4;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 8px;
+  padding: 8px 11px;
+  background: rgba(7, 11, 21, 0.78);
+  color: #fff;
+  cursor: pointer;
+  font-size: 0.8rem;
+  backdrop-filter: blur(6px);
+}
+
+.splat-reset-button:hover,
+.splat-reset-button:focus-visible {
+  background: rgba(37, 99, 235, 0.92);
+  outline: none;
+}
+
 /* Viewer Page */
 .viewer-page {
   max-width: 100%;
@@ -1181,5 +1233,11 @@ body {
   .splat-hint {
     max-width: calc(100% - 24px);
     white-space: normal;
+  }
+
+  .splat-reset-button {
+    right: 56px;
+    padding: 7px 9px;
+    font-size: 0.72rem;
   }
 }

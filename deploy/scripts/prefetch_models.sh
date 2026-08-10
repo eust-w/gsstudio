@@ -22,7 +22,7 @@ spec:
       nodeName: 192.168.80.136
       containers:
         - name: prefetch
-          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22
+          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v27
           command: ["bash", "-c"]
           args:
             - |
@@ -35,6 +35,9 @@ spec:
                   ('naver-iv/zim-anything-vitl', ['zim_vit_l_2092/*']),
                   ('IDEA-Research/grounding-dino-tiny', ['*.json', '*.txt', 'model.safetensors']),
                   ('facebook/dinov2-base', None),
+                  # High-quality tasks use the complete WorldStereo checkpoint,
+                  # while fast tasks use its DMD variant from the same snapshot.
+                  ('hanshanxue/WorldStereo', None),
                   (
                       'Wan-AI/Wan2.1-I2V-14B-480P-Diffusers',
                       [
@@ -44,6 +47,10 @@ spec:
                           'image_processor/*',
                           'tokenizer/*',
                           'vae/*',
+                          # Full WorldStereo uses UniPC from this directory;
+                          # DMD does not, so an incomplete fast-only cache can
+                          # otherwise fail only after a long trajectory run.
+                          'scheduler/*',
                       ],
                   ),
               ]
