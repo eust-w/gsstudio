@@ -21,7 +21,10 @@ const taskFixture = {
   current_stage: null,
   created_at: "2026-08-09T00:00:00Z",
   updated_at: "2026-08-09T00:01:00Z",
-  config: {},
+  config: {
+    quality_preset: "high",
+    worldstereo_model_type: "worldstereo-memory",
+  },
   error: null,
   stages: [],
   artifacts: [
@@ -29,6 +32,8 @@ const taskFixture = {
     { name: "render.mp4", path: "output/render.mp4", type: "video", size: 2048 },
     { name: "gaussians.ply", path: "output/gaussians.ply", type: "3dgs", size: 1024 },
     { name: "gaussians.spz", path: "output/gaussians.spz", type: "3dgs", size: 512 },
+    { name: "position_meta_info.json", path: "output/ply/position_meta_info.json", type: "data", size: 512 },
+    { name: "fuse_simplified.ply", path: "output/ply/fuse_simplified.ply", type: "3dgs", size: 512 },
   ],
 };
 
@@ -45,7 +50,9 @@ vi.mock("../components/StageProgress", () => ({ default: () => <div>Stages</div>
 vi.mock("../components/StatusBadge", () => ({ default: () => <div>Status</div> }));
 vi.mock("../components/PanoViewer", () => ({ default: () => <div>Panorama</div> }));
 vi.mock("../components/SplatViewer", () => ({
-  default: ({ url }: { url: string }) => <div data-testid="splat-viewer">{url}</div>,
+  default: ({ url, metadataUrl, collisionMeshUrl }: { url: string; metadataUrl?: string; collisionMeshUrl?: string }) => (
+    <div data-testid="splat-viewer">{[url, metadataUrl, collisionMeshUrl].filter(Boolean).join("|")}</div>
+  ),
 }));
 
 afterEach(() => {
@@ -82,6 +89,26 @@ describe("TaskDetail", () => {
     expect(await screen.findByTestId("splat-viewer")).toHaveTextContent(
       "/api/artifacts/output/gaussians.spz",
     );
+    expect(screen.getByTestId("splat-viewer")).toHaveTextContent(
+      "/api/artifacts/output/ply/position_meta_info.json",
+    );
+    expect(screen.getByTestId("splat-viewer")).toHaveTextContent(
+      "/api/artifacts/output/ply/fuse_simplified.ply",
+    );
+  });
+
+  it("shows the actual model, trajectory gates and fixed high-quality training plan", async () => {
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes>
+          <Route path="/tasks/:taskId" element={<TaskDetail />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("worldstereo-memory")).toBeInTheDocument();
+    expect(screen.getByText(/minimum 8 valid trajectories/i)).toBeInTheDocument();
+    expect(screen.getByText(/5 GPUs.*2,000 steps.*200.*1000.*133/i)).toBeInTheDocument();
   });
 
   it("defaults to 3D and exposes fullscreen for every preview type", async () => {

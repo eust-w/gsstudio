@@ -1,146 +1,46 @@
 # syntax=docker/dockerfile:1
-# GSStudio all-in-one image for 5x A800-SXM4-80GB
-# Base: PyTorch 2.7.1 + CUDA 12.8 (devel for compiling CUDA extensions)
+# GSStudio a800-v27: alignment-recovery candidates plus Pointer Lock fallback.
+# Keeping CUDA extensions and model runtimes in the v22 base makes this release
+# fast and avoids recompiling HY-World during a safety/quality-only rollout.
+FROM ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22
 
-FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel
+USER root
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    HF_HOME=/models/hf-cache \
-    GSSTUDIO_DATA_DIR=/data/tasks \
-    GSSTUDIO_HF_HOME=/models/hf-cache \
-    GSSTUDIO_HYWORLD_REPO=/opt/hyworld2 \
-    GSSTUDIO_NUM_GPUS=5 \
-    GSSTUDIO_PORT=8000 \
-    VLLM_PORT=8100 \
-    VLLM_MODEL=Qwen/Qwen3-VL-8B-Instruct \
-    TORCH_CUDA_ARCH_LIST="8.0" \
-    PYTHONPATH=/opt/hyworld2
-
-# ---------------------------------------------------------------------------
-# System dependencies
-# ---------------------------------------------------------------------------
+# WorldNav depends on both the native SpatialIndex library and its Python
+# binding.  Build-time and startup checks prevent the upstream silent fallback.
 RUN apt-get update && apt-get install --yes --no-install-recommends \
-        build-essential \
-        cmake \
-        git \
-        git-lfs \
-        ffmpeg \
-        libgl1-mesa-glx \
-        libglib2.0-0 \
-        libsm6 \
-        libxext6 \
-        libxrender-dev \
-        libgomp1 \
-        wget \
-        curl \
-        supervisor \
-    && rm -rf /var/lib/apt/lists/*
+        libspatialindex-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir rtree \
+    && python -c "import rtree; print('rtree preflight OK')"
 
-# ---------------------------------------------------------------------------
-# Clone HY-World-2.0
-# ---------------------------------------------------------------------------
-RUN git clone --recursive https://github.com/Tencent-Hunyuan/HY-World-2.0 /opt/hyworld2
-
-# glm is an undeclared gitlink inside gsplat_maskgaussian; fetch it explicitly
-RUN rm -rf /opt/hyworld2/hyworld2/worldgen/third_party/gsplat_maskgaussian/gsplat/cuda/csrc/third_party/glm \
-    && git clone --depth 1 --branch 1.0.1 https://github.com/g-truc/glm.git \
-       /opt/hyworld2/hyworld2/worldgen/third_party/gsplat_maskgaussian/gsplat/cuda/csrc/third_party/glm
-
-WORKDIR /opt/hyworld2
-
-# ---------------------------------------------------------------------------
-# Python dependencies (main requirements)
-# ---------------------------------------------------------------------------
-# cupy==13.6.0 is source-only on PyPI; use the prebuilt CUDA-12 wheel instead
-RUN sed -i 's/^cupy==13.6.0/cupy-cuda12x==13.6.0/' requirements.txt \
-    && pip install --no-cache-dir -r requirements.txt
-
-# ---------------------------------------------------------------------------
-# CUDA extensions (compile at build time)
-# ---------------------------------------------------------------------------
-
-# 1. Custom gsplat with MaskGaussian
-RUN cd /opt/hyworld2/hyworld2/worldgen/third_party/gsplat_maskgaussian \
-    && pip install --no-cache-dir -e . --no-build-isolation
-
-# 2. Navmesh (recastnavigation)
-RUN cd /opt/hyworld2/hyworld2/worldgen/third_party/navmesh \
-    && pip install --no-cache-dir . --no-build-isolation
-
-# 3. FlashAttention-2
-RUN TORCH_CUDA_ARCH_LIST="8.0" MAX_JOBS=8 pip install --no-cache-dir flash-attn --no-build-isolation
-
-# 4. Git-based dependencies (nerfview, fused-ssim, spz, pytorch3d, MoGe).
-# Kaniko has the CUDA toolkit but no visible GPU, so PyTorch3D otherwise
-# silently compiles a CPU-only extension and fails later in traj_render.
-RUN FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="8.0" MAX_JOBS=8 pip install --no-cache-dir --no-build-isolation -r requirements_git.txt
-
-# ---------------------------------------------------------------------------
-# vLLM for Qwen3-VL serving -- ISOLATED VENV
-# vLLM >= 0.11.0 (first release with native Qwen3-VL) requires torch==2.8.0
-# and transformers<5, which conflicts with HY-World's main env
-# (torch 2.7.1 + transformers 5.2.0). The pipeline only talks to vLLM over
-# HTTP, so we install it into a dedicated venv.
-# ---------------------------------------------------------------------------
-RUN python -m venv /opt/vllm && /opt/vllm/bin/pip install --no-cache-dir --upgrade pip && /opt/vllm/bin/pip install --no-cache-dir "transformers==4.57.6" "vllm==0.11.0"
-
-# HY-Pano-2 requires Transformers 4.57.x while the main HY-World runtime
-# currently installs Transformers 5.x. Keep the panorama runtime isolated,
-# but reuse the base image's CUDA-enabled PyTorch to avoid a duplicate install.
-RUN python -m venv --system-site-packages /opt/panogen \
-    && /opt/panogen/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/panogen/bin/pip install --no-cache-dir \
-        "transformers[accelerate,tiktoken]==4.57.1" \
-        "diffusers==0.36.0" \
-        "safetensors==0.7.0" \
-        "tokenizers==0.22.0" \
-        "einops==0.8.1" \
-        loguru huggingface_hub gradio
-
-# ---------------------------------------------------------------------------
-# GSStudio server dependencies
-# ---------------------------------------------------------------------------
-RUN pip install --no-cache-dir \
-        fastapi \
-        uvicorn[standard] \
-        python-multipart \
-        aiofiles \
-        websockets
-
-# HY-World forwards local_files_only to its auxiliary WorldStereo components,
-# but not to the sharded base transformer. Patch that upstream omission so a
-# fully populated persistent cache never triggers Hub metadata requests.
+# Reapply the idempotent offline-loading patch as a release invariant rather
+# than assuming it was present in the inherited image.
 COPY deploy/scripts/patch_hyworld_local_cache.py /tmp/patch_hyworld_local_cache.py
 RUN python /tmp/patch_hyworld_local_cache.py \
         /opt/hyworld2/hyworld2/worldgen/models/worldstereo_wrapper.py \
     && rm /tmp/patch_hyworld_local_cache.py
 
-# ---------------------------------------------------------------------------
-# Copy pre-built frontend (built locally with: cd web && npm install && npm run build)
-# ---------------------------------------------------------------------------
+# Patch the upstream GS-data entrypoint in place so it consumes only the
+# accepted WorldStereo trajectory ids generated by GSStudio's quality gate.
+COPY deploy/scripts/patch_hyworld_quality_filter.py /tmp/patch_hyworld_quality_filter.py
+RUN python /tmp/patch_hyworld_quality_filter.py \
+        /opt/hyworld2/hyworld2/worldgen/gen_gs_data.py \
+    && rm /tmp/patch_hyworld_quality_filter.py
+
+# Limit full-FSDP WorldStereo to the diverse candidates validated by NavMesh.
+COPY deploy/scripts/patch_hyworld_video_filter.py /tmp/patch_hyworld_video_filter.py
+RUN python /tmp/patch_hyworld_video_filter.py \
+        /opt/hyworld2/hyworld2/worldgen/video_gen.py \
+    && rm /tmp/patch_hyworld_video_filter.py
+
+# Replace the public application surface and API/worker implementation.
 COPY web/dist/ /app/web/dist/
-
-# ---------------------------------------------------------------------------
-# Copy GSStudio server code
-# ---------------------------------------------------------------------------
 COPY server/ /app/server/
-
-WORKDIR /app
-
-# ---------------------------------------------------------------------------
-# Supervisor config for multi-process (API + vLLM)
-# ---------------------------------------------------------------------------
 COPY deploy/supervisord.conf /etc/supervisor/conf.d/gsstudio.conf
-
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
 COPY deploy/scripts/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
+WORKDIR /app
 EXPOSE 8000 8100
-
 ENTRYPOINT ["/app/entrypoint.sh"]

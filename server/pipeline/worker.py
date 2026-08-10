@@ -12,6 +12,7 @@ from ..config import Config
 from ..db import get_task, list_tasks, set_task_stages, update_stage, update_task
 from ..models import StageStatus, TaskStatus
 from .stage_runner import run_stage
+from .quality import QualityGateError, postvalidate_worldgen_stage
 from .worldgen import get_stage_names, get_worldgen_commands
 from .worldrecon import get_worldrecon_commands
 
@@ -171,6 +172,7 @@ class PipelineWorker:
         task_config.setdefault("hf_home", self.config.HF_HOME)
         task_config.setdefault("num_gpus", self.config.NUM_GPUS)
         task_config.setdefault("panogen_python", self.config.PANOGEN_PYTHON)
+        task_config.setdefault("quality_preset", "high")
 
         stage_names = get_stage_names(task_type)
         set_task_stages(self.config.DB_PATH, task_id, stage_names)
@@ -188,7 +190,7 @@ class PipelineWorker:
                 update_task(self.config.DB_PATH, task_id, status=TaskStatus.CANCELLED.value)
                 return
 
-            artifacts = self._collect_artifacts(output_dir, scene_dir)
+            artifacts = self._collect_artifacts(output_dir, scene_dir, task_dir)
             update_task(
                 self.config.DB_PATH, task_id,
                 status=TaskStatus.COMPLETED.value,
@@ -199,10 +201,14 @@ class PipelineWorker:
 
         except Exception as e:
             logger.exception("Task %s failed", task_id)
+            # Surface structured quality evidence even for a deliberately
+            # rejected task, so the user can diagnose why it did not proceed.
+            artifacts = self._collect_artifacts(output_dir, scene_dir, task_dir)
             update_task(
                 self.config.DB_PATH, task_id,
                 status=TaskStatus.FAILED.value,
                 error=str(e),
+                artifacts=artifacts,
             )
         finally:
             # Make sure vLLM is restored even if the task failed mid-way.
@@ -247,6 +253,29 @@ class PipelineWorker:
             marker = task_dir / f".stage_{stage_name}_done"
             if marker.exists():
                 logger.info("Stage %s already completed, skipping", stage_name)
+                # Re-run output validation on resume.  This regenerates
+                # quality manifests introduced by a later release and never
+                # lets an old silent success bypass the current policy.
+                if task_type in ("worldgen", "worldgen_from_pano"):
+                    try:
+                        postvalidate_worldgen_stage(
+                            stage_name,
+                            task_dir=task_dir,
+                            scene_dir=scene_dir,
+                            log_file=logs_dir / f"{stage_name}.log",
+                            quality_preset=task_config["quality_preset"],
+                        )
+                    except QualityGateError as exc:
+                        update_stage(
+                            self.config.DB_PATH,
+                            task_id,
+                            stage_name,
+                            StageStatus.FAILED,
+                            error=str(exc),
+                        )
+                        raise RuntimeError(
+                            f"Stage {stage_name} failed quality validation on resume: {exc}"
+                        ) from exc
                 update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.SKIPPED)
                 continue
 
@@ -267,9 +296,31 @@ class PipelineWorker:
             )
 
             if success:
+                try:
+                    if task_type in ("worldgen", "worldgen_from_pano"):
+                        postvalidate_worldgen_stage(
+                            stage_name,
+                            task_dir=task_dir,
+                            scene_dir=scene_dir,
+                            log_file=log_file,
+                            quality_preset=task_config["quality_preset"],
+                        )
+                except QualityGateError as exc:
+                    update_stage(
+                        self.config.DB_PATH,
+                        task_id,
+                        stage_name,
+                        StageStatus.FAILED,
+                        error=str(exc),
+                    )
+                    raise RuntimeError(f"Stage {stage_name} failed quality validation: {exc}") from exc
                 marker.touch()
                 update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.COMPLETED)
             else:
+                if cancel_event.is_set():
+                    # execute_task owns the terminal cancelled status; do not
+                    # overwrite it with a synthetic stage failure.
+                    return
                 update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.FAILED, error=error)
                 # Even on failure, restore vLLM so later tasks can use it.
                 if stage_name == "panogen":
@@ -319,7 +370,7 @@ class PipelineWorker:
         (output_dir / "result.ply").write_bytes(b"ply\nmock gaussian splatting data")
         (output_dir / "result.spz").write_bytes(b"mock spz data")
 
-    def _collect_artifacts(self, output_dir: Path, scene_dir: Path) -> list[dict]:
+    def _collect_artifacts(self, output_dir: Path, scene_dir: Path, task_dir: Path | None = None) -> list[dict]:
         """Scan output and scene directories for artifacts."""
         artifacts = []
         for search_dir in (output_dir, scene_dir):
@@ -336,5 +387,23 @@ class PipelineWorker:
                         "path": rel_path,
                         "size": f.stat().st_size,
                         "type": ARTIFACT_TYPES[ext],
+                    })
+        # Quality reports live at task root so they remain available even when
+        # a gate rejects a later stage.  Include them without recursively
+        # rescanning output/scene and duplicating every normal artifact.
+        if task_dir:
+            for name in (
+                "quality_report.json",
+                "alignment_quality.json",
+                "trajectory_whitelist.json",
+                "video_trajectory_whitelist.json",
+            ):
+                report = task_dir / name
+                if report.is_file():
+                    artifacts.append({
+                        "name": report.name,
+                        "path": report.name,
+                        "size": report.stat().st_size,
+                        "type": "data",
                     })
         return artifacts

@@ -4,6 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .quality import normalize_worldgen_config
+
 
 WORLDGEN_STAGES = [
     {"name": "panogen", "description": "Panorama generation (HY-Pano-2 80B)", "gpu": "0,1,2,3,4"},
@@ -43,22 +45,34 @@ def get_worldgen_commands(
 
     Returns list of (stage_name, cmd, env_overrides, cwd).
     """
+    config = normalize_worldgen_config(config, form_prompt=None)
     worldgen_dir = hyworld_repo / "hyworld2" / "worldgen"
     panogen_dir = hyworld_repo / "hyworld2" / "panogen"
-    num_gpus = config.get("num_gpus", 5)
+    quality_preset = config["quality_preset"]
+    model_type = config["worldstereo_model_type"]
+    # High quality is deliberately invariant so its output is comparable over
+    # time and matches this deployment's five-A800 capacity.
+    num_gpus = 5 if quality_preset == "high" else int(config.get("num_gpus", 5))
     gpu_list = ",".join(str(i) for i in range(num_gpus))
     # WorldStereo has 16 attention heads, so sequence-parallel world size must
     # divide 16. Use the largest valid subset of the available GPUs.
     video_num_gpus = max(size for size in (1, 2, 4, 8, 16) if size <= num_gpus)
     video_gpu_list = ",".join(str(i) for i in range(video_num_gpus))
 
-    # 3DGS training steps: 8-GPU baseline is 1500, scale by 8/num_gpus
-    step_factor = 8.0 / num_gpus
-    max_steps = int(1500 * step_factor)
-    refine_start = int(150 * step_factor)
-    refine_stop = int(750 * step_factor)
-    refine_every = int(100 * step_factor)
-    refine_scale2d_stop = int(750 * step_factor)
+    if quality_preset == "high":
+        max_steps = 2000
+        refine_start = 200
+        refine_stop = 1000
+        refine_every = 133
+        refine_scale2d_stop = 1000
+    else:
+        # Fast DMD keeps the former resource-scaled training schedule.
+        step_factor = 8.0 / num_gpus
+        max_steps = int(1500 * step_factor)
+        refine_start = int(150 * step_factor)
+        refine_stop = int(750 * step_factor)
+        refine_every = int(100 * step_factor)
+        refine_scale2d_stop = int(750 * step_factor)
 
     commands = []
 
@@ -125,7 +139,16 @@ def get_worldgen_commands(
         "--target_path", str(scene_dir),
         "--fsdp",
         "--local_files_only",
+        "--model_type", model_type,
     ]
+    if quality_preset == "high":
+        # High-quality runs use a deterministic twelve-path, type-balanced set
+        # with enough regular/reconstruction recovery capacity for the strict
+        # alignment gate. `--skip_exist` resumes existing video artifacts.
+        video_gen_cmd.extend([
+            "--trajectory_whitelist", str(task_dir / "video_trajectory_whitelist.json"),
+            "--skip_exist",
+        ])
     video_gen_env = {
         "CUDA_VISIBLE_DEVICES": video_gpu_list,
         "HF_HOME": config.get("hf_home", "/models/hf-cache"),
@@ -139,9 +162,12 @@ def get_worldgen_commands(
         "torchrun", "--nproc_per_node", str(num_gpus),
         str(worldgen_dir / "gen_gs_data.py"),
         "--root_path", str(scene_dir),
+        "--result_name", model_type,
         "--save_normal",
         "--split_sky",
     ]
+    if quality_preset == "high":
+        gen_gs_cmd.extend(["--trajectory_whitelist", str(task_dir / "trajectory_whitelist.json")])
     gen_gs_env = {
         "CUDA_VISIBLE_DEVICES": gpu_list,
         "HF_HOME": config.get("hf_home", "/models/hf-cache"),

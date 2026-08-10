@@ -21,6 +21,10 @@ export function preferredSplatArtifact(artifacts: Artifact[]): Artifact | undefi
   return artifacts.find((artifact) => artifact.name.toLowerCase().endsWith(".spz")) ?? artifacts[0];
 }
 
+function findArtifactByName(artifacts: Artifact[], name: string): Artifact | undefined {
+  return artifacts.find((artifact) => artifact.name === name);
+}
+
 export default function TaskDetail() {
   const { taskId } = useParams<{ taskId: string }>();
   const navigate = useNavigate();
@@ -122,6 +126,8 @@ export default function TaskDetail() {
   const videoArtifacts = task.artifacts.filter((a) => a.type === "video");
   const splatArtifacts = task.artifacts.filter((a) => a.type === "3dgs");
   const previewSplat = preferredSplatArtifact(splatArtifacts);
+  const positionMetadata = findArtifactByName(task.artifacts, "position_meta_info.json");
+  const collisionMesh = findArtifactByName(task.artifacts, "fuse_simplified.ply");
   const imageArtifacts = task.artifacts.filter((a) => a.type === "image" && !a.name.includes("pano"));
   const otherArtifacts = task.artifacts.filter(
     (a) => !["image", "video", "3dgs"].includes(a.type)
@@ -185,6 +191,22 @@ export default function TaskDetail() {
         <div className="task-left-panel">
           <StageProgress stages={task.stages} currentStage={task.current_stage} />
 
+          {Boolean(task.config.quality_preset) && (
+            <section className="quality-summary" aria-label="Generation configuration">
+              <h3>Generation configuration</h3>
+              <p><span className="quality-label">Preset</span> {String(task.config.quality_preset)}</p>
+              <p><span className="quality-label">Actual model</span> {String(task.config.worldstereo_model_type ?? "not recorded")}</p>
+              {task.config.quality_preset === "high" ? (
+                <>
+                  <p><span className="quality-label">Trajectory gate</span> minimum 8 valid trajectories; at least 6 alignment-approved trajectories</p>
+                  <p><span className="quality-label">Training</span> 5 GPUs · 2,000 steps · refine 200 / 1000 / 133</p>
+                </>
+              ) : (
+                <p><span className="quality-label">Trajectory gate</span> fast DMD mode (quality report still recorded)</p>
+              )}
+            </section>
+          )}
+
           <div className="log-section">
             <h3>Logs</h3>
             <LogStream taskId={task.id} />
@@ -239,7 +261,11 @@ export default function TaskDetail() {
                 )}
                 {activePreview === "3dgs" && previewSplat && (
                   <Suspense fallback={<div className="viewer-loading">Preparing streaming viewer…</div>}>
-                    <SplatViewer url={getArtifactUrl(task.id, previewSplat.path)} />
+                    <SplatViewer
+                      url={getArtifactUrl(task.id, previewSplat.path)}
+                      metadataUrl={positionMetadata ? getArtifactUrl(task.id, positionMetadata.path) : undefined}
+                      collisionMeshUrl={collisionMesh ? getArtifactUrl(task.id, collisionMesh.path) : undefined}
+                    />
                   </Suspense>
                 )}
               </div>
