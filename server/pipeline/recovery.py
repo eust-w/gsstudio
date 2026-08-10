@@ -18,15 +18,16 @@ from typing import Any, Iterable
 
 
 AUTO_RECOVERY_REPORT_NAME = "auto_recovery.json"
-AUTO_RECOVERY_VERSION = 1
+AUTO_RECOVERY_VERSION = 2
 MINIMUM_ACCEPTED_TRAJECTORIES = 6
+MINIMUM_DEGRADED_TRAJECTORIES = 4
 INITIAL_NORMAL_CANDIDATE_COUNT = 8
 NORMAL_REFILL_CANDIDATE_COUNT = 4
 RESCUE_TARGET_ROTATIONS = {1: 25.0, 2: 12.0}
-RESCUE_CANDIDATE_COUNT = 6
-MAX_VIDEO_TRAJECTORIES = 40
-MAX_VIDEO_SECONDS = 120 * 60
-MAX_SOURCE_REGENERATIONS = 1
+MAX_RESCUE_CANDIDATE_COUNT = 6
+MAX_VIDEO_TRAJECTORIES = 56
+MAX_VIDEO_SECONDS = 180 * 60
+MAX_SOURCE_REGENERATIONS = 2
 
 
 class AutoRecoveryError(RuntimeError):
@@ -127,6 +128,12 @@ def _new_report(task_dir: Path, planning: dict[str, Any], task_type: str) -> dic
             "historical": True,
         }] if legacy else []),
         "attempt_history": [],
+        "source_attempts": [],
+        "best_source_attempt": 0,
+        "delivery_tier": None,
+        "quality_warning": None,
+        "recovery_exhausted": False,
+        "transient_retry_count": 0,
         "terminal_reason": None,
         "created_at": _utcnow(),
         "updated_at": _utcnow(),
@@ -134,10 +141,52 @@ def _new_report(task_dir: Path, planning: dict[str, Any], task_type: str) -> dic
     return report
 
 
+def _migrate_report(
+    report: dict[str, Any],
+    *,
+    planning: dict[str, Any] | None = None,
+    task_type: str | None = None,
+) -> dict[str, Any]:
+    """Migrate an existing journal without discarding paid GPU work."""
+    migrated = dict(report)
+    migrated["version"] = AUTO_RECOVERY_VERSION
+    migrated["task_type"] = str(task_type or migrated.get("task_type") or "worldgen")
+    migrated.setdefault("state", "ready")
+    migrated.setdefault("phase", None)
+    migrated.setdefault("rescue_round", None)
+    migrated.setdefault("source_attempt", 0)
+    migrated.setdefault("active_scene_relpath", "scene")
+    migrated.setdefault("minimum_accepted_trajectories", MINIMUM_ACCEPTED_TRAJECTORIES)
+    migrated["limits"] = {
+        "maximum_video_trajectories": MAX_VIDEO_TRAJECTORIES,
+        "maximum_video_seconds": MAX_VIDEO_SECONDS,
+        "maximum_source_regenerations": MAX_SOURCE_REGENERATIONS,
+    }
+    if planning is not None and not migrated.get("normal_candidate_trajectory_ids"):
+        migrated["normal_candidate_trajectory_ids"] = _normal_candidates(planning)
+    migrated.setdefault("normal_candidate_trajectory_ids", [])
+    for key in ("attempted_trajectory_ids", "accepted_trajectory_ids", "pending_candidate_trajectory_ids"):
+        migrated[key] = _ordered_unique(migrated.get(key, []))
+    migrated.setdefault("generated_video_trajectory_count", len(migrated["attempted_trajectory_ids"]))
+    migrated.setdefault("video_seconds", 0.0)
+    migrated.setdefault("batches", [])
+    migrated.setdefault("attempt_history", [])
+    migrated.setdefault("source_attempts", [])
+    migrated.setdefault("best_source_attempt", int(migrated.get("source_attempt", 0)))
+    migrated.setdefault("delivery_tier", None)
+    migrated.setdefault("quality_warning", None)
+    migrated.setdefault("recovery_exhausted", False)
+    migrated.setdefault("transient_retry_count", 0)
+    migrated.setdefault("terminal_reason", None)
+    migrated.setdefault("created_at", _utcnow())
+    migrated.setdefault("updated_at", _utcnow())
+    return migrated
+
+
 def _load_or_create(task_dir: Path, planning: dict[str, Any], task_type: str) -> dict[str, Any]:
     report = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
-    if report.get("version") == AUTO_RECOVERY_VERSION:
-        return report
+    if report:
+        return _migrate_report(report, planning=planning, task_type=task_type)
     return _new_report(task_dir, planning, task_type)
 
 
@@ -171,6 +220,71 @@ def _budget_exhausted(report: dict[str, Any]) -> bool:
     )
 
 
+def desired_rescue_candidate_count(accepted_count: int) -> int:
+    """Adaptive rescue size: one spare beyond the gap, bounded to 2..6."""
+    missing = max(MINIMUM_ACCEPTED_TRAJECTORIES - max(int(accepted_count), 0), 0)
+    return min(MAX_RESCUE_CANDIDATE_COUNT, max(2, missing + 1))
+
+
+def _delivery_tier(accepted_count: int) -> str:
+    if accepted_count >= MINIMUM_ACCEPTED_TRAJECTORIES:
+        return "strict_3d"
+    if accepted_count >= MINIMUM_DEGRADED_TRAJECTORIES:
+        return "degraded_3d"
+    return "panorama_only"
+
+
+def _best_source_snapshot(report: dict[str, Any]) -> dict[str, Any]:
+    attempts = [item for item in report.get("source_attempts", []) if isinstance(item, dict)]
+    current_attempt = int(report.get("source_attempt", 0))
+    if not any(int(item.get("source_attempt", -1)) == current_attempt for item in attempts):
+        accepted = _ordered_unique(report.get("accepted_trajectory_ids", []))
+        attempts.append({
+            "source_attempt": current_attempt,
+            "scene_relpath": report.get("active_scene_relpath", "scene"),
+            "accepted_trajectory_ids": accepted,
+            "accepted_count": len(accepted),
+            "quality_margin": 0.0,
+            "batches": report.get("batches", []),
+        })
+    return max(
+        attempts,
+        key=lambda item: (
+            int(item.get("accepted_count", len(_ordered_unique(item.get("accepted_trajectory_ids", []))))),
+            float(item.get("quality_margin", 0.0)),
+            -int(item.get("source_attempt", 0)),
+        ),
+    )
+
+
+def _finalize_delivery(report: dict[str, Any], *, exhausted: bool, reason: str) -> None:
+    best = _best_source_snapshot(report)
+    best_ids = _ordered_unique(best.get("accepted_trajectory_ids", []))
+    report["best_source_attempt"] = int(best.get("source_attempt", 0))
+    report["best_scene_relpath"] = best.get("scene_relpath", "scene")
+    report["accepted_trajectory_ids"] = best_ids
+    accepted_count = len(best_ids)
+    tier = _delivery_tier(accepted_count)
+    warning = None
+    if tier == "degraded_3d":
+        warning = (
+            f"Only {accepted_count} trajectories passed the strict quality gates; "
+            "3D was trained from the accepted whitelist with reduced coverage."
+        )
+    elif tier == "panorama_only":
+        warning = (
+            f"Only {accepted_count} trajectories passed the strict quality gates; "
+            "3D training was safely skipped and panorama/video results were delivered."
+        )
+    report["state"] = "completed"
+    report["phase"] = None
+    report["rescue_round"] = None
+    report["delivery_tier"] = tier
+    report["quality_warning"] = warning
+    report["recovery_exhausted"] = bool(exhausted)
+    report["terminal_reason"] = reason
+
+
 def _set_terminal(report: dict[str, Any], state: str, reason: str) -> None:
     report["state"] = state
     report["phase"] = None
@@ -185,14 +299,19 @@ def schedule_auto_recovery_batch(
     candidate_ids: Iterable[str],
 ) -> dict[str, Any]:
     """Persist the exact next batch before an expensive subprocess starts."""
-    report = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
-    if report.get("version") != AUTO_RECOVERY_VERSION:
+    stored = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
+    if not stored:
         raise AutoRecoveryError("Automatic recovery report has not been initialized")
+    report = _migrate_report(stored)
     pending = _ordered_unique(report.get("pending_candidate_trajectory_ids", []))
     if pending:
         return report
     if _budget_exhausted(report):
-        _set_terminal(report, "budget_exhausted", "Automatic recovery video budget is exhausted")
+        _finalize_delivery(
+            report,
+            exhausted=True,
+            reason="Automatic recovery video budget is exhausted; the best valid result was delivered.",
+        )
         return _persist(task_dir, report)
 
     capacity = int(report["limits"]["maximum_video_trajectories"]) - int(
@@ -200,12 +319,70 @@ def schedule_auto_recovery_batch(
     )
     batch = _ordered_unique(candidate_ids)[:max(capacity, 0)]
     if not batch:
-        raise AutoRecoveryError("Automatic recovery could not schedule any safe trajectory")
+        return report
     report["state"] = "generating_normal" if phase.startswith("normal") else "generating_rescue"
     report["phase"] = phase
     report["rescue_round"] = int(phase.rsplit("_", 1)[-1]) if phase.startswith("rescue_") else None
     report["pending_candidate_trajectory_ids"] = batch
     report["terminal_reason"] = None
+    return _persist(task_dir, report)
+
+
+def record_rescue_skipped(
+    task_dir: Path,
+    *,
+    round_number: int,
+    reason: str,
+) -> dict[str, Any]:
+    """Advance a rescue phase that has no safe camera sources."""
+    stored = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
+    if not stored:
+        raise AutoRecoveryError("Automatic recovery report has not been initialized")
+    report = _migrate_report(stored)
+    phase = f"rescue_{int(round_number)}"
+    batches = report.get("batches", [])
+    if not isinstance(batches, list):
+        batches = []
+    if not any(isinstance(item, dict) and item.get("phase") == phase for item in batches):
+        batches.append({
+            "phase": phase,
+            "candidate_trajectory_ids": [],
+            "accepted_trajectory_ids": [],
+            "rescue_skipped": True,
+            "reason": str(reason),
+            "completed_at": _utcnow(),
+        })
+    report["batches"] = batches
+    report["state"] = "ready"
+    report["phase"] = None
+    report["rescue_round"] = None
+    report["pending_candidate_trajectory_ids"] = []
+    return _persist(task_dir, report)
+
+
+def record_transient_retry(
+    task_dir: Path,
+    *,
+    stage: str,
+    error: str,
+    attempt: int,
+) -> dict[str, Any]:
+    """Journal a retryable infrastructure interruption without losing state."""
+    stored = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
+    if not stored:
+        raise AutoRecoveryError("Automatic recovery report has not been initialized")
+    report = _migrate_report(stored)
+    retries = report.get("transient_retries", [])
+    if not isinstance(retries, list):
+        retries = []
+    retries.append({
+        "stage": str(stage),
+        "attempt": max(int(attempt), 1),
+        "error": str(error)[-2000:],
+        "recorded_at": _utcnow(),
+    })
+    report["transient_retries"] = retries
+    report["transient_retry_count"] = len(retries)
     return _persist(task_dir, report)
 
 
@@ -241,13 +418,13 @@ def prepare_auto_recovery(
 
     accepted_count = len(_ordered_unique(report.get("accepted_trajectory_ids", [])))
     if accepted_count >= MINIMUM_ACCEPTED_TRAJECTORIES:
-        _set_terminal(report, "accepted", "Alignment quality gate satisfied")
+        _finalize_delivery(report, exhausted=False, reason="Alignment quality gate satisfied")
         return _persist(task_dir, report)
     if _budget_exhausted(report):
-        _set_terminal(
+        _finalize_delivery(
             report,
-            "budget_exhausted",
-            "Automatic recovery video budget is exhausted before six trajectories passed",
+            exhausted=True,
+            reason="Automatic recovery budget ended; the best valid result was delivered.",
         )
         return _persist(task_dir, report)
 
@@ -283,24 +460,22 @@ def prepare_auto_recovery(
         report["rescue_round"] = 2
         return _persist(task_dir, report)
 
-    if task_type == "worldgen" and int(report.get("source_attempt", 0)) < MAX_SOURCE_REGENERATIONS:
+    if task_type == "worldgen" and int(report.get("source_attempt", 0)) < int(report["limits"]["maximum_source_regenerations"]):
         report["state"] = "needs_regeneration"
         report["phase"] = "source_regeneration"
         report["rescue_round"] = None
         return _persist(task_dir, report)
 
-    if task_type == "worldgen_from_pano":
-        _set_terminal(
-            report,
-            "source_quality_blocked",
-            "Source panorama quality did not yield six accepted trajectories; upload a replacement panorama to retry.",
-        )
-    else:
-        _set_terminal(
-            report,
-            "quality_blocked",
-            "Automatic recovery exhausted the allowed source attempts before six trajectories passed.",
-        )
+    _finalize_delivery(
+        report,
+        exhausted=True,
+        reason=(
+            "Source panorama recovery is exhausted; the best valid result was delivered. "
+            "Upload a replacement panorama to pursue a higher 3D tier."
+            if task_type == "worldgen_from_pano"
+            else "Automatic recovery exhausted the allowed source attempts; the best valid result was delivered."
+        ),
+    )
     return _persist(task_dir, report)
 
 
@@ -311,9 +486,10 @@ def complete_auto_recovery_batch(
     duration_seconds: float,
 ) -> dict[str, Any]:
     """Commit a completed video batch once, including all accepted routes."""
-    report = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
-    if report.get("version") != AUTO_RECOVERY_VERSION:
+    stored = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
+    if not stored:
         raise AutoRecoveryError("Automatic recovery report has not been initialized")
+    report = _migrate_report(stored)
     pending = _ordered_unique(report.get("pending_candidate_trajectory_ids", []))
     if not pending:
         raise AutoRecoveryError("Automatic recovery has no pending batch to complete")
@@ -341,16 +517,75 @@ def complete_auto_recovery_batch(
     report["state"] = "ready"
     report["phase"] = None
     report["rescue_round"] = None
+    _update_source_attempt_snapshot(report, alignment)
     return _persist(task_dir, report)
+
+
+def _alignment_quality_margin(alignment: dict[str, Any]) -> float:
+    trajectories = alignment.get("trajectories", {})
+    if not isinstance(trajectories, dict):
+        return 0.0
+    margins: list[float] = []
+    for value in trajectories.values():
+        if not isinstance(value, dict) or not value.get("accepted"):
+            continue
+        try:
+            guidance = float(value.get("minimum_guidance_mask", value.get("guidance_mask", 0.8))) - 0.8
+            relative = 0.5 - float(value.get("max_relative_deviation", value.get("depth_relative_error", 0.5)))
+            keyframe = 0.1 - float(value.get("maximum_keyframe_depth_error_ratio", value.get("depth_error_ratio", 0.1)))
+        except (TypeError, ValueError):
+            continue
+        margins.append(guidance + relative + keyframe)
+    return sum(margins) / len(margins) if margins else 0.0
+
+
+def _update_source_attempt_snapshot(report: dict[str, Any], alignment: dict[str, Any]) -> None:
+    source_attempt = int(report.get("source_attempt", 0))
+    existing = next(
+        (
+            item for item in report.get("source_attempts", [])
+            if isinstance(item, dict) and int(item.get("source_attempt", -1)) == source_attempt
+        ),
+        {},
+    )
+    calculated_margin = _alignment_quality_margin(alignment)
+    snapshot = {
+        "source_attempt": source_attempt,
+        "scene_relpath": report.get("active_scene_relpath", "scene"),
+        "accepted_trajectory_ids": _ordered_unique(report.get("accepted_trajectory_ids", [])),
+        "attempted_trajectory_ids": _ordered_unique(report.get("attempted_trajectory_ids", [])),
+        "accepted_count": len(_ordered_unique(report.get("accepted_trajectory_ids", []))),
+        "quality_margin": calculated_margin if calculated_margin else float(existing.get("quality_margin", 0.0)),
+        "batches": report.get("batches", []),
+        "updated_at": _utcnow(),
+    }
+    attempts = [
+        item for item in report.get("source_attempts", [])
+        if isinstance(item, dict) and int(item.get("source_attempt", -1)) != source_attempt
+    ]
+    attempts.append(snapshot)
+    attempts.sort(key=lambda item: int(item.get("source_attempt", 0)))
+    report["source_attempts"] = attempts
+    best = max(
+        attempts,
+        key=lambda item: (
+            int(item.get("accepted_count", 0)),
+            float(item.get("quality_margin", 0.0)),
+            -int(item.get("source_attempt", 0)),
+        ),
+    )
+    report["best_source_attempt"] = int(best.get("source_attempt", 0))
 
 
 def begin_source_regeneration(task_dir: Path, *, seed: int, scene_relpath: str) -> dict[str, Any]:
     """Switch the recovery journal to one deterministic regenerated source."""
-    report = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
-    if report.get("version") != AUTO_RECOVERY_VERSION:
+    stored = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
+    if not stored:
         raise AutoRecoveryError("Automatic recovery report has not been initialized")
+    report = _migrate_report(stored)
     if report.get("state") != "needs_regeneration":
         raise AutoRecoveryError("Source regeneration was not requested by the recovery state machine")
+    _update_source_attempt_snapshot(report, {})
     report["attempt_history"].append({
         "source_attempt": report.get("source_attempt", 0),
         "accepted_trajectory_ids": report.get("accepted_trajectory_ids", []),
@@ -386,9 +621,10 @@ def request_source_retry(
     """
     if task_type not in {"worldgen", "worldgen_from_pano"}:
         raise AutoRecoveryError("Only world generation tasks support source retry")
-    report = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
-    if report.get("version") != AUTO_RECOVERY_VERSION:
+    stored = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
+    if not stored:
         raise AutoRecoveryError("Source retry requires an automatic recovery report")
+    report = _migrate_report(stored, task_type=task_type)
     source_attempt = int(report.get("source_attempt", 0)) + 1
     attempt_history = report.get("attempt_history", [])
     if not isinstance(attempt_history, list):
@@ -455,11 +691,37 @@ def archive_downstream_checkpoints(task_dir: Path, *, source_attempt: int) -> No
         os.replace(promotion, promotion_archive)
 
 
+def restore_best_attempt_reports(task_dir: Path, *, source_attempt: int) -> None:
+    """Restore the selected attempt's quality manifests, never its journal."""
+    stored = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
+    if not stored:
+        raise AutoRecoveryError("Automatic recovery report has not been initialized")
+    report = _migrate_report(stored)
+    reports_dir = task_dir / "recovery_attempts" / f"attempt-{int(source_attempt):03d}" / "reports"
+    for name in (
+        "quality_report.json",
+        "alignment_quality.json",
+        "trajectory_whitelist.json",
+        "video_trajectory_whitelist.json",
+    ):
+        source = reports_dir / name
+        if source.is_file():
+            shutil.copy2(source, task_dir / name)
+    # The accepted IDs in the v2 journal are authoritative even if an old
+    # report archive predates the final rescue batch.
+    _write_object_atomic(
+        task_dir / "trajectory_whitelist.json",
+        {"accepted_trajectory_ids": _ordered_unique(report.get("accepted_trajectory_ids", []))},
+    )
+    _persist(task_dir, report)
+
+
 def set_active_scene(task_dir: Path, scene_relpath: str) -> dict[str, Any]:
     """Record the canonical scene after a successful atomic promotion."""
-    report = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
-    if report.get("version") != AUTO_RECOVERY_VERSION:
+    stored = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
+    if not stored:
         raise AutoRecoveryError("Automatic recovery report has not been initialized")
+    report = _migrate_report(stored)
     report["active_scene_relpath"] = scene_relpath
     return _persist(task_dir, report)
 
@@ -554,9 +816,10 @@ def active_scene_dir(task_dir: Path, fallback_scene_dir: Path) -> Path:
 
 def auto_recovery_summary(task_dir: Path) -> dict[str, Any]:
     """Return the compact, safe-to-poll public recovery state."""
-    report = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
-    if report.get("version") != AUTO_RECOVERY_VERSION:
+    stored = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
+    if not stored:
         return {"available": False}
+    report = _migrate_report(stored)
     return {
         "available": True,
         "state": report.get("state"),
@@ -571,6 +834,11 @@ def auto_recovery_summary(task_dir: Path) -> dict[str, Any]:
         "video_seconds": report.get("video_seconds", 0.0),
         "limits": report.get("limits", {}),
         "terminal_reason": report.get("terminal_reason"),
+        "delivery_tier": report.get("delivery_tier"),
+        "best_source_attempt": report.get("best_source_attempt"),
+        "quality_warning": report.get("quality_warning"),
+        "recovery_exhausted": report.get("recovery_exhausted", False),
+        "transient_retry_count": report.get("transient_retry_count", 0),
         "updated_at": report.get("updated_at"),
     }
 
@@ -607,32 +875,152 @@ def _resample_safe_prefix(values: list[Any], last_index: int) -> list[Any]:
     return [prefix[round(index * (len(prefix) - 1) / 20)] for index in range(21)]
 
 
-def _source_regular_cameras(scene_dir: Path) -> list[tuple[str, Path]]:
+def _pose_is_finite_and_orthonormal(pose: object) -> bool:
+    if not isinstance(pose, list) or len(pose) < 4:
+        return False
+    try:
+        matrix = [[float(pose[row][column]) for column in range(4)] for row in range(4)]
+    except (IndexError, TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) for row in matrix for value in row):
+        return False
+    rotation = [row[:3] for row in matrix[:3]]
+    for row in rotation:
+        if abs(sum(value * value for value in row) - 1.0) > 1e-3:
+            return False
+    for first in range(3):
+        for second in range(first + 1, 3):
+            if abs(sum(rotation[first][axis] * rotation[second][axis] for axis in range(3))) > 1e-3:
+                return False
+    return True
+
+
+def _planned_regular_ids(planning: dict[str, Any] | None) -> list[str]:
+    if not isinstance(planning, dict):
+        return []
+    trajectories = planning.get("trajectories", [])
+    if not isinstance(trajectories, list):
+        return []
+    return _ordered_unique(
+        item.get("id")
+        for item in trajectories
+        if isinstance(item, dict)
+        and item.get("kind") == "regular"
+        and isinstance(item.get("id"), str)
+        and not str(item.get("id")).startswith("view_recovery_")
+        and item.get("valid", True) is not False
+        and item.get("collision_valid", True) is not False
+        and item.get("status") not in {"failed", "rejected", "invalid"}
+    )
+
+
+def _source_regular_cameras(
+    scene_dir: Path,
+    planning: dict[str, Any] | None,
+) -> list[tuple[str, Path]]:
     render_dir = scene_dir / "render_results"
+    source_ids = _planned_regular_ids(planning)
+    # Backward-compatible fallback for reports produced before trajectory kind
+    # was persisted. It is intentionally unrestricted by traj number.
+    if not source_ids and planning is None:
+        source_ids = _ordered_unique(
+            "/".join(path.relative_to(render_dir).parts[:2])
+            for path in render_dir.glob("view*/**/camera.json")
+            if not path.relative_to(render_dir).parts[0].startswith("view_recovery_")
+        )
     sources: list[tuple[str, Path]] = []
-    for camera_path in sorted(render_dir.glob("view*/traj[01]/camera.json")):
-        relative = camera_path.relative_to(render_dir)
-        if relative.parts[0].startswith("view_recovery_"):
+    for source_id in source_ids:
+        parts = Path(source_id).parts
+        if len(parts) != 2 or parts[0].startswith("view_recovery_"):
             continue
-        sources.append(("/".join(relative.parts[:2]), camera_path))
+        camera_path = render_dir / parts[0] / parts[1] / "camera.json"
+        start_frame = render_dir / parts[0] / "start_frame.png"
+        camera = _read_object(camera_path)
+        extrinsic = camera.get("extrinsic")
+        if (
+            not camera_path.is_file()
+            or not start_frame.is_file()
+            or not isinstance(extrinsic, list)
+            or len(extrinsic) < 2
+            or not all(_pose_is_finite_and_orthonormal(pose) for pose in extrinsic)
+        ):
+            continue
+        sources.append((source_id, camera_path))
     return sources
 
 
-def create_conservative_rescue_trajectories(scene_dir: Path, *, round_number: int) -> list[dict[str, Any]]:
-    """Create six reusable collision-safe camera-prefix trajectories.
+def _existing_rescue_candidates(
+    scene_dir: Path,
+    *,
+    round_number: int,
+    allowed_source_ids: set[str],
+) -> list[dict[str, Any]]:
+    render_dir = scene_dir / "render_results"
+    candidates: list[dict[str, Any]] = []
+    for camera_path in sorted(render_dir.glob(f"view_recovery_r{round_number}_*/traj0/camera.json")):
+        camera = _read_object(camera_path)
+        source_id = camera.get("recovery_source_trajectory")
+        extrinsic = camera.get("extrinsic")
+        start_frame = camera_path.parent.parent / "start_frame.png"
+        if (
+            not isinstance(source_id, str)
+            or source_id not in allowed_source_ids
+            or not isinstance(extrinsic, list)
+            or len(extrinsic) != 21
+            or not all(_pose_is_finite_and_orthonormal(pose) for pose in extrinsic)
+            or not start_frame.is_file()
+        ):
+            continue
+        relative = camera_path.relative_to(render_dir)
+        candidates.append({
+            "id": "/".join(relative.parts[:2]),
+            "kind": "regular",
+            "source_trajectory_id": source_id,
+        })
+    return candidates
+
+
+def create_conservative_rescue_trajectories(
+    scene_dir: Path,
+    *,
+    round_number: int,
+    planning: dict[str, Any] | None = None,
+    target_count: int | None = None,
+) -> list[dict[str, Any]]:
+    """Create every available reusable collision-safe camera prefix.
 
     Prefixing a regular route preserves its verified camera path.  Repeating
     selected prefix poses to 21 frames is safer than extrapolating translation
-    or inventing a NavMesh route after the original planner has failed.
+    or inventing a NavMesh route after the original planner has failed. Fewer
+    than the requested number is a normal content outcome, never an exception.
     """
     target_rotation = RESCUE_TARGET_ROTATIONS.get(round_number)
     if target_rotation is None:
         raise AutoRecoveryError(f"Unknown conservative rescue round: {round_number}")
+    requested = MAX_RESCUE_CANDIDATE_COUNT if target_count is None else max(int(target_count), 0)
     render_dir = scene_dir / "render_results"
-    candidates: list[dict[str, Any]] = []
-    for source_id, source_path in _source_regular_cameras(scene_dir):
-        if len(candidates) >= RESCUE_CANDIDATE_COUNT:
+    sources = _source_regular_cameras(scene_dir, planning)
+    allowed_source_ids = {source_id for source_id, _ in sources}
+    candidates = _existing_rescue_candidates(
+        scene_dir,
+        round_number=round_number,
+        allowed_source_ids=allowed_source_ids,
+    )
+    used_sources = {item["source_trajectory_id"] for item in candidates}
+    # Existing partial paths belong to a previously persisted atomic batch.
+    # Always return them, even when the newly calculated adaptive target is
+    # smaller, so a retry cannot orphan paid work or renumber output paths.
+    required_total = max(requested, len(candidates))
+    occupied_indices = {
+        int(path.parent.parent.name.rsplit("_", 1)[-1])
+        for path in render_dir.glob(f"view_recovery_r{round_number}_*/traj0/camera.json")
+        if path.parent.parent.name.rsplit("_", 1)[-1].isdigit()
+    }
+    for source_id, source_path in sources:
+        if len(candidates) >= required_total:
             break
+        if source_id in used_sources:
+            continue
         source = _read_object(source_path)
         extrinsic = source.get("extrinsic")
         intrinsic = source.get("intrinsic")
@@ -653,7 +1041,10 @@ def create_conservative_rescue_trajectories(scene_dir: Path, *, round_number: in
                 break
         if safe_last_index == 0:
             continue
-        index = len(candidates)
+        index = 0
+        while index in occupied_indices:
+            index += 1
+        occupied_indices.add(index)
         view_id = f"view_recovery_r{round_number}_{index}"
         trajectory_id = f"{view_id}/traj0"
         output_dir = render_dir / view_id / "traj0"
@@ -661,14 +1052,6 @@ def create_conservative_rescue_trajectories(scene_dir: Path, *, round_number: in
         source_view = source_id.split("/", 1)[0]
         source_frame = render_dir / source_view / "start_frame.png"
         if not source_frame.is_file():
-            continue
-        if output_path.is_file():
-            existing = _read_object(output_path)
-            candidates.append({
-                "id": trajectory_id,
-                "kind": "regular",
-                "source_trajectory_id": existing.get("recovery_source_trajectory", source_id),
-            })
             continue
         output_dir.mkdir(parents=True, exist_ok=True)
         output_intrinsic = _resample_safe_prefix(intrinsic, min(safe_last_index, len(intrinsic) - 1))
@@ -689,8 +1072,6 @@ def create_conservative_rescue_trajectories(scene_dir: Path, *, round_number: in
             "kind": "regular",
             "source_trajectory_id": source_id,
         })
-    if len(candidates) < RESCUE_CANDIDATE_COUNT:
-        raise AutoRecoveryError(
-            f"Unable to construct six safe conservative trajectories; only {len(candidates)} regular prefixes are available"
-        )
+        used_sources.add(source_id)
+    candidates.sort(key=lambda item: item["id"])
     return candidates

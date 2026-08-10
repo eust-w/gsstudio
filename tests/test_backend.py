@@ -217,7 +217,8 @@ class TestCheckpointResume:
         assert success is True
         assert error == ""
         recovery = json.loads((task_dir / "auto_recovery.json").read_text())
-        assert recovery["state"] == "accepted"
+        assert recovery["state"] == "completed"
+        assert recovery["delivery_tier"] == "strict_3d"
         assert recovery["generated_video_trajectory_count"] == 8
         assert len(recovery["accepted_trajectory_ids"]) == 8
 
@@ -293,7 +294,7 @@ class TestCheckpointResume:
         monkeypatch.setattr(
             worker_module,
             "create_conservative_rescue_trajectories",
-            lambda _scene_dir, *, round_number: [
+            lambda _scene_dir, *, round_number, **_kwargs: [
                 {"id": f"view_recovery_r{round_number}_{index}/traj0", "kind": "regular"}
                 for index in range(6)
             ],
@@ -1003,8 +1004,17 @@ class TestAPI:
             "pending_trajectories": 1,
             "generated_video_trajectories": 8,
             "video_seconds": 9.0,
-            "limits": {"maximum_video_trajectories": 40, "maximum_video_seconds": 7200},
+            "limits": {
+                "maximum_video_trajectories": 56,
+                "maximum_video_seconds": 10800,
+                "maximum_source_regenerations": 2,
+            },
             "terminal_reason": None,
+            "delivery_tier": None,
+            "best_source_attempt": 0,
+            "quality_warning": None,
+            "recovery_exhausted": False,
+            "transient_retry_count": 0,
             "updated_at": "2026-08-11T00:00:00Z",
         }
 

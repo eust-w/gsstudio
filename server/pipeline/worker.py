@@ -28,8 +28,12 @@ from .recovery import (
     begin_source_regeneration,
     complete_auto_recovery_batch,
     create_conservative_rescue_trajectories,
+    desired_rescue_candidate_count,
     prepare_auto_recovery,
     promote_recovered_scene,
+    record_rescue_skipped,
+    record_transient_retry,
+    restore_best_attempt_reports,
     schedule_auto_recovery_batch,
     set_active_scene,
     write_auto_video_trajectory_candidates,
@@ -161,6 +165,64 @@ class PipelineWorker:
 
     async def stop(self):
         self._running = False
+
+    @staticmethod
+    def _is_transient_stage_error(error: str) -> bool:
+        lowered = str(error).lower()
+        permanent = (
+            "no such file or directory",
+            "module not found",
+            "modulenotfounderror",
+            "gated repo",
+            "cannot access gated",
+            "missing model",
+            "invalid configuration",
+            "unrecognized arguments",
+        )
+        if any(pattern in lowered for pattern in permanent):
+            return False
+        transient = (
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection refused",
+            "temporary failure",
+            "temporarily unavailable",
+            "nccl",
+            "network is unreachable",
+            "broken pipe",
+            "remote disconnected",
+        )
+        return any(pattern in lowered for pattern in transient)
+
+    async def _run_stage_resilient(self, *, task_dir: Path, **kwargs) -> tuple[bool, str]:
+        """Retry transient stage infrastructure errors at 30/120 seconds."""
+        stage_name = str(kwargs.get("stage_name", "unknown"))
+        backoffs = (30, 120)
+        for attempt in range(len(backoffs) + 1):
+            success, error = await run_stage(**kwargs)
+            if success or not self._is_transient_stage_error(error) or attempt >= len(backoffs):
+                return success, error
+            try:
+                record_transient_retry(
+                    task_dir,
+                    stage=stage_name,
+                    error=error,
+                    attempt=attempt + 1,
+                )
+            except AutoRecoveryError:
+                # Non-recovery tasks still get the same retry policy; they do
+                # not have an auto_recovery.json journal to update.
+                pass
+            log_file = kwargs.get("log_file")
+            if isinstance(log_file, Path):
+                with open(log_file, "a") as log:
+                    log.write(
+                        f"[Infrastructure Retry] {stage_name} transient failure; "
+                        f"retry {attempt + 1}/2 in {backoffs[attempt]} seconds: {error}\n"
+                    )
+            await asyncio.sleep(backoffs[attempt])
+        return False, "Transient retry loop exhausted"
 
     async def cancel_task(self, task_id: str):
         """Signal cancellation for a running task."""
@@ -328,6 +390,27 @@ class PipelineWorker:
             if cancel_event.is_set():
                 return
 
+            # Content-quality exhaustion is a completed panorama delivery, not
+            # a failed pipeline. Keep both downstream stages visibly skipped so
+            # the API never advertises a fabricated or empty 3D result.
+            if stage_name in {"gen_gs_data", "gs_training"}:
+                try:
+                    recovery_delivery = json.loads(recovery_path.read_text())
+                except (FileNotFoundError, json.JSONDecodeError):
+                    recovery_delivery = {}
+                if recovery_delivery.get("delivery_tier") == "panorama_only":
+                    update_stage(
+                        self.config.DB_PATH,
+                        task_id,
+                        stage_name,
+                        StageStatus.SKIPPED,
+                        error=str(
+                            recovery_delivery.get("quality_warning")
+                            or "3D stage skipped because fewer than four trajectories passed strict quality gates."
+                        ),
+                    )
+                    continue
+
             # Checkpoint resume: skip completed stages
             marker = task_dir / f".stage_{stage_name}_done"
             if marker.exists():
@@ -421,7 +504,8 @@ class PipelineWorker:
                 update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.FAILED, error=error)
                 raise RuntimeError(f"Stage {stage_name} failed: {error}")
 
-            success, error = await run_stage(
+            success, error = await self._run_stage_resilient(
+                task_dir=task_dir,
                 stage_name=stage_name,
                 cmd=cmd,
                 env=env,
@@ -519,7 +603,8 @@ class PipelineWorker:
                     f"{recovery['minimum_accepted_trajectories']} accepted so far)\n"
                 )
 
-            success, error = await run_stage(
+            success, error = await self._run_stage_resilient(
+                task_dir=task_dir,
                 stage_name="video_gen",
                 cmd=cmd,
                 env=env,
@@ -586,7 +671,7 @@ class PipelineWorker:
                 recovery_policy=recovery_policy,
             )
             state = recovery["state"]
-            if state == "accepted":
+            if state in {"accepted", "completed"}:
                 return True, ""
             if state == "needs_rescue":
                 round_number = recovery.get("rescue_round")
@@ -594,7 +679,18 @@ class PipelineWorker:
                     candidates = create_conservative_rescue_trajectories(
                         scene_dir,
                         round_number=int(round_number),
+                        planning=planning,
+                        target_count=desired_rescue_candidate_count(
+                            len(recovery.get("accepted_trajectory_ids", []))
+                        ),
                     )
+                    if not candidates:
+                        record_rescue_skipped(
+                            task_dir,
+                            round_number=int(round_number),
+                            reason="No validated regular camera prefix is available; advancing recovery without failing the task.",
+                        )
+                        continue
                     recovery = schedule_auto_recovery_batch(
                         task_dir,
                         phase=f"rescue_{round_number}",
@@ -616,7 +712,8 @@ class PipelineWorker:
                 ]
                 render_log = log_file.parent / f"traj_render_recovery_r{round_number}.log"
                 await self._start_vllm()
-                rendered, render_error = await run_stage(
+                rendered, render_error = await self._run_stage_resilient(
+                    task_dir=task_dir,
                     stage_name="traj_render",
                     cmd=render_cmd,
                     env=render_env,
@@ -643,7 +740,9 @@ class PipelineWorker:
                     resume=False,
                 )
             if state in {"source_quality_blocked", "quality_blocked", "budget_exhausted"}:
-                return False, str(recovery.get("terminal_reason") or "Automatic recovery did not satisfy the quality gate")
+                # v1 journals can reach these states before migration. Prepare
+                # once more so v2 converts the content outcome to a delivery.
+                continue
             if state == "disabled":
                 return False, "Automatic recovery is disabled"
 
@@ -660,7 +759,8 @@ class PipelineWorker:
                     f"{recovery.get('minimum_accepted_trajectories', 6)} accepted so far)\n"
                 )
             started = time.monotonic()
-            success, error = await run_stage(
+            success, error = await self._run_stage_resilient(
+                task_dir=task_dir,
                 stage_name="video_gen",
                 cmd=cmd,
                 env=env,
@@ -713,7 +813,8 @@ class PipelineWorker:
         attempt_scene_dir.mkdir(parents=True, exist_ok=True)
         scene_relpath = str(attempt_scene_dir.relative_to(task_dir))
         if not resume:
-            archive_reports = recovery_root / "attempt-000" / "reports"
+            previous_attempt = source_attempt - 1
+            archive_reports = recovery_root / f"attempt-{previous_attempt:03d}" / "reports"
             archive_reports.mkdir(parents=True, exist_ok=True)
             for name in (
                 "quality_report.json",
@@ -754,7 +855,8 @@ class PipelineWorker:
             elif stage_name == "traj_generate":
                 await self._start_vllm()
             log_file = task_dir / "logs" / f"recovery_attempt_{source_attempt:03d}_{stage_name}.log"
-            success, error = await run_stage(
+            success, error = await self._run_stage_resilient(
+                task_dir=task_dir,
                 stage_name=stage_name,
                 cmd=command,
                 env=env,
@@ -798,14 +900,21 @@ class PipelineWorker:
             return False, error
 
         try:
-            promote_recovered_scene(
-                task_dir,
-                source_attempt=source_attempt,
-                regenerated_scene_dir=attempt_scene_dir,
-                canonical_scene_dir=source_scene_dir,
-            )
-            set_active_scene(task_dir, "scene")
-        except AutoRecoveryError as exc:
+            completed_report = json.loads((task_dir / "auto_recovery.json").read_text())
+            best_attempt = int(completed_report.get("best_source_attempt", source_attempt))
+            if best_attempt == source_attempt:
+                promote_recovered_scene(
+                    task_dir,
+                    source_attempt=source_attempt,
+                    regenerated_scene_dir=attempt_scene_dir,
+                    canonical_scene_dir=source_scene_dir,
+                )
+                set_active_scene(task_dir, "scene")
+            else:
+                restore_best_attempt_reports(task_dir, source_attempt=best_attempt)
+                if best_attempt == 0:
+                    set_active_scene(task_dir, "scene")
+        except (AutoRecoveryError, FileNotFoundError, json.JSONDecodeError) as exc:
             return False, str(exc)
         return True, ""
 
@@ -854,7 +963,8 @@ class PipelineWorker:
             if stage_name == "traj_generate":
                 await self._start_vllm()
             log_file = task_dir / "logs" / f"replacement_attempt_{source_attempt:03d}_{stage_name}.log"
-            success, error = await run_stage(
+            success, error = await self._run_stage_resilient(
+                task_dir=task_dir,
                 stage_name=stage_name,
                 cmd=command,
                 env=env,
