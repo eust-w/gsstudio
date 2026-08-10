@@ -16,6 +16,12 @@ from ..config import Config
 from ..db import create_task, delete_task, get_task, list_tasks, update_task
 from ..models import TaskDetail, TaskListResponse, TaskResponse, TaskStatus, TaskUpdate
 from ..pipeline.quality import normalize_worldgen_config
+from ..pipeline.recovery import (
+    AutoRecoveryError,
+    archive_downstream_checkpoints,
+    auto_recovery_summary,
+    request_source_retry,
+)
 from ..pipeline.stage_runner import stream_log
 
 logger = logging.getLogger(__name__)
@@ -152,6 +158,15 @@ async def get_task_endpoint(task_id: str):
     return task
 
 
+@router.get("/tasks/{task_id}/quality")
+async def get_task_quality_endpoint(task_id: str):
+    """Poll the compact automatic-recovery state without downloading reports."""
+    cfg = _get_config()
+    if not get_task(cfg.DB_PATH, task_id):
+        raise HTTPException(404, "Task not found")
+    return auto_recovery_summary(cfg.task_dir(task_id))
+
+
 @router.patch("/tasks/{task_id}")
 async def update_task_endpoint(task_id: str, payload: TaskUpdate):
     cfg = _get_config()
@@ -209,6 +224,68 @@ async def retry_task_endpoint(task_id: str):
         raise HTTPException(404, "Task not found")
     if task["status"] not in (TaskStatus.FAILED.value, TaskStatus.CANCELLED.value):
         raise HTTPException(409, f"Cannot retry task in status: {task['status']}")
+
+    update_task(
+        cfg.DB_PATH,
+        task_id,
+        status=TaskStatus.PENDING.value,
+        progress=0.0,
+        current_stage=None,
+        error=None,
+    )
+    return get_task(cfg.DB_PATH, task_id)
+
+
+@router.post("/tasks/{task_id}/retry-source")
+async def retry_task_source_endpoint(
+    task_id: str,
+    panorama: Optional[UploadFile] = File(None),
+):
+    """Queue a user-approved new source without weakening the quality gate."""
+    cfg = _get_config()
+    task = get_task(cfg.DB_PATH, task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    if task["type"] not in ("worldgen", "worldgen_from_pano"):
+        raise HTTPException(409, "Only World Generation tasks support source retry")
+    if task["status"] not in (TaskStatus.FAILED.value, TaskStatus.CANCELLED.value):
+        raise HTTPException(409, f"Cannot replace the source in status: {task['status']}")
+    config = dict(task.get("config") or {})
+    if config.get("quality_preset", "high") != "high" or config.get("recovery_policy", "auto") != "auto":
+        raise HTTPException(409, "Source retry is available only for high-quality tasks with automatic recovery enabled")
+    if task["type"] == "worldgen_from_pano" and panorama is None:
+        raise HTTPException(400, "Upload a replacement panorama to retry this panorama-based task")
+    if panorama is not None and not (panorama.content_type or "").startswith("image/"):
+        raise HTTPException(400, "Replacement panorama must be an image")
+
+    task_dir = cfg.task_dir(task_id)
+    try:
+        current = auto_recovery_summary(task_dir)
+        if not current.get("available"):
+            raise AutoRecoveryError("Source retry requires an automatic recovery report")
+        source_attempt = int(current.get("source_attempt", 0))
+        base_seed = int(config.get("seed", 1024))
+        # Archive downstream state before mutating the journal. If the archive
+        # cannot be made safely, the failed task remains exactly as it was.
+        archive_downstream_checkpoints(task_dir, source_attempt=source_attempt + 1)
+        report = request_source_retry(
+            task_dir,
+            task_type=task["type"],
+            seed=base_seed + source_attempt + 1 if task["type"] == "worldgen" else None,
+        )
+    except (AutoRecoveryError, TypeError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+    if panorama is not None:
+        source_scene = task_dir / str(report["active_scene_relpath"])
+        source_scene.mkdir(parents=True, exist_ok=True)
+        input_dir = cfg.task_input_dir(task_id)
+        input_dir.mkdir(parents=True, exist_ok=True)
+        upload_copy = input_dir / f"replacement-panorama-attempt-{int(report['source_attempt']):03d}.png"
+        with open(upload_copy, "wb") as destination:
+            while chunk := await panorama.read(1024 * 1024):
+                destination.write(chunk)
+        shutil.copy2(upload_copy, source_scene / "panorama.png")
 
     update_task(
         cfg.DB_PATH,
