@@ -142,9 +142,9 @@ def get_worldgen_commands(
         "--model_type", model_type,
     ]
     if quality_preset == "high":
-        # High-quality runs use a deterministic twelve-path, type-balanced set
-        # with enough regular/reconstruction recovery capacity for the strict
-        # alignment gate. `--skip_exist` resumes existing video artifacts.
+        # The automatic recovery journal writes a bounded, regular-first
+        # whitelist before each full WorldStereo invocation. `--skip_exist`
+        # resumes an interrupted batch without regenerating completed videos.
         video_gen_cmd.extend([
             "--trajectory_whitelist", str(task_dir / "video_trajectory_whitelist.json"),
             "--skip_exist",
