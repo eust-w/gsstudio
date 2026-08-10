@@ -208,6 +208,9 @@ def get_worldgen_commands(
     gs_train_env = {
         "CUDA_VISIBLE_DEVICES": gpu_list,
         "HF_HOME": config.get("hf_home", "/models/hf-cache"),
+        # The perceptual-loss checkpoint is required by the trainer.  Keep it
+        # on the persistent model volume so every worker starts offline.
+        "TORCH_HOME": config.get("torch_home", "/models/torch-cache"),
     }
     commands.append(("gs_training", gs_train_cmd, gs_train_env, worldgen_dir))
 

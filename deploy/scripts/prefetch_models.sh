@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Pre-download all model weights to the HF cache PVC.
-# Run this as a K8s Job or on a machine with access to the PVC.
+# Pre-download all model weights to the persistent model volume.
+# Run this as a K8s Job or on a machine with access to the volume.
 set -euo pipefail
 
 HF_HOME="${HF_HOME:-/models/hf-cache}"
-echo "Pre-downloading models to ${HF_HOME}"
+TORCH_HOME="${TORCH_HOME:-/models/torch-cache}"
+export HF_HOME TORCH_HOME
+echo "Pre-downloading Hugging Face models to ${HF_HOME}"
+echo "Pre-downloading Torch checkpoints to ${TORCH_HOME}"
 
 # Check if running as K8s job or standalone
 if [ "${1:-}" = "--k8s" ]; then
@@ -22,13 +25,15 @@ spec:
       nodeName: 192.168.80.136
       containers:
         - name: prefetch
-          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v31
+          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v32
           command: ["bash", "-c"]
           args:
             - |
               python -c "
               from huggingface_hub import snapshot_download
               import os
+              from pathlib import Path
+              from torch.hub import download_url_to_file
 
               models = [
                   ('facebook/sam3', None),
@@ -64,11 +69,25 @@ spec:
                   )
                   print(f'Done: {repo_id}')
 
+              checkpoint_dir = Path(os.environ['TORCH_HOME']) / 'hub' / 'checkpoints'
+              checkpoint_dir.mkdir(parents=True, exist_ok=True)
+              checkpoint = checkpoint_dir / 'vgg16-397923af.pth'
+              if not checkpoint.exists():
+                  print('Downloading VGG16 perceptual-loss checkpoint...')
+                  download_url_to_file(
+                      'https://download.pytorch.org/models/vgg16-397923af.pth',
+                      str(checkpoint),
+                      hash_prefix='397923af',
+                      progress=True,
+                  )
+              print(f'VGG16 checkpoint ready: {checkpoint}')
               print('All models downloaded.')
               "
           env:
             - name: HF_HOME
               value: /models/hf-cache
+            - name: TORCH_HOME
+              value: /models/torch-cache
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -76,8 +95,8 @@ spec:
                   key: token
                   optional: true
           volumeMounts:
-            - name: hf-cache
-              mountPath: /models/hf-cache
+            - name: models
+              mountPath: /models
           resources:
             requests:
               cpu: "4"
@@ -86,9 +105,9 @@ spec:
               cpu: "8"
               memory: 16Gi
       volumes:
-        - name: hf-cache
+        - name: models
           hostPath:
-            path: /home/cce/gsstudio/models/hf-cache
+            path: /home/cce/gsstudio/models
             type: DirectoryOrCreate
       imagePullSecrets:
         - name: gsstudio-registry
@@ -101,6 +120,9 @@ fi
 # Standalone mode
 python3 -c "
 from huggingface_hub import snapshot_download
+from pathlib import Path
+from torch.hub import download_url_to_file
+import os
 
 models = [
     'tencent/HY-World-2.0',
@@ -117,5 +139,17 @@ for repo_id in models:
     snapshot_download(repo_id)
     print(f'Done: {repo_id}')
 
-print('All models downloaded to', '${HF_HOME}')
+checkpoint_dir = Path(os.environ['TORCH_HOME']) / 'hub' / 'checkpoints'
+checkpoint_dir.mkdir(parents=True, exist_ok=True)
+checkpoint = checkpoint_dir / 'vgg16-397923af.pth'
+if not checkpoint.exists():
+    print('Downloading VGG16 perceptual-loss checkpoint...')
+    download_url_to_file(
+        'https://download.pytorch.org/models/vgg16-397923af.pth',
+        str(checkpoint),
+        hash_prefix='397923af',
+        progress=True,
+    )
+print(f'VGG16 checkpoint ready: {checkpoint}')
+print('All models downloaded to', os.environ['HF_HOME'])
 "
