@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# GSStudio a800-v38: effective-input delivery tiers, durable best-attempt
+# GSStudio a800-v39: effective-input delivery tiers, durable best-attempt
 # recovery, dependency-audit remediation, and parent-safe render filtering.
 # Keeping CUDA extensions and model runtimes in the v22 base makes this release
 # fast and avoids recompiling HY-World during a safety/quality-only rollout.
