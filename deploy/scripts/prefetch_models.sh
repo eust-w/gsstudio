@@ -25,7 +25,7 @@ spec:
       nodeName: 192.168.80.136
       containers:
         - name: prefetch
-          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v37
+          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v38
           command: ["bash", "-c"]
           args:
             - |

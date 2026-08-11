@@ -27,6 +27,7 @@ CAMERA_GUARD_PATTERN = re.compile(
     r'(?P=indent)    continue\n'
 )
 ARGUMENT_SENTINEL = "# GSStudio trajectory render whitelist patch"
+TRAJECTORY_SENTINEL = "# GSStudio trajectory list whitelist patch"
 CAPTION_SENTINEL = "# GSStudio trajectory caption whitelist patch"
 SKIP_SENTINEL = "# GSStudio trajectory render resume patch"
 
@@ -52,10 +53,21 @@ def patch(source: str) -> str:
                 'help="Reuse rendered recovery trajectories when present")\n'
             ),
         )
+
+    # Patch sections are intentionally independent.  Release images inherit
+    # already-patched HY-World files from earlier immutable images, and an old
+    # parent may contain the CLI and caption markers without the list filter.
+    # In that state ``candidate_trajectory_ids`` was referenced but never
+    # defined.  Do not use the argument marker as a proxy for this section.
+    if (
+        TRAJECTORY_SENTINEL not in source
+        and "candidate_trajectory_ids = set" not in source
+    ):
         source = _insert_after(
             TRAJECTORY_LIST_PATTERN,
             source,
             lambda indent: (
+                f"{indent}{TRAJECTORY_SENTINEL}\n"
                 f"{indent}if args.trajectory_whitelist:\n"
                 f"{indent}    with open(args.trajectory_whitelist, 'r') as whitelist_file:\n"
                 f"{indent}        whitelist = json.load(whitelist_file)\n"
