@@ -225,6 +225,76 @@ class PipelineWorker:
             await asyncio.sleep(backoffs[attempt])
         return False, "Transient retry loop exhausted"
 
+    @staticmethod
+    def _missing_recovery_render_assets(
+        scene_dir: Path,
+        candidate_ids: list[str],
+    ) -> list[str]:
+        missing: list[str] = []
+        render_root = scene_dir / "render_results"
+        for candidate_id in candidate_ids:
+            parts = Path(candidate_id).parts
+            if len(parts) != 2 or any(part in {"", ".", ".."} for part in parts):
+                missing.append(f"{candidate_id}:invalid_id")
+                continue
+            trajectory_dir = render_root.joinpath(*parts)
+            for name in ("render.mp4", "render_mask.mp4", "traj_caption.json"):
+                path = trajectory_dir / name
+                if not path.is_file() or path.stat().st_size <= 0:
+                    missing.append(f"{candidate_id}:{name}")
+        return missing
+
+    async def _render_recovery_batch(
+        self,
+        *,
+        task_dir: Path,
+        scene_dir: Path,
+        candidate_ids: list[str],
+        render_spec: tuple[list[str], dict[str, str], Path],
+        render_log: Path,
+        cancel_event: asyncio.Event,
+    ) -> tuple[bool, str]:
+        """Render/caption a rescue batch and verify all paid outputs exist."""
+        render_cmd, render_env, render_cwd = render_spec
+        command = [
+            *render_cmd,
+            "--trajectory_whitelist", str(task_dir / "video_trajectory_whitelist.json"),
+            "--skip_exist",
+        ]
+        asset_backoffs = (30, 120)
+        for attempt in range(len(asset_backoffs) + 1):
+            rendered, render_error = await self._run_stage_resilient(
+                task_dir=task_dir,
+                stage_name="traj_render",
+                cmd=command,
+                env=render_env,
+                log_file=render_log,
+                cwd=render_cwd,
+                cancel_event=cancel_event,
+            )
+            if not rendered:
+                return False, render_error
+            missing = self._missing_recovery_render_assets(scene_dir, candidate_ids)
+            if not missing:
+                record_recovery_render_complete(task_dir, candidate_ids=candidate_ids)
+                return True, ""
+            error = "Trajectory rendering completed without required rescue assets: " + ", ".join(missing)
+            if attempt >= len(asset_backoffs):
+                return False, error
+            record_transient_retry(
+                task_dir,
+                stage="traj_render_assets",
+                error=error,
+                attempt=attempt + 1,
+            )
+            with open(render_log, "a") as log:
+                log.write(
+                    f"[Infrastructure Retry] rescue render asset validation failed; "
+                    f"retry {attempt + 1}/2 in {asset_backoffs[attempt]} seconds: {error}\n"
+                )
+            await asyncio.sleep(asset_backoffs[attempt])
+        return False, "Recovery render asset retry loop exhausted"
+
     async def cancel_task(self, task_id: str):
         """Signal cancellation for a running task."""
         if task_id in self._cancel_events:
@@ -705,29 +775,18 @@ class PipelineWorker:
 
                 if render_spec is None:
                     return False, "Automatic recovery cannot render rescue trajectories without a render command"
-                render_cmd, render_env, render_cwd = render_spec
-                render_cmd = [
-                    *render_cmd,
-                    "--trajectory_whitelist", str(task_dir / "video_trajectory_whitelist.json"),
-                    "--skip_exist",
-                ]
                 render_log = log_file.parent / f"traj_render_recovery_r{round_number}.log"
                 await self._start_vllm()
-                rendered, render_error = await self._run_stage_resilient(
+                rendered, render_error = await self._render_recovery_batch(
                     task_dir=task_dir,
-                    stage_name="traj_render",
-                    cmd=render_cmd,
-                    env=render_env,
-                    log_file=render_log,
-                    cwd=render_cwd,
+                    scene_dir=scene_dir,
+                    candidate_ids=recovery["pending_candidate_trajectory_ids"],
+                    render_spec=render_spec,
+                    render_log=render_log,
                     cancel_event=cancel_event,
                 )
                 if not rendered:
                     return False, render_error
-                record_recovery_render_complete(
-                    task_dir,
-                    candidate_ids=recovery["pending_candidate_trajectory_ids"],
-                )
                 await self._stop_vllm()
                 continue
             if state == "needs_regeneration":
@@ -769,30 +828,19 @@ class PipelineWorker:
             if pending_rescue_ids and not set(pending_rescue_ids).issubset(rendered_ids):
                 if render_spec is None:
                     return False, "Pending rescue trajectories require a render command before WorldStereo"
-                render_cmd, render_env, render_cwd = render_spec
-                resume_render_cmd = [
-                    *render_cmd,
-                    "--trajectory_whitelist", str(task_dir / "video_trajectory_whitelist.json"),
-                    "--skip_exist",
-                ]
                 round_number = recovery.get("rescue_round") or 1
                 resume_render_log = log_file.parent / f"traj_render_recovery_r{round_number}.log"
                 await self._start_vllm()
-                rendered, render_error = await self._run_stage_resilient(
+                rendered, render_error = await self._render_recovery_batch(
                     task_dir=task_dir,
-                    stage_name="traj_render",
-                    cmd=resume_render_cmd,
-                    env=render_env,
-                    log_file=resume_render_log,
-                    cwd=render_cwd,
+                    scene_dir=scene_dir,
+                    candidate_ids=pending_rescue_ids,
+                    render_spec=render_spec,
+                    render_log=resume_render_log,
                     cancel_event=cancel_event,
                 )
                 if not rendered:
                     return False, render_error
-                record_recovery_render_complete(
-                    task_dir,
-                    candidate_ids=pending_rescue_ids,
-                )
                 await self._stop_vllm()
                 recovery = prepare_auto_recovery(
                     task_dir,
