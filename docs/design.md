@@ -53,7 +53,7 @@ WorldStereo paths, 180 minutes, and two deterministic regenerated sources.
 |-------|------|---------|
 | HY-Pano-2.0 (80B) | 169.4 GB | Panorama generation |
 | HY-WorldMirror-2.0 | 5.1 GB | 3D reconstruction |
-| WorldStereo-2 (memory-dmd) | 34.9 GB | World expansion |
+| WorldStereo-2 (memory + memory-dmd) | 34.9 GB | High-quality and fast world expansion |
 | Qwen3-VL-8B-Instruct | 17.5 GB | vLLM trajectory planning |
 | facebook/sam3 | 6.9 GB | Semantic segmentation |
 | Ruicheng/moge-2-vitl-normal | 1.3 GB | Monocular depth |
@@ -95,10 +95,11 @@ Based on pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel. All CUDA extensions are co
    transformers <5, which conflicts with the main HY-World env
    (torch 2.7.1 + transformers 5.2.0). Pipeline talks to vLLM only over HTTP.
 
-## Deployment Status (verified)
+## Deployment Status (verified 2026-08-11)
 
-- Image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22
-- Pod: gsstudio ns, 1/1 Running, 5x A800 on node 192.168.80.136
+- Image: `ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v41`
+- Digest: `sha256:ddb65575de2b234edf6192faf909d6bf4a26932c3632ca2d08c6c3aefe1e5297`
+- Pod: `gsstudio` namespace, 1/1 Running, 5x A800 on node 192.168.80.136
 - Public IP URL: http://120.48.33.45 (CCE load balancer + Basic Auth)
 - TLS URL: https://geneva-ingredients-expression-located.trycloudflare.com (Cloudflare Tunnel TLS + Basic Auth)
 - One-time world generation prerequisite: approved access to gated
@@ -106,7 +107,12 @@ Based on pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel. All CUDA extensions are co
 - `facebook/sam3` only needs that token for its first download. Its complete
   snapshot is retained under the node's persistent `/models/hf-cache`; later
   tasks and Pod restarts use the local cache without requiring the token.
-- vLLM 0.11.0 Qwen3-VL-8B: chat completion verified working
+- vLLM 0.11.0 Qwen3-VL-8B: process and trajectory-caption path verified working
 - worldrecon e2e via API verified: 8 images -> gaussians.ply (82MB, 1.21M
   vertices) + points.ply + depth/normal/camera in ~45s (warm) 
 - frontend served at / (static build), artifacts download verified
+- High-quality auto-recovery acceptance task `435d4b33616e` completed as
+  `strict_3d`: seed 1025 best attempt, 6 strict trajectories, 2,000 training
+  steps, SPZ/PLY output, and authenticated browser preview verification.
+- Panorama preview explicitly selects the source `scene/panorama.png`; generated
+  depth/normal maps are never used as the interactive panorama.

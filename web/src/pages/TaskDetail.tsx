@@ -24,6 +24,12 @@ export function preferredSplatArtifact(artifacts: Artifact[]): Artifact | undefi
   return artifacts.find((artifact) => artifact.name.toLowerCase().endsWith(".spz")) ?? artifacts[0];
 }
 
+export function preferredPanoramaArtifact(artifacts: Artifact[]): Artifact | undefined {
+  return artifacts.find((artifact) => artifact.name.toLowerCase() === "panorama.png")
+    ?? artifacts.find((artifact) => artifact.path.includes("/gs_data/images/"))
+    ?? artifacts[0];
+}
+
 function findArtifactByName(artifacts: Artifact[], name: string): Artifact | undefined {
   return artifacts.find((artifact) => artifact.name === name);
 }
@@ -202,6 +208,7 @@ export default function TaskDetail() {
   const videoArtifacts = task.artifacts.filter((a) => a.type === "video");
   const splatArtifacts = task.artifacts.filter((a) => a.type === "3dgs");
   const previewSplat = preferredSplatArtifact(splatArtifacts);
+  const previewPanorama = preferredPanoramaArtifact(panoArtifacts);
   const positionMetadata = findArtifactByName(task.artifacts, "position_meta_info.json");
   const collisionMesh = findArtifactByName(task.artifacts, "fuse_simplified.ply");
   const imageArtifacts = task.artifacts.filter((a) => a.type === "image" && !a.name.includes("pano"));
@@ -384,8 +391,8 @@ export default function TaskDetail() {
           {previewLabels[activePreview] && (
             <PreviewFrame label={previewLabels[activePreview]}>
               <div className="preview-content">
-                {activePreview === "panorama" && panoArtifacts.length > 0 && (
-                  <PanoViewer url={getArtifactUrl(task.id, panoArtifacts[0].path)} />
+                {activePreview === "panorama" && previewPanorama && (
+                  <PanoViewer url={getArtifactUrl(task.id, previewPanorama.path)} />
                 )}
                 {activePreview === "video" && videoArtifacts.length > 0 && (
                   <video
