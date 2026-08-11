@@ -119,6 +119,7 @@ def _new_report(task_dir: Path, planning: dict[str, Any], task_type: str) -> dic
         "attempted_trajectory_ids": legacy_attempted,
         "accepted_trajectory_ids": legacy_accepted,
         "pending_candidate_trajectory_ids": [],
+        "rendered_candidate_trajectory_ids": [],
         "generated_video_trajectory_count": 0,
         "video_seconds": 0.0,
         "batches": ([{
@@ -165,7 +166,12 @@ def _migrate_report(
     if planning is not None and not migrated.get("normal_candidate_trajectory_ids"):
         migrated["normal_candidate_trajectory_ids"] = _normal_candidates(planning)
     migrated.setdefault("normal_candidate_trajectory_ids", [])
-    for key in ("attempted_trajectory_ids", "accepted_trajectory_ids", "pending_candidate_trajectory_ids"):
+    for key in (
+        "attempted_trajectory_ids",
+        "accepted_trajectory_ids",
+        "pending_candidate_trajectory_ids",
+        "rendered_candidate_trajectory_ids",
+    ):
         migrated[key] = _ordered_unique(migrated.get(key, []))
     migrated.setdefault("generated_video_trajectory_count", len(migrated["attempted_trajectory_ids"]))
     migrated.setdefault("video_seconds", 0.0)
@@ -383,6 +389,30 @@ def record_transient_retry(
     })
     report["transient_retries"] = retries
     report["transient_retry_count"] = len(retries)
+    return _persist(task_dir, report)
+
+
+def record_recovery_render_complete(
+    task_dir: Path,
+    *,
+    candidate_ids: list[str],
+) -> dict[str, Any]:
+    """Durably mark a rescue render/caption batch before WorldStereo starts.
+
+    A container or process failure can happen after the camera videos were
+    written but before the pending WorldStereo batch completes. Keeping this
+    checkpoint separate lets retry either reuse a fully rendered batch or
+    safely rerun ``--skip_exist`` to fill missing captions.
+    """
+    stored = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
+    if not stored:
+        raise AutoRecoveryError("Automatic recovery report has not been initialized")
+    report = _migrate_report(stored)
+    report["rendered_candidate_trajectory_ids"] = _ordered_unique([
+        *report.get("rendered_candidate_trajectory_ids", []),
+        *candidate_ids,
+    ])
+    report["render_completed_at"] = _utcnow()
     return _persist(task_dir, report)
 
 
