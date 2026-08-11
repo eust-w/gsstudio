@@ -21,7 +21,7 @@ from server.db import create_task, get_task, init_db, list_tasks, set_task_stage
 from server.models import StageStatus, TaskStatus
 from server.pipeline.stage_runner import run_stage
 from server.pipeline.worldgen import get_worldgen_commands
-from server.pipeline.worker import PipelineWorker, VLLM_FREE_STAGES
+from server.pipeline.worker import PipelineWorker, VLLM_FREE_STAGES, _next_recovery_seed
 
 
 @pytest.fixture
@@ -111,6 +111,10 @@ class TestTaskStateMachine:
 
 
 class TestCheckpointResume:
+    def test_recovery_seeds_are_based_on_the_original_seed(self):
+        assert _next_recovery_seed({"seed": 1024}, 0) == 1025
+        assert _next_recovery_seed({"seed": 1025, "_recovery_base_seed": 1024}, 1) == 1026
+
     def test_checkpoint_marker(self, cfg, task_id):
         task_dir = cfg.task_dir(task_id)
         task_dir.mkdir(parents=True, exist_ok=True)
@@ -1036,13 +1040,13 @@ class TestDeploymentContract:
         assert "patch_hyworld_render_filter.py" in dockerfile
         assert "/opt/hyworld2/hyworld2/worldgen/traj_render.py" in dockerfile
 
-    def test_gpu_rollout_manifests_target_the_immutable_v39_image(self):
+    def test_gpu_rollout_manifests_target_the_immutable_v40_image(self):
         root = Path(__file__).parents[1]
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v39" in deployment
-        assert "gsstudio:a800-v39" in build
+        assert "gsstudio:a800-v40" in deployment
+        assert "gsstudio:a800-v40" in build
         assert "gsstudio:a800-v35" not in deployment
         assert "gsstudio:a800-v35" not in build
         assert "gsstudio:a800-v22" not in deployment
@@ -1106,7 +1110,7 @@ class TestDeploymentContract:
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
 
         assert "FROM ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22" in source
-        assert "GSStudio a800-v39" in source
+        assert "GSStudio a800-v40" in source
 
     def test_image_patches_worldstereo_transformer_for_local_only_loading(self):
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()

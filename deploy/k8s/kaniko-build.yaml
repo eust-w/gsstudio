@@ -12,7 +12,7 @@ spec:
       args:
         - --dockerfile=/build-context/Dockerfile.a800
         - --context=dir:///build-context
-        - --destination=ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v39
+        - --destination=ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v40
         - --cache=true
         - --cache-repo=ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio-cache
         - --snapshot-mode=redo
