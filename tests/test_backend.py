@@ -276,6 +276,11 @@ class TestCheckpointResume:
             candidate_ids = manifest["candidate_trajectory_ids"]
             calls.append((stage_name, candidate_ids))
             if stage_name == "traj_render":
+                for candidate_id in candidate_ids:
+                    trajectory_dir = scene_dir / "render_results" / candidate_id
+                    trajectory_dir.mkdir(parents=True, exist_ok=True)
+                    for name in ("render.mp4", "render_mask.mp4", "traj_caption.json"):
+                        (trajectory_dir / name).write_bytes(b"complete")
                 return True, ""
             accepted_count = 2 if len([item for item in calls if item[0] == "video_gen"]) == 1 else 6
             with open(log_file, "a") as log:
@@ -370,7 +375,13 @@ class TestCheckpointResume:
 
         async def fake_stage(*, stage_name, log_file, **_kwargs):
             calls.append(stage_name)
-            if stage_name == "video_gen":
+            if stage_name == "traj_render":
+                for candidate_id in rescue_ids:
+                    trajectory_dir = scene_dir / "render_results" / candidate_id
+                    trajectory_dir.mkdir(parents=True, exist_ok=True)
+                    for name in ("render.mp4", "render_mask.mp4", "traj_caption.json"):
+                        (trajectory_dir / name).write_bytes(b"complete")
+            else:
                 with open(log_file, "a") as log:
                     for trajectory_id in rescue_ids:
                         log.write(
@@ -406,6 +417,59 @@ class TestCheckpointResume:
         report = json.loads((task_dir / "auto_recovery.json").read_text())
         assert set(rescue_ids).issubset(report["rendered_candidate_trajectory_ids"])
         assert report["delivery_tier"] == "strict_3d"
+
+    def test_recovery_render_retries_success_without_required_caption(self, cfg, monkeypatch):
+        import server.pipeline.worker as worker_module
+        from server.pipeline.recovery import prepare_auto_recovery
+
+        task_dir = cfg.task_dir("retry-missing-render-assets")
+        scene_dir = task_dir / "scene"
+        task_dir.mkdir(parents=True)
+        scene_dir.mkdir()
+        planning = {"trajectories": [{"id": "view0/traj0", "kind": "regular"}]}
+        prepare_auto_recovery(
+            task_dir,
+            planning=planning,
+            task_type="worldgen_from_pano",
+            recovery_policy="auto",
+        )
+        candidate_ids = ["view_recovery_r1_0/traj0"]
+        attempts = 0
+
+        async def fake_stage(**_kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 2:
+                trajectory_dir = scene_dir / "render_results" / candidate_ids[0]
+                trajectory_dir.mkdir(parents=True)
+                for name in ("render.mp4", "render_mask.mp4", "traj_caption.json"):
+                    (trajectory_dir / name).write_bytes(b"complete")
+            return True, ""
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr(worker_module, "run_stage", fake_stage)
+        monkeypatch.setattr(worker_module.asyncio, "sleep", no_sleep)
+        worker = PipelineWorker(cfg)
+
+        async def render_batch():
+            return await worker._render_recovery_batch(
+                task_dir=task_dir,
+                scene_dir=scene_dir,
+                candidate_ids=candidate_ids,
+                render_spec=(["renderer"], {}, task_dir),
+                render_log=task_dir / "render.log",
+                cancel_event=asyncio.Event(),
+            )
+
+        success, error = asyncio.run(render_batch())
+
+        assert success, error
+        assert attempts == 2
+        report = json.loads((task_dir / "auto_recovery.json").read_text())
+        assert report["transient_retry_count"] == 1
+        assert report["rendered_candidate_trajectory_ids"] == candidate_ids
 
     def test_auto_worker_uses_next_seed_for_generated_source_after_two_failed_rescue_rounds(self, cfg, monkeypatch):
         from server.pipeline.recovery import (
