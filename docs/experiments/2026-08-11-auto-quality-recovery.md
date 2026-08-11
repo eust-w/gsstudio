@@ -1,72 +1,120 @@
 # Auto Quality Recovery Experiment Record
 
-## Baseline and hypothesis
+## Goal and preserved baseline
 
-The preserved failure `80313f5ea237` accepted only 2 of 31 WorldStereo
-trajectories. Its two accepted paths were short, approximately 35-degree,
-horizontal rotations. The hypothesis is therefore that quality improves by
-reusing collision-validated prefixes rather than spending GPU time on longer
-exploration paths.
+This experiment verifies that valid high-quality inputs no longer fail merely
+because fewer than six trajectories pass the strict alignment gate. The gate
+itself remains unchanged: minimum guidance mask `0.80`, maximum relative depth
+deviation `0.50`, and maximum keyframe depth-error ratio `0.10`.
 
-## Reproducible offline replay
+The preserved low-acceptance baseline `80313f5ea237` passed only 2 of 31
+WorldStereo trajectories. Task `435d4b33616e` was used for the resumable live
+acceptance run without deleting its original panorama, videos, logs, or rescue
+paths.
 
-The deterministic state-machine replay covers the observed low-acceptance
-case without accessing or modifying the original task:
+## Deterministic replay and automated coverage
 
-| Check | Result |
-| --- | --- |
-| First inference batch | 8 regular-first trajectories |
-| 0--3 accepted | Directly enters rescue round 1; it does not consume the remaining regular backlog |
-| Rescue round 1 | Six source prefixes capped at 25 degrees and resampled to 21 poses |
-| Rescue round 2 | Six source prefixes capped at 12 degrees and resampled to 21 poses |
-| Accepted path handling | Only accepted ids are written to `trajectory_whitelist.json` for `gen_gs_data` |
-| Budget | 40 WorldStereo trajectories or 120 minutes across all source attempts |
-| Generated source fallback | One isolated `base_seed + 1` attempt; original scene remains archived until promotion |
-| Uploaded panorama fallback | Original upload remains unchanged; terminal state is `source_quality_blocked` until a replacement is supplied |
+The recovery suite covers arbitrary regular paths (including `traj2`), fewer
+than six sources, zero sources, partially rendered rescue directories, stable
+recovery indexes, crash resume, source-attempt isolation, best-attempt
+promotion, and rejected-trajectory isolation. It also covers all delivery
+tiers:
 
-The control path represented by successful task `fac2f9d99c2f` is also
-covered: 4--5 accepted routes schedule exactly one four-path normal refill,
-and six accepted routes stop recovery immediately.
+| Strictly accepted | Delivery | Top-level task result |
+| --- | --- | --- |
+| 6 or more | `strict_3d` | `completed`, whitelist-only 3D training |
+| 4 or 5 | `degraded_3d` | `completed`, whitelist-only 3D training with warning |
+| 0 through 3 | `panorama_only` | `completed`, 3D data/training stages skipped |
 
-## Automated evidence
+The global journaled budget is 56 WorldStereo trajectories, 10,800 seconds,
+and at most two deterministic source regenerations. Transient infrastructure
+failures retry twice; content-quality exhaustion selects the best preserved
+attempt instead of failing the task.
 
-- Backend: `105 passed` after adding durable-state, prefix-geometry,
-  whitelist, atomic-promotion, source-retry, API, and worker-resume tests.
-- Frontend: `32 passed`; task details show phase, accepted/required count,
-  40-path/120-minute budget, terminal diagnosis, and source replacement.
-- Build: TypeScript/Vite production build completes. `npm audit
-  --audit-level=high` reports no vulnerabilities. A clean Python 3.11
-  environment created from `requirements-dev.txt` reports no known
-  vulnerabilities with `pip-audit`, passes `pip check`, and passes the same
-  105 backend tests. The A800 image installs the audited generic dependency
-  pins from `deploy/requirements-security.txt` without upgrading HY-World's
-  tested CUDA/model stack.
+## Live GPU acceptance: `435d4b33616e`
 
-## Isolated GPU acceptance run
+- Public task: `http://120.48.33.45/tasks/435d4b33616e`
+- Source: original `frame_000001.jpg`
+- Configuration: high quality, automatic recovery, base seed `1024`, full
+  `worldstereo-memory`
+- Final state: `completed / strict_3d`
+- Final source: attempt 1, deterministic seed `1025`
+- Recovery total: 30 of 56 WorldStereo trajectories and 9,472.48 of 10,800
+  budgeted seconds; no transient infrastructure retry
 
-The live acceptance run must use a new task created from the source image,
-never mutate `80313f5ea237`. On the initial immutable `a800-v34` rollout
-(superseded by `a800-v36` for the manual-retry archival edge case and audited
-generic Python dependencies), collect the following before
-declaring the experiment complete:
+### Attempt history
 
-1. `auto_recovery.json`, `quality_report.json`, and `alignment_quality.json`.
-2. Accepted/rejected counts and rejection reason histogram for each batch.
-3. GPU runtime from the task stage records and the bounded WorldStereo count.
-4. The final 3DGS artifact, one fixed-camera screenshot, and the generated
-   trajectory video.
-5. Browser evidence that the authenticated 3D viewer has no new console
-   errors and the public unauthenticated API remains `401`.
+| Attempt | Seed | Initial batch | Refill | Rescue | Final accepted | Quality margin |
+| --- | ---: | --- | --- | --- | ---: | ---: |
+| 0 | 1024 | 5/8 | 0/4 | 0/6 | 5 | 0.5400674 |
+| 1 | 1025 | 4/8 | 2/4 | not needed | 6 | 0.6657242 |
 
-The deployment record will be appended with the actual task id and metrics;
-this document deliberately distinguishes replay proof from a completed GPU
-generation run.
+Attempt 0 remained archived while attempt 1 ran. Attempt 1 became active only
+after it reached six accepted trajectories; attempt 2 was never scheduled.
+No already completed trajectory was recomputed after a retry.
 
-### Active v34 run
+### Planning and alignment evidence
 
-- Task: `435d4b33616e` (`frame-000001-auto-recovery-experiment-v34`)
-- Source: original `frame_000001.jpg`, uploaded as a new isolated task
-- Configuration: high quality, `recovery_policy=auto`, deterministic seed
-  `1024`
-- Status at creation: running `panogen`; no existing task, panorama, or
-  artifact was modified.
+- NavMesh present, `reconstruct_pairs.json` present, no planning log errors.
+- 25 valid planned trajectories: 8 regular, 9 surround, 4 exploration, and 4
+  reconstruction; two collision-invalid paths were discarded.
+- Attempt 1 evaluated 12 trajectories and accepted exactly six.
+- Rejection histogram: guidance mask 6, relative depth deviation 3, keyframe
+  depth-error ratio 3. A trajectory can contribute to multiple reasons.
+- `trajectory_whitelist.json` exactly equals the six accepted IDs from
+  `alignment_quality.json`:
+  `target_bookshelf_1/traj0`, `target_bookshelf_1/traj1`, `view0/traj1`,
+  `view0/traj2`, `view1/traj2`, and `view2/traj2`.
+- The six rejected IDs are absent from GS-data generation and 3DGS training.
+
+### Downstream result
+
+| Stage | Result | Duration |
+| --- | --- | ---: |
+| World expansion and recovery | completed | 7,303.82 s |
+| GS data preparation | completed | 43.40 s |
+| 3DGS training | completed, 5 GPUs, 2,000/2,000 steps | 191.62 s |
+
+Produced artifacts include:
+
+- `output/ply/point_cloud_1999.spz` — 15,624,698 bytes
+- `output/ply/point_cloud_1999.ply` — 50,318,378 bytes
+- `output/ply/fuse_simplified.ply` — 538,153 bytes for collision navigation
+- `output/ply/position_meta_info.json` — official scene pose and scale
+- `output/renders/val_step1999_0000.png` through `_0003.png` — fixed-camera
+  validation images
+- accepted WorldStereo result videos under `scene/render_results/...`
+- `quality_report.json`, `alignment_quality.json`,
+  `trajectory_whitelist.json`, `auto_recovery.json`, and
+  `source_promotion.json`
+
+## Release and acceptance gates
+
+- Backend: 121 passed.
+- Frontend: 37 passed after adding source-panorama selection regressions.
+- TypeScript/Vite production build passed; `npm audit --audit-level=high`
+  reports zero vulnerabilities.
+- The clean Python 3.11 dependency audit reports no known vulnerabilities and
+  passes `pip check`; the final code-only rerun also passes `git diff --check`
+  and Python compilation.
+- Immutable image: `a800-v41`, digest
+  `sha256:ddb65575de2b234edf6192faf909d6bf4a26932c3632ca2d08c6c3aefe1e5297`.
+- The verified rollback baseline remains deployed-history image `a800-v34`;
+  no unverified intermediate tag is used as a rollback target.
+- Image preflight passed rtree, SAM3 offline configuration, full WorldStereo,
+  VGG16 checksum, recovery ordering/isolation, and the source-panorama web
+  asset check.
+- Public unauthenticated task API returns `401`; authenticated health, task,
+  quality, source panorama, and artifact endpoints return `200`.
+- Real Chrome acceptance passed 3D default view, official pose, SPZ streaming,
+  focused WASD/Shift/R controls, reset, Panorama/Video/3D fullscreen, and zero
+  application-origin console warnings or errors.
+- Browser acceptance exposed and fixed one final issue: the Panorama tab had
+  selected a generated depth map. `a800-v41` now prioritizes the exact source
+  `scene/panorama.png`; the live panorama and fullscreen views were rechecked.
+
+The automated negative-tier fixtures prove that a best attempt with three or
+fewer accepted trajectories completes as `panorama_only` without training a
+fabricated 3D result. The live run exercised the stronger strict-delivery path;
+no destructive GPU duplicate of the same source was needed for that negative
+case.
