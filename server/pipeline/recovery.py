@@ -631,6 +631,8 @@ def begin_source_regeneration(task_dir: Path, *, seed: int, scene_relpath: str) 
     report["attempted_trajectory_ids"] = []
     report["accepted_trajectory_ids"] = []
     report["pending_candidate_trajectory_ids"] = []
+    report["rendered_candidate_trajectory_ids"] = []
+    report.pop("render_completed_at", None)
     report["batches"] = []
     report["terminal_reason"] = None
     return _persist(task_dir, report)
@@ -676,6 +678,8 @@ def request_source_retry(
     report["attempted_trajectory_ids"] = []
     report["accepted_trajectory_ids"] = []
     report["pending_candidate_trajectory_ids"] = []
+    report["rendered_candidate_trajectory_ids"] = []
+    report.pop("render_completed_at", None)
     # Manual retry is explicit, but it still honors the task-wide 40-path /
     # 120-minute allowance accumulated by automatic recovery.
     report["batches"] = []

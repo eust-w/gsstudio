@@ -44,6 +44,12 @@ from .worldrecon import get_worldrecon_commands
 
 logger = logging.getLogger(__name__)
 
+
+def _next_recovery_seed(task_config: dict, source_attempt: int) -> int:
+    """Return base_seed + attempt without compounding nested attempt seeds."""
+    base_seed = task_config.get("_recovery_base_seed", task_config.get("seed", 1024))
+    return int(base_seed) + int(source_attempt) + 1
+
 # Artifact type classification
 ARTIFACT_TYPES = {
     ".png": "image", ".jpg": "image", ".jpeg": "image", ".webp": "image",
@@ -792,8 +798,10 @@ class PipelineWorker:
             if state == "needs_regeneration":
                 if task_type != "worldgen" or input_dir is None or task_config is None:
                     return False, "Automatic recovery requires a regenerated panorama attempt"
-                base_seed = int(task_config.get("seed", 1024))
-                seed = base_seed + int(recovery.get("source_attempt", 0)) + 1
+                seed = _next_recovery_seed(
+                    task_config,
+                    int(recovery.get("source_attempt", 0)),
+                )
                 return await self._run_regenerated_source_attempt(
                     task_dir=task_dir,
                     source_scene_dir=scene_dir,
@@ -928,6 +936,9 @@ class PipelineWorker:
             begin_source_regeneration(task_dir, seed=seed, scene_relpath=scene_relpath)
 
         attempt_config = dict(task_config)
+        attempt_config["_recovery_base_seed"] = int(
+            task_config.get("_recovery_base_seed", task_config.get("seed", 1024))
+        )
         attempt_config["seed"] = seed
         commands = get_worldgen_commands(
             task_dir=task_dir,
