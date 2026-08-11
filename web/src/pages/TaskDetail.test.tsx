@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import TaskDetail, { preferredSplatArtifact } from "./TaskDetail";
+import TaskDetail, { preferredPanoramaArtifact, preferredSplatArtifact } from "./TaskDetail";
 
 const { deleteTaskMock, getTaskMock, getTaskQualityMock, retryTaskSourceMock, updateTaskMock } = vi.hoisted(() => ({
   deleteTaskMock: vi.fn().mockResolvedValue(undefined),
@@ -52,7 +52,9 @@ vi.mock("../api", () => ({
 vi.mock("../components/LogStream", () => ({ default: () => <div>Logs</div> }));
 vi.mock("../components/StageProgress", () => ({ default: () => <div>Stages</div> }));
 vi.mock("../components/StatusBadge", () => ({ default: () => <div>Status</div> }));
-vi.mock("../components/PanoViewer", () => ({ default: () => <div>Panorama</div> }));
+vi.mock("../components/PanoViewer", () => ({
+  default: ({ url }: { url: string }) => <div data-testid="panorama-viewer">{url}</div>,
+}));
 vi.mock("../components/SplatViewer", () => ({
   default: ({ url, metadataUrl, collisionMeshUrl }: { url: string; metadataUrl?: string; collisionMeshUrl?: string }) => (
     <div data-testid="splat-viewer">{[url, metadataUrl, collisionMeshUrl].filter(Boolean).join("|")}</div>
@@ -79,6 +81,38 @@ describe("TaskDetail", () => {
     };
 
     expect(preferredSplatArtifact([ply])).toEqual(ply);
+  });
+
+  it("prefers the source panorama over generated depth and normal maps", () => {
+    const artifacts = [
+      { name: "panorama_L00_A0000.png", path: "scene/gs_data/depths/panorama_L00_A0000.png", type: "image" as const, size: 100 },
+      { name: "panorama_L00_A0000.png", path: "scene/gs_data/images/panorama_L00_A0000.png", type: "image" as const, size: 200 },
+      { name: "panorama.png", path: "scene/panorama.png", type: "image" as const, size: 300 },
+    ];
+
+    expect(preferredPanoramaArtifact(artifacts)).toEqual(artifacts[2]);
+  });
+
+  it("renders the source panorama instead of the first depth artifact", async () => {
+    getTaskMock.mockResolvedValue({
+      ...taskFixture,
+      artifacts: [
+        { name: "panorama_L00_A0000.png", path: "scene/gs_data/depths/panorama_L00_A0000.png", type: "image", size: 100 },
+        { name: "panorama.png", path: "scene/panorama.png", type: "image", size: 300 },
+      ],
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes>
+          <Route path="/tasks/:taskId" element={<TaskDetail />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByTestId("panorama-viewer")).toHaveTextContent(
+      "/api/artifacts/scene/panorama.png",
+    );
   });
 
   it("starts streaming SPZ instead of an earlier PLY artifact", async () => {
