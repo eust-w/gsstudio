@@ -31,6 +31,7 @@ from .recovery import (
     desired_rescue_candidate_count,
     prepare_auto_recovery,
     promote_recovered_scene,
+    record_recovery_render_complete,
     record_rescue_skipped,
     record_transient_retry,
     restore_best_attempt_reports,
@@ -723,6 +724,10 @@ class PipelineWorker:
                 )
                 if not rendered:
                     return False, render_error
+                record_recovery_render_complete(
+                    task_dir,
+                    candidate_ids=recovery["pending_candidate_trajectory_ids"],
+                )
                 await self._stop_vllm()
                 continue
             if state == "needs_regeneration":
@@ -750,6 +755,51 @@ class PipelineWorker:
             if not candidate_ids:
                 return False, f"Automatic recovery entered unexpected state: {state}"
             write_auto_video_trajectory_candidates(task_dir, candidate_ids)
+
+            # A prior render may have stopped after writing MP4s but before
+            # captioning or before its durable checkpoint. Resume the rescue
+            # render with --skip_exist instead of sending incomplete inputs to
+            # WorldStereo and repeating the same missing-caption failure.
+            rendered_ids = set(recovery.get("rendered_candidate_trajectory_ids", []))
+            pending_rescue_ids = [
+                candidate_id
+                for candidate_id in candidate_ids
+                if candidate_id.startswith("view_recovery_")
+            ]
+            if pending_rescue_ids and not set(pending_rescue_ids).issubset(rendered_ids):
+                if render_spec is None:
+                    return False, "Pending rescue trajectories require a render command before WorldStereo"
+                render_cmd, render_env, render_cwd = render_spec
+                resume_render_cmd = [
+                    *render_cmd,
+                    "--trajectory_whitelist", str(task_dir / "video_trajectory_whitelist.json"),
+                    "--skip_exist",
+                ]
+                round_number = recovery.get("rescue_round") or 1
+                resume_render_log = log_file.parent / f"traj_render_recovery_r{round_number}.log"
+                await self._start_vllm()
+                rendered, render_error = await self._run_stage_resilient(
+                    task_dir=task_dir,
+                    stage_name="traj_render",
+                    cmd=resume_render_cmd,
+                    env=render_env,
+                    log_file=resume_render_log,
+                    cwd=render_cwd,
+                    cancel_event=cancel_event,
+                )
+                if not rendered:
+                    return False, render_error
+                record_recovery_render_complete(
+                    task_dir,
+                    candidate_ids=pending_rescue_ids,
+                )
+                await self._stop_vllm()
+                recovery = prepare_auto_recovery(
+                    task_dir,
+                    planning=planning,
+                    task_type=task_type,
+                    recovery_policy=recovery_policy,
+                )
             expected_ids = [*recovery.get("attempted_trajectory_ids", []), *candidate_ids]
             phase = recovery.get("phase") or "unknown"
             with open(log_file, "a") as log:

@@ -323,6 +323,90 @@ class TestCheckpointResume:
         ]
         assert calls[1][1] == [f"view_recovery_r1_{index}/traj0" for index in range(6)]
 
+    def test_auto_worker_rerenders_uncheckpointed_pending_rescue_before_video(self, cfg, monkeypatch):
+        """A crash after MP4 output but before captions must resume rendering."""
+        import server.pipeline.worker as worker_module
+        from server.pipeline.recovery import (
+            complete_auto_recovery_batch,
+            prepare_auto_recovery,
+            schedule_auto_recovery_batch,
+        )
+
+        cfg.MANAGE_VLLM = False
+        task_dir = cfg.task_dir("resume-pending-rescue")
+        scene_dir = task_dir / "scene"
+        logs_dir = task_dir / "logs"
+        scene_dir.mkdir(parents=True)
+        logs_dir.mkdir(parents=True)
+        planning = {
+            "trajectories": [
+                {"id": f"view{index}/traj0", "kind": "regular"}
+                for index in range(8)
+            ]
+        }
+        (task_dir / "quality_report.json").write_text(json.dumps({"planning": planning}))
+        initial = prepare_auto_recovery(
+            task_dir,
+            planning=planning,
+            task_type="worldgen_from_pano",
+            recovery_policy="auto",
+        )
+        complete_auto_recovery_batch(
+            task_dir,
+            alignment={"accepted_trajectory_ids": initial["pending_candidate_trajectory_ids"][:2]},
+            duration_seconds=1,
+        )
+        needs_rescue = prepare_auto_recovery(
+            task_dir,
+            planning=planning,
+            task_type="worldgen_from_pano",
+            recovery_policy="auto",
+        )
+        assert needs_rescue["state"] == "needs_rescue"
+        rescue_ids = [f"view_recovery_r1_{index}/traj0" for index in range(4)]
+        schedule_auto_recovery_batch(task_dir, phase="rescue_1", candidate_ids=rescue_ids)
+
+        calls: list[str] = []
+
+        async def fake_stage(*, stage_name, log_file, **_kwargs):
+            calls.append(stage_name)
+            if stage_name == "video_gen":
+                with open(log_file, "a") as log:
+                    for trajectory_id in rescue_ids:
+                        log.write(
+                            f"{trajectory_id} (2 frames): k=[0.9,1.0], b=[0.0,0.1], "
+                            "max_abs_dev=[0.01,0.02], max_rel_dev=[1.0%,10.0%]\n"
+                            f"[Alignment Rank0] [Frame {trajectory_id}/000000] [Success] "
+                            "Guidance mask ratio: 0.9200, depth percentile error ratio: 0.02000\n"
+                            f"[Alignment Rank0] [Frame {trajectory_id}/000020] [Success] "
+                            "Guidance mask ratio: 0.9100, depth percentile error ratio: 0.03000\n"
+                        )
+            return True, ""
+
+        monkeypatch.setattr(worker_module, "run_stage", fake_stage)
+        worker = PipelineWorker(cfg)
+        async def run_recovery():
+            return await worker._run_auto_high_quality_video_recovery(
+                task_dir=task_dir,
+                scene_dir=scene_dir,
+                log_file=logs_dir / "video_gen.log",
+                cmd=["worldstereo"],
+                env={},
+                cwd=task_dir,
+                cancel_event=asyncio.Event(),
+                task_type="worldgen_from_pano",
+                recovery_policy="auto",
+                render_spec=(["renderer"], {}, task_dir),
+            )
+
+        success, error = asyncio.run(run_recovery())
+
+        assert success, error
+        assert calls == ["traj_render", "video_gen"]
+        report = json.loads((task_dir / "auto_recovery.json").read_text())
+        assert set(rescue_ids).issubset(report["rendered_candidate_trajectory_ids"])
+        assert report["delivery_tier"] == "strict_3d"
+
     def test_auto_worker_uses_next_seed_for_generated_source_after_two_failed_rescue_rounds(self, cfg, monkeypatch):
         from server.pipeline.recovery import (
             complete_auto_recovery_batch,
