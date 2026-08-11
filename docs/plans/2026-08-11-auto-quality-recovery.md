@@ -115,3 +115,13 @@ v39 patch supersedes both builds by anchoring whitelist loading directly after
 argument parsing and list filtering directly before the upstream
 trajectory-count log, so execution
 order is guaranteed even when the parent contains the misplaced legacy block.
+
+### Source-attempt isolation follow-up (a800-v40)
+
+The live seed-1025 transition showed that rescue render checkpoints also need
+source-attempt scope. v40 clears rendered candidate ids when a generated or
+uploaded source attempt begins, preventing same-named rescue paths from an
+older scene being treated as ready. It also carries the original seed through
+nested attempts so automatic attempts are exactly `base_seed + 1` and
+`base_seed + 2`, never compounded from the prior attempt seed. v39 was
+preflighted but not deployed; v40 is the rollout target.

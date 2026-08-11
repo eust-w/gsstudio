@@ -12,6 +12,7 @@ from server.pipeline.recovery import (
     complete_auto_recovery_batch,
     desired_rescue_candidate_count,
     promote_recovered_scene,
+    record_recovery_render_complete,
     record_transient_retry,
     request_source_retry,
     restore_best_attempt_reports,
@@ -163,6 +164,10 @@ class TestAutoRecoveryStateMachine:
         schedule_auto_recovery_batch(tmp_path, phase="rescue_2", candidate_ids=[f"view_recovery_r2_{i}/traj0" for i in range(6)])
         complete_auto_recovery_batch(tmp_path, alignment=_alignment([]), duration_seconds=20)
         assert prepare_auto_recovery(tmp_path, planning=planning, task_type="worldgen", recovery_policy="auto")["state"] == "needs_regeneration"
+        record_recovery_render_complete(
+            tmp_path,
+            candidate_ids=["view_recovery_r1_0/traj0", "view_recovery_r2_0/traj0"],
+        )
 
         report = begin_source_regeneration(
             tmp_path,
@@ -172,6 +177,7 @@ class TestAutoRecoveryStateMachine:
 
         assert report["generated_video_trajectory_count"] == 20
         assert report["video_seconds"] == 90
+        assert report["rendered_candidate_trajectory_ids"] == []
 
 
 def _matrix(angle_degrees: float) -> list[list[float]]:
@@ -589,6 +595,7 @@ class TestManualSourceRetry:
             "accepted_trajectory_ids": ["view0/traj0"],
             "attempted_trajectory_ids": ["view0/traj0"],
             "batches": [{"phase": "rescue_2"}],
+            "rendered_candidate_trajectory_ids": ["view_recovery_r1_0/traj0"],
             "generated_video_trajectory_count": 20,
             "video_seconds": 600.0,
             "minimum_accepted_trajectories": 6,
@@ -604,6 +611,7 @@ class TestManualSourceRetry:
         assert report["accepted_trajectory_ids"] == []
         assert report["generated_video_trajectory_count"] == 20
         assert report["video_seconds"] == 600.0
+        assert report["rendered_candidate_trajectory_ids"] == []
         assert report["attempt_history"][0]["accepted_trajectory_ids"] == ["view0/traj0"]
 
     def test_uploaded_panorama_retry_never_requests_panogen(self, tmp_path):
