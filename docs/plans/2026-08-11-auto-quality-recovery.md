@@ -96,5 +96,16 @@ exist.
 Network, NCCL, connection, and timeout failures receive two infrastructure
 retries after 30 and 120 seconds. Configuration errors, missing models, invalid
 arguments, and exhausted transient retries remain real system failures. The
-deployment target is immutable `a800-v37`; because v36 was not deployed, the
-production rollback target is the currently running `a800-v34`.
+deployment target was immutable `a800-v37`; because v36 was not deployed, the
+production rollback target remained the verified `a800-v34`.
+
+### Recovery renderer follow-up (a800-v38)
+
+The first live v37 resume exposed a parent-image composition defect: v34
+already contained the renderer CLI and caption markers, so the v37 patch
+mistook the patch as complete and did not define the recovery candidate set.
+The renderer then raised `NameError: candidate_trajectory_ids` before any new
+WorldStereo inference. v38 makes every patch section independently idempotent
+and adds an exact regression fixture for partially patched parent images. v37
+remains immutable; v38 supersedes it and retains v34 as the verified rollback
+baseline.
