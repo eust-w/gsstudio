@@ -16,8 +16,11 @@ import sys
 ARGUMENT_PATTERN = re.compile(
     r'(?m)^(?P<indent>\s*)parser\.add_argument\("--target_path"[^\n]*\)\n'
 )
-TRAJECTORY_LIST_PATTERN = re.compile(
-    r'(?ms)^(?P<indent>\s*)traj_list = \(.*?^\s*.*\)\)\n'
+ARGS_PARSE_PATTERN = re.compile(
+    r'(?m)^(?P<indent>\s*)args = parser\.parse_args\(\)\n'
+)
+RANK_LOG_PATTERN = re.compile(
+    r'(?m)^(?P<indent>\s*)rank0_log\(f"Get \{len\(traj_list\)\} trajectories at all for \{scene_path\}"\)\n'
 )
 CAPTION_LIST_PATTERN = re.compile(
     r'(?m)^(?P<indent>\s*)total_render_list = glob\(f"\{scene_path\}/render_results/\*/traj\*/render\.mp4"\)\n'
@@ -27,6 +30,7 @@ CAMERA_GUARD_PATTERN = re.compile(
     r'(?P=indent)    continue\n'
 )
 ARGUMENT_SENTINEL = "# GSStudio trajectory render whitelist patch"
+LOAD_SENTINEL = "# GSStudio trajectory whitelist load patch"
 TRAJECTORY_SENTINEL = "# GSStudio trajectory list whitelist patch"
 CAPTION_SENTINEL = "# GSStudio trajectory caption whitelist patch"
 SKIP_SENTINEL = "# GSStudio trajectory render resume patch"
@@ -38,6 +42,14 @@ def _insert_after(pattern: re.Pattern[str], source: str, insertion_for_indent) -
         raise RuntimeError(f"Expected upstream marker not found: {pattern.pattern}")
     insertion = insertion_for_indent(match.group("indent"))
     return source[:match.end()] + insertion + source[match.end():]
+
+
+def _insert_before(pattern: re.Pattern[str], source: str, insertion_for_indent) -> str:
+    match = pattern.search(source)
+    if not match:
+        raise RuntimeError(f"Expected upstream marker not found: {pattern.pattern}")
+    insertion = insertion_for_indent(match.group("indent"))
+    return source[:match.start()] + insertion + source[match.start():]
 
 
 def patch(source: str) -> str:
@@ -54,24 +66,34 @@ def patch(source: str) -> str:
             ),
         )
 
-    # Patch sections are intentionally independent.  Release images inherit
-    # already-patched HY-World files from earlier immutable images, and an old
-    # parent may contain the CLI and caption markers without the list filter.
-    # In that state ``candidate_trajectory_ids`` was referenced but never
-    # defined.  Do not use the argument marker as a proxy for this section.
-    if (
-        TRAJECTORY_SENTINEL not in source
-        and "candidate_trajectory_ids = set" not in source
-    ):
+    # Patch sections are intentionally independent. Release images can inherit
+    # a legacy patch that defined candidate_trajectory_ids *after* captioning.
+    # Load it immediately after argument parsing so every rank has the value
+    # before either rendering or rank-zero caption filtering.
+    if LOAD_SENTINEL not in source:
         source = _insert_after(
-            TRAJECTORY_LIST_PATTERN,
+            ARGS_PARSE_PATTERN,
             source,
             lambda indent: (
-                f"{indent}{TRAJECTORY_SENTINEL}\n"
+                f"{indent}{LOAD_SENTINEL}\n"
+                f"{indent}candidate_trajectory_ids = set()\n"
                 f"{indent}if args.trajectory_whitelist:\n"
                 f"{indent}    with open(args.trajectory_whitelist, 'r') as whitelist_file:\n"
                 f"{indent}        whitelist = json.load(whitelist_file)\n"
                 f"{indent}    candidate_trajectory_ids = set(whitelist.get('candidate_trajectory_ids', []))\n"
+            ),
+        )
+
+    # Filter immediately before the upstream count/log marker. This anchor is
+    # stable across the four-line and future arbitrary trajectory glob lists,
+    # unlike the previous parenthesis-based expression matcher.
+    if TRAJECTORY_SENTINEL not in source:
+        source = _insert_before(
+            RANK_LOG_PATTERN,
+            source,
+            lambda indent: (
+                f"{indent}{TRAJECTORY_SENTINEL}\n"
+                f"{indent}if args.trajectory_whitelist:\n"
                 f"{indent}    traj_list = [\n"
                 f"{indent}        traj_path for traj_path in traj_list\n"
                 f"{indent}        if '/'.join(traj_path.replace('\\\\', '/').rstrip('/').split('/')[-2:]) in candidate_trajectory_ids\n"

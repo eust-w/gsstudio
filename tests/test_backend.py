@@ -791,8 +791,10 @@ class TestDeploymentContract:
             "import argparse\nimport json\n"
             "parser = argparse.ArgumentParser()\n"
             "parser.add_argument(\"--target_path\", default=None, type=str, help=\"target path\")\n"
+            "args = parser.parse_args()\n"
             "traj_list = (glob(f\"{scene_path}/render_results/view*/traj*\") +\n"
             "             glob(f\"{scene_path}/render_results/target*/traj*\"))\n"
+            "rank0_log(f\"Get {len(traj_list)} trajectories at all for {scene_path}\")\n"
             "for traj_path in traj_list:\n"
             "    if not os.path.exists(f\"{traj_path}/camera.json\"):\n"
             "        continue\n"
@@ -827,8 +829,10 @@ class TestDeploymentContract:
             "# GSStudio trajectory render whitelist patch\n"
             "parser.add_argument(\"--trajectory_whitelist\", type=str, default=None)\n"
             "parser.add_argument(\"--skip_exist\", action=\"store_true\")\n"
+            "args = parser.parse_args()\n"
             "traj_list = (glob(f\"{scene_path}/render_results/view*/traj*\") +\n"
             "             glob(f\"{scene_path}/render_results/target*/traj*\"))\n"
+            "rank0_log(f\"Get {len(traj_list)} trajectories at all for {scene_path}\")\n"
             "for traj_path in traj_list:\n"
             "    if not os.path.exists(f\"{traj_path}/camera.json\"):\n"
             "        continue\n"
@@ -838,6 +842,10 @@ class TestDeploymentContract:
             "if args.trajectory_whitelist:\n"
             "    total_render_list = [path for path in total_render_list "
             "if path in candidate_trajectory_ids]\n"
+            "if args.trajectory_whitelist:\n"
+            "    with open(args.trajectory_whitelist) as whitelist_file:\n"
+            "        whitelist = json.load(whitelist_file)\n"
+            "    candidate_trajectory_ids = set(whitelist.get('candidate_trajectory_ids', []))\n"
         )
         patch_script = Path(__file__).parents[1] / "deploy/scripts/patch_hyworld_render_filter.py"
 
@@ -845,9 +853,13 @@ class TestDeploymentContract:
         patched = upstream.read_text()
 
         assert "# GSStudio trajectory list whitelist patch" in patched
+        assert "# GSStudio trajectory whitelist load patch" in patched
         assert "candidate_trajectory_ids = set" in patched
         assert "No trajectory paths matched" in patched
-        assert patched.index("candidate_trajectory_ids = set") < patched.index("for traj_path in traj_list")
+        load_index = patched.index("# GSStudio trajectory whitelist load patch")
+        render_index = patched.index("for traj_path in traj_list")
+        caption_index = patched.index("total_render_list = [path")
+        assert load_index < render_index < caption_index
 
     def test_image_and_startup_preflight_require_rtree(self):
         dockerfile = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
@@ -876,13 +888,13 @@ class TestDeploymentContract:
         assert "patch_hyworld_render_filter.py" in dockerfile
         assert "/opt/hyworld2/hyworld2/worldgen/traj_render.py" in dockerfile
 
-    def test_gpu_rollout_manifests_target_the_immutable_v38_image(self):
+    def test_gpu_rollout_manifests_target_the_immutable_v39_image(self):
         root = Path(__file__).parents[1]
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v38" in deployment
-        assert "gsstudio:a800-v38" in build
+        assert "gsstudio:a800-v39" in deployment
+        assert "gsstudio:a800-v39" in build
         assert "gsstudio:a800-v35" not in deployment
         assert "gsstudio:a800-v35" not in build
         assert "gsstudio:a800-v22" not in deployment
@@ -946,7 +958,7 @@ class TestDeploymentContract:
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
 
         assert "FROM ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22" in source
-        assert "GSStudio a800-v38" in source
+        assert "GSStudio a800-v39" in source
 
     def test_image_patches_worldstereo_transformer_for_local_only_loading(self):
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()

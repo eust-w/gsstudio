@@ -25,7 +25,7 @@ spec:
       nodeName: <gpu-node-ip>
       containers:
         - name: prefetch
-          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v38
+          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v39
           command: ["bash", "-c"]
           args:
             - |

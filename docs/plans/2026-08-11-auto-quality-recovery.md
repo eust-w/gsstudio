@@ -106,6 +106,12 @@ already contained the renderer CLI and caption markers, so the v37 patch
 mistook the patch as complete and did not define the recovery candidate set.
 The renderer then raised `NameError: candidate_trajectory_ids` before any new
 WorldStereo inference. v38 makes every patch section independently idempotent
-and adds an exact regression fixture for partially patched parent images. v37
-remains immutable; v38 supersedes it and retains v34 as the verified rollback
-baseline.
+and adds a regression fixture for partially patched parent images. v37 remains
+immutable and v34 stays the verified rollback baseline.
+
+The v38 build was intentionally not deployed after the real upstream fixture
+showed that its legacy assignment existed but ran after captioning. The final
+v39 patch supersedes both builds by anchoring whitelist loading directly after
+argument parsing and list filtering directly before the upstream
+trajectory-count log, so execution
+order is guaranteed even when the parent contains the misplaced legacy block.
