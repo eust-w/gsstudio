@@ -6,7 +6,7 @@ Date: 2026-08-12
 
 - Production baseline: `a800-v41`
 - Released image: `a800-v45`
-- Registry digest: recorded after publication below
+- Registry digest: `sha256:ada0f45f167e97d72a37c5038fb18ba5f417607599aa8c330079961a16c66e97`
 - Scope: only the `gsstudio/gsstudio` Deployment was updated.
 - Rollback target: `a800-v44`
 
