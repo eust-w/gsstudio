@@ -20,14 +20,13 @@ from typing import Any, Iterable
 AUTO_RECOVERY_REPORT_NAME = "auto_recovery.json"
 AUTO_RECOVERY_VERSION = 2
 MINIMUM_ACCEPTED_TRAJECTORIES = 6
-MINIMUM_DEGRADED_TRAJECTORIES = 4
 INITIAL_NORMAL_CANDIDATE_COUNT = 8
 NORMAL_REFILL_CANDIDATE_COUNT = 4
 RESCUE_TARGET_ROTATIONS = {1: 25.0, 2: 12.0}
 MAX_RESCUE_CANDIDATE_COUNT = 6
-MAX_VIDEO_TRAJECTORIES = 56
-MAX_VIDEO_SECONDS = 180 * 60
-MAX_SOURCE_REGENERATIONS = 2
+MAX_VIDEO_TRAJECTORIES = 32
+MAX_VIDEO_SECONDS = 90 * 60
+MAX_SOURCE_REGENERATIONS = 1
 
 
 class AutoRecoveryError(RuntimeError):
@@ -132,6 +131,9 @@ def _new_report(task_dir: Path, planning: dict[str, Any], task_type: str) -> dic
         "source_attempts": [],
         "best_source_attempt": 0,
         "delivery_tier": None,
+        "training_mode": None,
+        "strict_accepted_count": len(legacy_accepted),
+        "guaranteed_3d": True,
         "quality_warning": None,
         "recovery_exhausted": False,
         "transient_retry_count": 0,
@@ -180,13 +182,42 @@ def _migrate_report(
     migrated.setdefault("source_attempts", [])
     migrated.setdefault("best_source_attempt", int(migrated.get("source_attempt", 0)))
     migrated.setdefault("delivery_tier", None)
+    migrated.setdefault("training_mode", None)
+    migrated.setdefault("strict_accepted_count", len(migrated["accepted_trajectory_ids"]))
+    migrated.setdefault("guaranteed_3d", True)
     migrated.setdefault("quality_warning", None)
     migrated.setdefault("recovery_exhausted", False)
     migrated.setdefault("transient_retry_count", 0)
     migrated.setdefault("terminal_reason", None)
     migrated.setdefault("created_at", _utcnow())
     migrated.setdefault("updated_at", _utcnow())
+    if migrated.get("delivery_tier") == "panorama_only":
+        accepted_count = len(migrated["accepted_trajectory_ids"])
+        migrated["delivery_tier"] = _delivery_tier(accepted_count)
+        migrated["training_mode"] = (
+            "accepted_plus_anchors" if accepted_count else "panorama_anchored"
+        )
+        migrated["strict_accepted_count"] = accepted_count
+        migrated["guaranteed_3d"] = True
+        migrated["quality_warning"] = (
+            f"Only {accepted_count} trajectories passed strict gates; 3DGS will use RGB-D anchors."
+            if accepted_count else
+            "No trajectories passed strict gates; 3DGS will use panorama/polar RGB-D anchors."
+        )
     return migrated
+
+
+def prepare_training_delivery(task_dir: Path) -> dict[str, Any]:
+    """Migrate and persist the selected tier immediately before GS training."""
+    stored = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
+    if not stored:
+        report = _new_report(task_dir, {}, "worldgen")
+        _finalize_delivery(report, exhausted=False, reason="Training requested without strict recovery")
+        return _persist(task_dir, report)
+    report = _migrate_report(stored)
+    if not report.get("delivery_tier"):
+        _finalize_delivery(report, exhausted=False, reason="Best available training inputs selected")
+    return _persist(task_dir, report)
 
 
 def _load_or_create(task_dir: Path, planning: dict[str, Any], task_type: str) -> dict[str, Any]:
@@ -235,9 +266,9 @@ def desired_rescue_candidate_count(accepted_count: int) -> int:
 def _delivery_tier(accepted_count: int) -> str:
     if accepted_count >= MINIMUM_ACCEPTED_TRAJECTORIES:
         return "strict_3d"
-    if accepted_count >= MINIMUM_DEGRADED_TRAJECTORIES:
+    if accepted_count > 0:
         return "degraded_3d"
-    return "panorama_only"
+    return "anchored_3d"
 
 
 def _best_source_snapshot(report: dict[str, Any]) -> dict[str, Any]:
@@ -277,15 +308,22 @@ def _finalize_delivery(report: dict[str, Any], *, exhausted: bool, reason: str) 
             f"Only {accepted_count} trajectories passed the strict quality gates; "
             "3D was trained from the accepted whitelist with reduced coverage."
         )
-    elif tier == "panorama_only":
+    elif tier == "anchored_3d":
         warning = (
-            f"Only {accepted_count} trajectories passed the strict quality gates; "
-            "3D training was safely skipped and panorama/video results were delivered."
+            "No trajectories passed the strict quality gates; 3DGS will be trained "
+            "from panorama/polar RGB-D anchors without consuming rejected trajectories."
         )
     report["state"] = "completed"
     report["phase"] = None
     report["rescue_round"] = None
     report["delivery_tier"] = tier
+    report["training_mode"] = {
+        "strict_3d": "accepted_trajectories",
+        "degraded_3d": "accepted_plus_anchors",
+        "anchored_3d": "panorama_anchored",
+    }[tier]
+    report["strict_accepted_count"] = accepted_count
+    report["guaranteed_3d"] = True
     report["quality_warning"] = warning
     report["recovery_exhausted"] = bool(exhausted)
     report["terminal_reason"] = reason
@@ -881,6 +919,8 @@ def auto_recovery_summary(task_dir: Path) -> dict[str, Any]:
     if not stored:
         return {"available": False, "source_generation": source_summary or None}
     report = _migrate_report(stored)
+    training_manifest = _read_object(task_dir / "training_input_manifest.json")
+    artifact_validation = _read_object(task_dir / "artifact_validation.json")
     return {
         "available": True,
         "state": report.get("state"),
@@ -896,12 +936,19 @@ def auto_recovery_summary(task_dir: Path) -> dict[str, Any]:
         "limits": report.get("limits", {}),
         "terminal_reason": report.get("terminal_reason"),
         "delivery_tier": report.get("delivery_tier"),
+        "training_mode": report.get("training_mode"),
+        "strict_accepted_count": report.get("strict_accepted_count", 0),
+        "guaranteed_3d": report.get("guaranteed_3d", True),
         "best_source_attempt": report.get("best_source_attempt"),
         "quality_warning": report.get("quality_warning"),
         "recovery_exhausted": report.get("recovery_exhausted", False),
         "transient_retry_count": report.get("transient_retry_count", 0),
         "updated_at": report.get("updated_at"),
         "source_generation": source_summary or None,
+        "anchor_view_count": training_manifest.get("anchor_view_count", 0),
+        "training_input_manifest": training_manifest or None,
+        "artifact_validation": artifact_validation or None,
+        "fallback_reason": report.get("quality_warning"),
     }
 
 
