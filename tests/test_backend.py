@@ -999,6 +999,7 @@ class TestDeploymentContract:
         assert "--trajectory_whitelist" in patched
         assert "accepted_trajectory_ids" in patched
         assert "Empty trajectory whitelist" in patched
+        assert "Anchor output resolution" in patched
 
     def test_video_filter_patch_limits_worldstereo_to_planned_candidates(self, tmp_path):
         upstream = tmp_path / "video_gen.py"
