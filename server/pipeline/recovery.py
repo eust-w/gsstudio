@@ -857,12 +857,18 @@ def auto_recovery_summary(task_dir: Path) -> dict[str, Any]:
     stored = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
     source = _read_object(task_dir / "source_generation.json")
     if stored:
+        # While recovery is running, surface the source currently being
+        # generated. Once delivery is finalized, report the source backing the
+        # selected best scene instead of the last (possibly rejected) attempt.
         source_attempt = int(stored.get("source_attempt", 0) or 0)
-        attempt_source = _read_object(
-            task_dir / "recovery_attempts" / f"attempt-{source_attempt:03d}" / "source_generation.json"
-        )
-        if attempt_source:
-            source = attempt_source
+        if stored.get("state") == "completed":
+            source_attempt = int(stored.get("best_source_attempt", source_attempt) or 0)
+        if source_attempt > 0:
+            attempt_source = _read_object(
+                task_dir / "recovery_attempts" / f"attempt-{source_attempt:03d}" / "source_generation.json"
+            )
+            if attempt_source:
+                source = attempt_source
     source_summary = {
         key: source.get(key)
         for key in (
