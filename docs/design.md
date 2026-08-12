@@ -97,8 +97,8 @@ Based on pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel. All CUDA extensions are co
 
 ## Deployment Status (verified 2026-08-11)
 
-- Image: `ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v43`
-- Digest: `sha256:ddb65575de2b234edf6192faf909d6bf4a26932c3632ca2d08c6c3aefe1e5297`
+- Image: `ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v44`
+- Digest: recorded in the prompt-only source repair experiment report after publication
 - Pod: `gsstudio` namespace, 1/1 Running, 5x A800 on node 192.168.80.136
 - Public IP URL: http://120.48.33.45 (CCE load balancer + Basic Auth)
 - TLS URL: https://geneva-ingredients-expression-located.trycloudflare.com (Cloudflare Tunnel TLS + Basic Auth)
