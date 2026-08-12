@@ -57,7 +57,7 @@ def patch(source: str) -> str:
             f"{indent}    ]\n"
             f"{indent}    rank0_log(f'[Quality] Using {{len(video_paths)}} accepted trajectory videos')\n"
             f"{indent}    if not video_paths:\n"
-            f"{indent}        raise RuntimeError('Skipping all videos is not allowed: quality whitelist matched none')\n"
+            f"{indent}        rank0_log('[Quality] Empty trajectory whitelist: using panorama/polar RGB-D anchors only')\n"
         ),
     )
     return source
