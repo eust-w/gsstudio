@@ -982,6 +982,11 @@ class TestFrontendViewerContract:
 
 
 class TestDeploymentContract:
+    def test_resumed_video_checkpoint_cannot_block_guaranteed_3d_training(self):
+        worker = (Path(__file__).parents[1] / "server/pipeline/worker.py").read_text()
+
+        assert 'enforce_alignment=stage_name != "video_gen"' in worker
+
     def test_quality_filter_patch_adds_a_trajectory_whitelist_to_upstream_gs_data(self, tmp_path):
         upstream = tmp_path / "gen_gs_data.py"
         upstream.write_text(
@@ -1134,8 +1139,8 @@ class TestDeploymentContract:
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v47" in deployment
-        assert "gsstudio:a800-v47" in build
+        assert "gsstudio:a800-v48" in deployment
+        assert "gsstudio:a800-v48" in build
         assert "gsstudio:a800-v35" not in deployment
         assert "gsstudio:a800-v35" not in build
         assert "gsstudio:a800-v22" not in deployment
