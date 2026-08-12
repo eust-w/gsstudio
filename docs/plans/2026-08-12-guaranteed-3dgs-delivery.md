@@ -31,7 +31,7 @@ additional deterministic source seed.
 4. Extend the quality API and task UI with the actual training mode, anchor
    count, validation status, and three user-visible quality labels. Completed
    tasks default to the 3D preview.
-5. Build immutable image `a800-v48`, update only the `gsstudio` Deployment, and
+5. Build immutable image `a800-v49`, update only the `gsstudio` Deployment, and
    resume task `3dc27ec897d9` from GS data preparation without regenerating its
    source, panorama, trajectories, or videos.
 
@@ -42,7 +42,11 @@ uses the next immutable release tag rather than mutating the rejected image.
 `a800-v47` then passed image/SPZ preflight but was also held back before
 deployment when the one-off resume rehearsal found that an old completed
 video checkpoint still enforced the retired 6-trajectory blocking rule. The
-v48 worker regenerates that evidence without blocking tiered training.
+v48 worker regenerates that evidence without blocking tiered training. The
+live anchored run then exposed an empty-validation-set exception after 2,000
+steps and successful artifact export. v49 makes the hard PLY/checkpoint/SPZ
+validator authoritative after any trainer exit, preventing redundant retrains
+without weakening the completed-delivery contract.
 
 ## Acceptance
 
