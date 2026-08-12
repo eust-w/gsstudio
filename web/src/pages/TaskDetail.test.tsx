@@ -114,7 +114,7 @@ describe("TaskDetail", () => {
     expect(screen.getByText("Seed").closest("p")).toHaveTextContent("1024");
   });
 
-  it("falls back to PLY when no SPZ artifact exists", () => {
+  it("falls back only to a trained Gaussian PLY when no SPZ artifact exists", () => {
     const ply = {
       name: "gaussians.ply",
       path: "output/gaussians.ply",
@@ -123,6 +123,12 @@ describe("TaskDetail", () => {
     };
 
     expect(preferredSplatArtifact([ply])).toEqual(ply);
+    expect(preferredSplatArtifact([{
+      name: "vis_mesh.ply",
+      path: "scene/navmesh/vis_mesh.ply",
+      type: "3dgs",
+      size: 1024,
+    }])).toBeUndefined();
   });
 
   it("prefers the source panorama over generated depth and normal maps", () => {
@@ -262,6 +268,7 @@ describe("TaskDetail", () => {
       artifacts: [
         { name: "panorama.png", path: "output/panorama.png", type: "image", size: 256 },
         { name: "render.mp4", path: "output/render.mp4", type: "video", size: 2048 },
+        { name: "vis_mesh.ply", path: "scene/navmesh/vis_mesh.ply", type: "3dgs", size: 1024 },
       ],
     });
     getTaskQualityMock.mockResolvedValue({
@@ -286,6 +293,7 @@ describe("TaskDetail", () => {
 
     expect(await screen.findByText("Panorama result")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Panorama" })).toHaveClass("active");
+    expect(screen.queryByRole("button", { name: "3D Model" })).not.toBeInTheDocument();
     expect(screen.queryByTestId("splat-viewer")).not.toBeInTheDocument();
     expect(screen.getByText(/3D training was safely skipped/i)).toBeInTheDocument();
   });

@@ -97,7 +97,7 @@ Based on pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel. All CUDA extensions are co
 
 ## Deployment Status (verified 2026-08-11)
 
-- Image: `ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v44`
+- Image: `ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v45`
 - Digest: recorded in the prompt-only source repair experiment report after publication
 - Pod: `gsstudio` namespace, 1/1 Running, 5x A800 on node <gpu-node-ip>
 - Public IP URL: http://<poc-public-ip> (CCE load balancer + Basic Auth)

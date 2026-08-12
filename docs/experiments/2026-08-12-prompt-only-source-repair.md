@@ -5,10 +5,10 @@ Date: 2026-08-12
 ## Release
 
 - Production baseline: `a800-v41`
-- Released image: `a800-v44`
+- Released image: `a800-v45`
 - Registry digest: recorded after publication below
 - Scope: only the `gsstudio/gsstudio` Deployment was updated.
-- Rollback target: `a800-v43`
+- Rollback target: `a800-v44`
 
 ## Automated gates
 
@@ -98,3 +98,8 @@ configured account, the original task URL and quality endpoint return the
 completed delivery tier and authenticated artifacts. The browser task page
 shows the source-generation checkpoint and opens the panorama by default
 because no SPZ was produced.
+
+Browser acceptance also verified that navigation and reconstruction mesh PLYs
+are not advertised as Gaussian previews. A panorama-only task therefore has no
+3D Model tab unless a real SPZ or trained Gaussian PLY artifact exists, avoiding
+the former unsupported-ASCII-PLY error when a user clicked a NavMesh artifact.
