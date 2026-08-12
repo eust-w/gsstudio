@@ -21,7 +21,11 @@ import StatusBadge from "../components/StatusBadge";
 const SplatViewer = lazy(() => import("../components/SplatViewer"));
 
 export function preferredSplatArtifact(artifacts: Artifact[]): Artifact | undefined {
-  return artifacts.find((artifact) => artifact.name.toLowerCase().endsWith(".spz")) ?? artifacts[0];
+  return artifacts.find((artifact) => artifact.name.toLowerCase().endsWith(".spz"))
+    ?? artifacts.find((artifact) => {
+      const name = artifact.name.toLowerCase();
+      return name.endsWith(".ply") && name.includes("gaussian");
+    });
 }
 
 export function preferredPanoramaArtifact(artifacts: Artifact[]): Artifact | undefined {
@@ -112,7 +116,9 @@ export default function TaskDetail() {
       }
       setActivePreview((current) => {
         const hasSpz = data.artifacts.some((artifact) => artifact.name.toLowerCase().endsWith(".spz"));
-        const has3d = data.artifacts.some((artifact) => artifact.type === "3dgs");
+        const has3d = Boolean(preferredSplatArtifact(
+          data.artifacts.filter((artifact) => artifact.type === "3dgs"),
+        ));
         const hasVideo = data.artifacts.some((artifact) => artifact.type === "video");
         const hasPanorama = data.artifacts.some(
           (artifact) => artifact.type === "image" && artifact.name.includes("pano"),
@@ -411,7 +417,7 @@ export default function TaskDetail() {
                 Video
               </button>
             )}
-            {splatArtifacts.length > 0 && (
+            {previewSplat && (
               <button
                 className={`preview-tab ${activePreview === "3dgs" ? "active" : ""}`}
                 onClick={() => setActivePreview("3dgs")}
