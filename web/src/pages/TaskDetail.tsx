@@ -68,7 +68,9 @@ function deliveryTierLabel(tier?: TaskQualityRecovery["delivery_tier"]): string 
     case "strict_3d":
       return "High-quality 3D";
     case "degraded_3d":
-      return "Degraded 3D";
+      return "Limited 3DGS";
+    case "anchored_3d":
+      return "Panorama-anchored 3DGS";
     case "panorama_only":
       return "Panorama result";
     default:
@@ -349,8 +351,21 @@ export default function TaskDetail() {
               )}
               <p><span className="quality-label">Current action</span> {recoveryLabel(recovery.state)}</p>
               <p><span className="quality-label">Quality gate</span> {recovery.accepted_trajectories ?? 0} of {recovery.required_trajectories ?? 6} accepted</p>
-              <p><span className="quality-label">WorldStereo budget</span> {recovery.generated_video_trajectories ?? 0} of {recovery.limits?.maximum_video_trajectories ?? 56} WorldStereo trajectories</p>
-              <p><span className="quality-label">Time budget</span> {Math.round((recovery.video_seconds ?? 0) / 60)} of {Math.round((recovery.limits?.maximum_video_seconds ?? 10800) / 60)} minutes</p>
+              <p><span className="quality-label">WorldStereo budget</span> {recovery.generated_video_trajectories ?? 0} of {recovery.limits?.maximum_video_trajectories ?? 32} WorldStereo trajectories</p>
+              <p><span className="quality-label">Time budget</span> {Math.round((recovery.video_seconds ?? 0) / 60)} of {Math.round((recovery.limits?.maximum_video_seconds ?? 5400) / 60)} minutes</p>
+              {recovery.training_mode && (
+                <p><span className="quality-label">Training input</span> {{
+                  accepted_trajectories: "Strict trajectories + panorama RGB-D",
+                  accepted_plus_anchors: "Accepted trajectories + dense panorama RGB-D",
+                  panorama_anchored: "Dense panorama RGB-D + sanitized scene point clouds",
+                }[recovery.training_mode]}</p>
+              )}
+              {typeof recovery.anchor_view_count === "number" && recovery.anchor_view_count > 0 && (
+                <p><span className="quality-label">RGB-D anchors</span> {recovery.anchor_view_count} views</p>
+              )}
+              {recovery.artifact_validation && (
+                <p><span className="quality-label">3D validation</span> SPZ decoded · {String(recovery.artifact_validation.gaussian_count ?? "validated")} Gaussians</p>
+              )}
               {typeof recovery.best_source_attempt === "number" && (
                 <p><span className="quality-label">Best source attempt</span> {recovery.best_source_attempt}</p>
               )}

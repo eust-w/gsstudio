@@ -66,7 +66,14 @@ export interface TaskQualityRecovery {
     maximum_video_seconds?: number;
     maximum_source_regenerations?: number;
   };
-  delivery_tier?: "strict_3d" | "degraded_3d" | "panorama_only" | null;
+  delivery_tier?: "strict_3d" | "degraded_3d" | "anchored_3d" | "panorama_only" | null;
+  guaranteed_3d?: boolean;
+  training_mode?: "accepted_trajectories" | "accepted_plus_anchors" | "panorama_anchored" | null;
+  strict_accepted_count?: number;
+  anchor_view_count?: number;
+  training_input_manifest?: Record<string, unknown> | null;
+  artifact_validation?: Record<string, unknown> | null;
+  fallback_reason?: string | null;
   best_source_attempt?: number;
   quality_warning?: string | null;
   recovery_exhausted?: boolean;

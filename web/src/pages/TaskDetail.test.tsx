@@ -227,7 +227,7 @@ describe("TaskDetail", () => {
     expect(screen.getByText(/8 of 40 WorldStereo trajectories/i)).toBeInTheDocument();
   });
 
-  it("shows degraded 3D delivery, best attempt, warning, and v37 budget", async () => {
+  it("shows limited 3DGS delivery, best attempt, warning, and recovery budget", async () => {
     getTaskQualityMock.mockResolvedValue({
       available: true,
       state: "completed",
@@ -241,9 +241,9 @@ describe("TaskDetail", () => {
       generated_video_trajectories: 31,
       video_seconds: 4000,
       limits: {
-        maximum_video_trajectories: 56,
-        maximum_video_seconds: 10800,
-        maximum_source_regenerations: 2,
+        maximum_video_trajectories: 32,
+        maximum_video_seconds: 5400,
+        maximum_source_regenerations: 1,
       },
     });
 
@@ -255,9 +255,9 @@ describe("TaskDetail", () => {
       </MemoryRouter>,
     );
 
-    expect(await screen.findByText("Degraded 3D")).toBeInTheDocument();
+    expect(await screen.findByText("Limited 3DGS")).toBeInTheDocument();
     expect(screen.getByText("Best source attempt").closest("p")).toHaveTextContent("1");
-    expect(screen.getByText(/31 of 56 WorldStereo trajectories/i)).toBeInTheDocument();
+    expect(screen.getByText(/31 of 32 WorldStereo trajectories/i)).toBeInTheDocument();
     expect(screen.getByText(/Only 5 trajectories passed/i)).toBeInTheDocument();
     expect(screen.getByText("Infrastructure retries").closest("p")).toHaveTextContent("2");
   });
