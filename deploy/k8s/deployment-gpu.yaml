@@ -23,7 +23,7 @@ spec:
         kubernetes.io/hostname: "192.168.80.136"
       containers:
         - name: gsstudio
-          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v47
+          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v48
           imagePullPolicy: IfNotPresent
           command: ["/app/entrypoint.sh"]
           ports:
