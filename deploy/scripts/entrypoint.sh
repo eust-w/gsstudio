@@ -34,6 +34,20 @@ echo "VGG16 offline preflight OK"
 # low-quality task.
 python -c 'import rtree; print("rtree startup preflight OK")'
 
+# Prompt-only Text to World reuses the resident HunyuanImage-3 model. Verify
+# the cached runtime exposes its image-optional generation contract without
+# loading weights or reaching the network.
+/opt/panogen/bin/python - <<'PY'
+import inspect
+import sys
+sys.path.insert(0, "/opt/hyworld2/hyworld2/panogen")
+from hunyuan_image_3.modeling_hunyuan_image_3 import HunyuanImage3ForCausalMM
+parameter = inspect.signature(HunyuanImage3ForCausalMM.generate_image).parameters["image"]
+if parameter.default is not None:
+    raise SystemExit("HunyuanImage-3 prompt-source preflight failed: image must default to None")
+print("HunyuanImage-3 prompt-source preflight OK")
+PY
+
 # HY-World's trajectory script currently resolves ZIM/GroundingDINO through
 # ~/.cache explicitly. Point that legacy path at the same persistent hub used
 # by Transformers so Pod restarts never trigger another model download.

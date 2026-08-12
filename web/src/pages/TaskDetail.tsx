@@ -72,6 +72,17 @@ function deliveryTierLabel(tier?: TaskQualityRecovery["delivery_tier"]): string 
   }
 }
 
+function sourceGenerationLabel(state?: string): string {
+  switch (state) {
+    case "generating_source": return "Generating source view from prompt";
+    case "source_ready": return "Source view ready";
+    case "expanding_panorama": return "Expanding source view into panorama";
+    case "completed": return "Source and panorama ready";
+    case "failed": return "Source generation needs attention";
+    default: return "Preparing source generation";
+  }
+}
+
 export default function TaskDetail() {
   const { taskId } = useParams<{ taskId: string }>();
   const navigate = useNavigate();
@@ -193,7 +204,7 @@ export default function TaskDetail() {
     }
     setRetryingSource(true);
     try {
-      await retryTaskSource(taskId, replacementPanorama ?? undefined);
+      await retryTaskSource(taskId, replacementPanorama ?? undefined, task.type);
       setReplacementPanorama(null);
       await fetchTask();
     } catch (e) {
@@ -275,7 +286,15 @@ export default function TaskDetail() {
       </div>
 
       {error && <div className="error-banner">{error}</div>}
-      {task.error && <div className="error-banner">Error: {task.error}</div>}
+      {task.error && (
+        <div className="error-banner task-error-summary">
+          <p>{task.error_summary || "The task could not be completed. Review the details or retry the source."}</p>
+          <details>
+            <summary>Technical details</summary>
+            <pre>{task.error}</pre>
+          </details>
+        </div>
+      )}
 
       <div className="task-detail-layout">
         <div className="task-left-panel">
@@ -295,6 +314,21 @@ export default function TaskDetail() {
               ) : (
                 <p><span className="quality-label">Trajectory gate</span> fast DMD mode (quality report still recorded)</p>
               )}
+            </section>
+          )}
+
+          {recovery?.source_generation && (
+            <section className="quality-summary source-generation-summary" aria-label="Source generation status">
+              <h3>Source generation</h3>
+              <p><span className="quality-label">Current action</span> {sourceGenerationLabel(recovery.source_generation.state)}</p>
+              <p><span className="quality-label">Mode</span> {recovery.source_generation.mode === "prompt" ? "Prompt to source view" : "Uploaded image"}</p>
+              {typeof recovery.source_generation.seed === "number" && (
+                <p><span className="quality-label">Seed</span> {recovery.source_generation.seed}</p>
+              )}
+              {typeof recovery.source_generation.source_attempt === "number" && (
+                <p><span className="quality-label">Source attempt</span> {recovery.source_generation.source_attempt}</p>
+              )}
+              {recovery.source_generation.error_summary && <p className="quality-warning">{recovery.source_generation.error_summary}</p>}
             </section>
           )}
 
@@ -324,9 +358,9 @@ export default function TaskDetail() {
               {recovery.quality_warning && <p className="quality-warning">{recovery.quality_warning}</p>}
               {canRetrySource && (
                 <div className="source-retry-controls">
-                  {task.type === "worldgen_from_pano" && (
+                  {(task.type === "worldgen_from_pano" || task.config.input_mode === "image") && (
                     <label className="form-label" htmlFor="replacement-panorama">
-                      Replacement panorama
+                      {task.type === "worldgen_from_pano" ? "Replacement panorama" : "Replacement source image"}
                       <input
                         id="replacement-panorama"
                         type="file"
@@ -338,13 +372,15 @@ export default function TaskDetail() {
                   <button
                     className="btn btn-primary"
                     onClick={handleRetrySource}
-                    disabled={retryingSource || (task.type === "worldgen_from_pano" && !replacementPanorama)}
+                    disabled={retryingSource || ((task.type === "worldgen_from_pano" || task.config.input_mode === "image") && !replacementPanorama)}
                   >
                     {retryingSource
                       ? "Queuing source retry..."
                       : task.type === "worldgen_from_pano"
                         ? "Retry with replacement panorama"
-                        : "Retry with next seed"}
+                        : task.config.input_mode === "image"
+                          ? "Retry with replacement source"
+                          : "Retry with next seed"}
                   </button>
                 </div>
               )}

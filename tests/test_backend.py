@@ -6,9 +6,11 @@ import os
 import subprocess
 import sys
 import tempfile
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 # Set mock mode before importing server modules
 os.environ["GSSTUDIO_MOCK_PIPELINE"] = "true"
@@ -22,6 +24,12 @@ from server.models import StageStatus, TaskStatus
 from server.pipeline.stage_runner import run_stage
 from server.pipeline.worldgen import get_worldgen_commands
 from server.pipeline.worker import PipelineWorker, VLLM_FREE_STAGES, _next_recovery_seed
+
+
+def png_bytes(color=(120, 80, 40)) -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", (8, 6), color).save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 @pytest.fixture
@@ -61,6 +69,15 @@ class TestDB:
         create_task(cfg.DB_PATH, name="wr1", task_type="worldrecon")
         tasks, total = list_tasks(cfg.DB_PATH, task_type="worldrecon")
         assert all(t["type"] == "worldrecon" for t in tasks)
+
+    def test_pending_tasks_are_fifo_even_when_ids_sort_differently(self, cfg):
+        first = create_task(cfg.DB_PATH, name="first", task_type="worldrecon", task_id="ffff-first")
+        second = create_task(cfg.DB_PATH, name="second", task_type="worldrecon", task_id="aaaa-second")
+
+        tasks, _ = list_tasks(cfg.DB_PATH, status="pending", limit=100)
+
+        ids = [task["id"] for task in tasks]
+        assert ids.index(first) < ids.index(second)
 
     def test_update_task(self, cfg, task_id):
         update_task(cfg.DB_PATH, task_id, status="running", progress=0.5)
@@ -135,6 +152,41 @@ class TestCheckpointResume:
         task = get_task(cfg.DB_PATH, tid)
         assert task["status"] == TaskStatus.PENDING.value
         assert task["error"] is None
+
+    def test_worker_requeues_only_prompt_tasks_failed_by_missing_input(self, cfg):
+        recoverable = create_task(
+            cfg.DB_PATH,
+            name="prompt missing input",
+            task_type="worldgen",
+            config={"prompt": "robotics office"},
+        )
+        ignored = create_task(
+            cfg.DB_PATH,
+            name="other failure",
+            task_type="worldgen",
+            config={"prompt": "robotics office"},
+        )
+        recoverable_dir = cfg.task_dir(recoverable)
+        (recoverable_dir / "logs").mkdir(parents=True)
+        (recoverable_dir / "logs" / "panogen.log").write_text("old failure")
+        update_task(
+            cfg.DB_PATH,
+            recoverable,
+            status="failed",
+            error="ValueError: Input image does not exist: /task/input/input.png",
+        )
+        update_task(cfg.DB_PATH, ignored, status="failed", error="CUDA out of memory")
+
+        worker = PipelineWorker(cfg)
+        worker._recover_prompt_only_failures()
+        worker._recover_prompt_only_failures()
+
+        recovered = get_task(cfg.DB_PATH, recoverable)
+        assert recovered["status"] == "pending"
+        assert recovered["config"]["input_mode"] == "prompt"
+        assert recovered["config"]["seed"] == 1024
+        assert (recoverable_dir / "logs" / "panogen_missing_input_attempt_000.log").read_text() == "old failure"
+        assert get_task(cfg.DB_PATH, ignored)["status"] == "failed"
 
     def test_world_expansion_releases_vllm_resources(self):
         assert "panogen" in VLLM_FREE_STAGES
@@ -818,7 +870,9 @@ class TestWorldgenCommands:
 
         _, command, _, _ = commands[0]
         assert command[0] == "/opt/panogen/bin/python"
-        assert command[command.index("--attn-impl") + 1] == "sdpa"
+        assert command[1].endswith("server/pipeline/panogen_adapter.py")
+        assert command[command.index("--input-mode") + 1] == "image"
+        assert command[command.index("--source-attempt") + 1] == "0"
 
     def test_trajectory_generation_uses_only_persisted_huggingface_cache(self, tmp_path):
         commands = get_worldgen_commands(
@@ -1040,13 +1094,13 @@ class TestDeploymentContract:
         assert "patch_hyworld_render_filter.py" in dockerfile
         assert "/opt/hyworld2/hyworld2/worldgen/traj_render.py" in dockerfile
 
-    def test_gpu_rollout_manifests_target_the_immutable_v40_image(self):
+    def test_gpu_rollout_manifests_target_the_immutable_v42_image(self):
         root = Path(__file__).parents[1]
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v41" in deployment
-        assert "gsstudio:a800-v41" in build
+        assert "gsstudio:a800-v42" in deployment
+        assert "gsstudio:a800-v42" in build
         assert "gsstudio:a800-v35" not in deployment
         assert "gsstudio:a800-v35" not in build
         assert "gsstudio:a800-v22" not in deployment
@@ -1110,7 +1164,7 @@ class TestDeploymentContract:
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
 
         assert "FROM ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22" in source
-        assert "GSStudio a800-v41" in source
+        assert "GSStudio a800-v42" in source
 
     def test_image_patches_worldstereo_transformer_for_local_only_loading(self):
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
@@ -1197,7 +1251,7 @@ class TestAPI:
                 "prompt": "form prompt wins",
                 "config": json.dumps({"prompt": "advanced prompt", "seed": "17"}),
             },
-            files={"image": ("input.png", b"image-bytes", "image/png")},
+            files={"image": ("input.png", png_bytes(), "image/png")},
         )
 
         assert resp.status_code == 201
@@ -1208,7 +1262,61 @@ class TestAPI:
             "recovery_policy": "auto",
             "seed": 17,
             "worldstereo_model_type": "worldstereo-memory",
+            "input_mode": "image",
         }
+
+    def test_prompt_only_worldgen_is_queued_without_a_fake_input_image(self, client, monkeypatch):
+        monkeypatch.setenv("HF_TOKEN", "test-token")
+
+        response = client.post("/api/tasks", data={
+            "type": "worldgen",
+            "name": "prompt-only",
+            "prompt": "  a robotics office  ",
+            "config": "{}",
+        })
+
+        assert response.status_code == 201
+        task_id = response.json()["task_id"]
+        task = client.get(f"/api/tasks/{task_id}").json()
+        assert task["config"]["input_mode"] == "prompt"
+        assert task["config"]["prompt"] == "a robotics office"
+        assert not Config().task_input_dir(task_id).joinpath("input.png").exists()
+
+    def test_worldgen_rejects_missing_prompt_and_image_without_creating_a_task(self, client, monkeypatch):
+        monkeypatch.setenv("HF_TOKEN", "test-token")
+        before = client.get("/api/tasks", params={"limit": 100}).json()["total"]
+
+        response = client.post("/api/tasks", data={"type": "worldgen", "name": "empty", "config": "{}"})
+
+        assert response.status_code == 400
+        assert client.get("/api/tasks", params={"limit": 100}).json()["total"] == before
+
+    def test_worldgen_rejects_corrupt_image_without_creating_a_task(self, client, monkeypatch):
+        monkeypatch.setenv("HF_TOKEN", "test-token")
+        before = client.get("/api/tasks", params={"limit": 100}).json()["total"]
+
+        response = client.post(
+            "/api/tasks",
+            data={"type": "worldgen", "name": "corrupt", "config": "{}"},
+            files={"image": ("broken.png", b"not-an-image", "image/png")},
+        )
+
+        assert response.status_code == 400
+        assert client.get("/api/tasks", params={"limit": 100}).json()["total"] == before
+
+    def test_worldgen_normalizes_upload_and_preserves_original(self, client, monkeypatch):
+        monkeypatch.setenv("HF_TOKEN", "test-token")
+
+        response = client.post(
+            "/api/tasks",
+            data={"type": "worldgen", "name": "uploaded", "config": "{}"},
+            files={"image": ("camera.jpg", png_bytes(), "image/jpeg")},
+        )
+
+        assert response.status_code == 201
+        input_dir = Config().task_input_dir(response.json()["task_id"])
+        assert Image.open(input_dir / "input.png").mode == "RGB"
+        assert (input_dir / "source_upload.jpg").is_file()
 
     def test_task_quality_endpoint_returns_compact_auto_recovery_state(self, client):
         from server.config import Config
@@ -1264,6 +1372,7 @@ class TestAPI:
             "recovery_exhausted": False,
             "transient_retry_count": 0,
             "updated_at": "2026-08-11T00:00:00Z",
+            "source_generation": None,
         }
 
     def test_retry_source_advances_generated_seed_without_relaxing_quality_policy(self, client, cfg):
@@ -1297,6 +1406,79 @@ class TestAPI:
         assert report["state"] == "regenerating_panorama"
         assert report["source_seed"] == 1025
         assert get_task(cfg.DB_PATH, task_id)["config"]["recovery_policy"] == "auto"
+
+    def test_image_worldgen_retry_accepts_a_replacement_source(self, client, cfg):
+        task_id = create_task(
+            cfg.DB_PATH,
+            name="image-source-retry",
+            task_type="worldgen",
+            config={"quality_preset": "high", "recovery_policy": "auto", "seed": 1024, "input_mode": "image"},
+        )
+        update_task(cfg.DB_PATH, task_id, status="failed", error="source_quality_blocked")
+        task_dir = cfg.task_dir(task_id)
+        task_dir.mkdir(parents=True)
+        (task_dir / "auto_recovery.json").write_text(json.dumps({
+            "version": 2,
+            "task_type": "worldgen",
+            "state": "quality_blocked",
+            "source_attempt": 0,
+            "attempt_history": [],
+            "source_attempts": [],
+            "accepted_trajectory_ids": [],
+            "attempted_trajectory_ids": [],
+            "pending_candidate_trajectory_ids": [],
+            "batches": [],
+            "minimum_accepted_trajectories": 6,
+            "limits": {},
+        }))
+
+        response = client.post(
+            f"/api/tasks/{task_id}/retry-source",
+            files={"image": ("replacement.jpg", png_bytes((5, 6, 7)), "image/jpeg")},
+        )
+
+        assert response.status_code == 200
+        replacement = task_dir / "recovery_attempts" / "attempt-001" / "input" / "input.png"
+        assert Image.open(replacement).mode == "RGB"
+        assert get_task(cfg.DB_PATH, task_id)["config"]["input_mode"] == "image"
+
+    def test_corrupt_replacement_image_does_not_advance_recovery_journal(self, client, cfg):
+        task_id = create_task(
+            cfg.DB_PATH,
+            name="corrupt-image-source-retry",
+            task_type="worldgen",
+            config={"quality_preset": "high", "recovery_policy": "auto", "seed": 1024, "input_mode": "image"},
+        )
+        update_task(cfg.DB_PATH, task_id, status="failed", error="source_quality_blocked")
+        task_dir = cfg.task_dir(task_id)
+        task_dir.mkdir(parents=True)
+        journal = {
+            "version": 2,
+            "task_type": "worldgen",
+            "state": "quality_blocked",
+            "source_attempt": 0,
+            "attempt_history": [],
+            "source_attempts": [],
+            "accepted_trajectory_ids": [],
+            "attempted_trajectory_ids": [],
+            "pending_candidate_trajectory_ids": [],
+            "batches": [],
+            "minimum_accepted_trajectories": 6,
+            "limits": {},
+        }
+        journal_path = task_dir / "auto_recovery.json"
+        journal_path.write_text(json.dumps(journal))
+        before = journal_path.read_bytes()
+
+        response = client.post(
+            f"/api/tasks/{task_id}/retry-source",
+            files={"image": ("broken.png", b"not-an-image", "image/png")},
+        )
+
+        assert response.status_code == 400
+        assert journal_path.read_bytes() == before
+        assert get_task(cfg.DB_PATH, task_id)["status"] == "failed"
+        assert not (task_dir / "recovery_attempts" / "attempt-001").exists()
 
     def test_completed_degraded_delivery_can_request_a_higher_quality_source(self, client, cfg):
         task_id = create_task(
@@ -1363,16 +1545,16 @@ class TestAPI:
         missing = client.post(f"/api/tasks/{task_id}/retry-source")
         response = client.post(
             f"/api/tasks/{task_id}/retry-source",
-            files={"panorama": ("replacement.png", b"replacement-panorama", "image/png")},
+            files={"panorama": ("replacement.png", png_bytes((5, 6, 7)), "image/png")},
         )
 
         assert missing.status_code == 400
         assert response.status_code == 200
         report = json.loads((task_dir / "auto_recovery.json").read_text())
         assert report["state"] == "replacing_panorama_source"
-        assert (
-            task_dir / "recovery_attempts" / "attempt-001" / "scene" / "panorama.png"
-        ).read_bytes() == b"replacement-panorama"
+        replacement = task_dir / "recovery_attempts" / "attempt-001" / "scene" / "panorama.png"
+        with Image.open(replacement) as decoded:
+            assert decoded.mode == "RGB"
 
     def test_worldgen_rejects_invalid_quality_preset(self, client, monkeypatch):
         monkeypatch.setenv("HF_TOKEN", "test-token")
@@ -1384,7 +1566,7 @@ class TestAPI:
                 "name": "bad-quality-config",
                 "config": json.dumps({"quality_preset": "ultra"}),
             },
-            files={"image": ("input.png", b"image-bytes", "image/png")},
+            files={"image": ("input.png", png_bytes(), "image/png")},
         )
 
         assert resp.status_code == 400
@@ -1433,7 +1615,7 @@ class TestAPI:
         resp = client.post(
             "/api/tasks",
             data={"type": "worldgen", "name": "cached-sam3", "config": "{}"},
-            files={"image": ("input.png", b"image-bytes", "image/png")},
+            files={"image": ("input.png", png_bytes(), "image/png")},
         )
 
         assert resp.status_code == 201

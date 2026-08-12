@@ -855,8 +855,25 @@ def active_scene_dir(task_dir: Path, fallback_scene_dir: Path) -> Path:
 def auto_recovery_summary(task_dir: Path) -> dict[str, Any]:
     """Return the compact, safe-to-poll public recovery state."""
     stored = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
+    source = _read_object(task_dir / "source_generation.json")
+    if stored:
+        source_attempt = int(stored.get("source_attempt", 0) or 0)
+        attempt_source = _read_object(
+            task_dir / "recovery_attempts" / f"attempt-{source_attempt:03d}" / "source_generation.json"
+        )
+        if attempt_source:
+            source = attempt_source
+    source_summary = {
+        key: source.get(key)
+        for key in (
+            "mode", "state", "source_attempt", "seed", "artifact_path",
+            "width", "height", "duration_seconds", "error_code",
+            "error_summary", "updated_at", "completed_at",
+        )
+        if key in source
+    }
     if not stored:
-        return {"available": False}
+        return {"available": False, "source_generation": source_summary or None}
     report = _migrate_report(stored)
     return {
         "available": True,
@@ -878,6 +895,7 @@ def auto_recovery_summary(task_dir: Path) -> dict[str, Any]:
         "recovery_exhausted": report.get("recovery_exhausted", False),
         "transient_retry_count": report.get("transient_retry_count", 0),
         "updated_at": report.get("updated_at"),
+        "source_generation": source_summary or None,
     }
 
 

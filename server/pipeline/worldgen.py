@@ -80,17 +80,25 @@ def get_worldgen_commands(
     if task_type == "worldgen":
         input_image = input_dir / config.get("input_image", "input.png")
         pano_output = scene_dir / "panorama.png"
+        source_attempt = int(config.get("_source_attempt", 0))
+        source_report = (
+            scene_dir.parent / "source_generation.json"
+            if source_attempt > 0
+            else task_dir / "source_generation.json"
+        )
         panogen_cmd = [
             config.get("panogen_python", "/opt/panogen/bin/python"),
-            str(panogen_dir / "pipeline.py"),
+            str(Path(__file__).with_name("panogen_adapter.py")),
+            "--panogen-dir", str(panogen_dir),
+            "--input-mode", str(config.get("input_mode", "image")),
             "--image", str(input_image),
             "--save", str(pano_output),
-            "--attn-impl", "sdpa",
+            "--report", str(source_report),
+            "--seed", str(int(config.get("seed", 1024))),
+            "--source-attempt", str(source_attempt),
         ]
         if config.get("prompt"):
             panogen_cmd.extend(["--prompt", config["prompt"]])
-        if config.get("seed"):
-            panogen_cmd.extend(["--seed", str(config["seed"])])
         panogen_env = {
             "CUDA_VISIBLE_DEVICES": gpu_list,
             "HF_HOME": config.get("hf_home", "/models/hf-cache"),

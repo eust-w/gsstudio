@@ -32,6 +32,9 @@ async def lifespan(app: FastAPI):
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     config.tasks_dir.mkdir(parents=True, exist_ok=True)
     init_db(config.DB_PATH)
+    removed = tasks_route.cleanup_stale_incoming(config)
+    if removed:
+        logger.info("Removed %d abandoned incoming task directories", removed)
     logger.info("Database initialized at %s", config.DB_PATH)
 
     # Initialize routers

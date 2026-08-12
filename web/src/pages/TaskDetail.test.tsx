@@ -72,6 +72,48 @@ beforeEach(() => {
 });
 
 describe("TaskDetail", () => {
+  it("shows a concise failure with expandable technical details", async () => {
+    getTaskMock.mockResolvedValue({
+      ...taskFixture,
+      status: "failed",
+      error_summary: "The source image could not be generated.",
+      error: "Traceback: very long internal stack",
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes><Route path="/tasks/:taskId" element={<TaskDetail />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("The source image could not be generated.")).toBeInTheDocument();
+    expect(screen.queryByText(/Traceback: very long internal stack/)).not.toBeVisible();
+    fireEvent.click(screen.getByText("Technical details"));
+    expect(screen.getByText(/Traceback: very long internal stack/)).toBeVisible();
+  });
+
+  it("shows prompt source generation progress", async () => {
+    getTaskQualityMock.mockResolvedValue({
+      available: true,
+      source_generation: {
+        mode: "prompt",
+        state: "expanding_panorama",
+        seed: 1024,
+        source_attempt: 0,
+        artifact_path: "input/input.png",
+      },
+    });
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes><Route path="/tasks/:taskId" element={<TaskDetail />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole("heading", { name: "Source generation" })).toBeInTheDocument();
+    expect(screen.getByText(/Expanding source view into panorama/i)).toBeInTheDocument();
+    expect(screen.getByText("Seed").closest("p")).toHaveTextContent("1024");
+  });
+
   it("falls back to PLY when no SPZ artifact exists", () => {
     const ply = {
       name: "gaussians.ply",
@@ -299,7 +341,7 @@ describe("TaskDetail", () => {
     fireEvent.change(screen.getByLabelText("Replacement panorama"), { target: { files: [panorama] } });
     fireEvent.click(screen.getByRole("button", { name: "Retry with replacement panorama" }));
 
-    await waitFor(() => expect(retryTaskSourceMock).toHaveBeenCalledWith("recon-task", panorama));
+    await waitFor(() => expect(retryTaskSourceMock).toHaveBeenCalledWith("recon-task", panorama, "worldgen_from_pano"));
   });
 
   it("defaults to 3D and exposes fullscreen for every preview type", async () => {

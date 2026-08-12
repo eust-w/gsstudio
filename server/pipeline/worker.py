@@ -147,6 +147,57 @@ class PipelineWorker:
                 status=TaskStatus.PENDING.value,
                 error=None,
             )
+        self._recover_prompt_only_failures()
+
+    def _recover_prompt_only_failures(self) -> None:
+        """Idempotently requeue the historical prompt-only missing-input bug."""
+        tasks = []
+        offset = 0
+        while True:
+            page, total = list_tasks(
+                self.config.DB_PATH,
+                status=TaskStatus.FAILED.value,
+                limit=100,
+                offset=offset,
+            )
+            tasks.extend(page)
+            offset += len(page)
+            if offset >= total or not page:
+                break
+        signature = "input image does not exist:"
+        for task in reversed(tasks):
+            if task.get("type") != "worldgen":
+                continue
+            task_dir = self.config.task_dir(task["id"])
+            marker = task_dir / ".migration_prompt_source_v1"
+            prompt = str((task.get("config") or {}).get("prompt") or "").strip()
+            if marker.exists() or not prompt or (task_dir / "input" / "input.png").is_file():
+                continue
+            if signature not in str(task.get("error") or "").lower():
+                continue
+            if (task_dir / ".stage_panogen_done").exists():
+                continue
+            stages = task.get("stages") or []
+            if any(stage.get("name") == "panogen" and stage.get("status") == "completed" for stage in stages):
+                continue
+            log = task_dir / "logs" / "panogen.log"
+            archived = task_dir / "logs" / "panogen_missing_input_attempt_000.log"
+            if log.is_file() and not archived.exists():
+                shutil.copy2(log, archived)
+            config = dict(task.get("config") or {})
+            config.update({"input_mode": "prompt", "seed": int(config.get("seed", 1024))})
+            update_task(
+                self.config.DB_PATH,
+                task["id"],
+                config=config,
+                status=TaskStatus.PENDING.value,
+                progress=0.0,
+                current_stage=None,
+                error=None,
+                error_code=None,
+                error_summary=None,
+            )
+            marker.touch()
 
     async def start(self):
         """Main worker loop: poll for pending tasks and execute serially."""
@@ -342,6 +393,12 @@ class PipelineWorker:
             "recovery_policy",
             "auto" if task_config["quality_preset"] == "high" else "off",
         )
+        if task_type == "worldgen":
+            task_config.setdefault(
+                "input_mode",
+                "image" if (input_dir / "input.png").is_file() else "prompt",
+            )
+            task_config.setdefault("seed", 1024)
 
         stage_names = get_stage_names(task_type)
         set_task_stages(self.config.DB_PATH, task_id, stage_names)
@@ -373,10 +430,21 @@ class PipelineWorker:
             # Surface structured quality evidence even for a deliberately
             # rejected task, so the user can diagnose why it did not proceed.
             artifacts = self._collect_artifacts(output_dir, scene_dir, task_dir)
+            source_report = {}
+            try:
+                source_report = json.loads((task_dir / "source_generation.json").read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+            error_code = source_report.get("error_code") or "pipeline_failed"
+            error_summary = source_report.get("error_summary")
+            if not error_summary:
+                error_summary = f"The {task.get('current_stage') or 'pipeline'} stage could not be completed."
             update_task(
                 self.config.DB_PATH, task_id,
                 status=TaskStatus.FAILED.value,
                 error=str(e),
+                error_code=error_code,
+                error_summary=error_summary,
                 artifacts=artifacts,
             )
         finally:
@@ -940,10 +1008,16 @@ class PipelineWorker:
             task_config.get("_recovery_base_seed", task_config.get("seed", 1024))
         )
         attempt_config["seed"] = seed
+        attempt_config["_source_attempt"] = source_attempt
+        staged_attempt_input = attempt_dir / "input"
+        attempt_input_dir = input_dir
+        if attempt_config.get("input_mode") == "prompt" or (staged_attempt_input / "input.png").is_file():
+            attempt_input_dir = staged_attempt_input
+            attempt_input_dir.mkdir(parents=True, exist_ok=True)
         commands = get_worldgen_commands(
             task_dir=task_dir,
             scene_dir=attempt_scene_dir,
-            input_dir=input_dir,
+            input_dir=attempt_input_dir,
             config=attempt_config,
             hyworld_repo=self.config.HYWORLD_REPO,
             vllm_host=self.config.VLLM_HOST,
@@ -1002,7 +1076,7 @@ class PipelineWorker:
             task_type="worldgen",
             recovery_policy="auto",
             render_spec=(render_cmd, render_env, render_cwd),
-            input_dir=input_dir,
+            input_dir=attempt_input_dir,
             task_config=attempt_config,
         )
         if not success:
@@ -1018,9 +1092,26 @@ class PipelineWorker:
                     regenerated_scene_dir=attempt_scene_dir,
                     canonical_scene_dir=source_scene_dir,
                 )
+                if attempt_config.get("input_mode") == "prompt":
+                    generated_source = attempt_input_dir / "input.png"
+                    canonical_source = input_dir / "input.png"
+                    canonical_source.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(generated_source, canonical_source)
+                    attempt_report = attempt_dir / "source_generation.json"
+                    if attempt_report.is_file():
+                        shutil.copy2(attempt_report, task_dir / "source_generation.json")
                 set_active_scene(task_dir, "scene")
             else:
                 restore_best_attempt_reports(task_dir, source_attempt=best_attempt)
+                if attempt_config.get("input_mode") == "prompt" and best_attempt > 0:
+                    best_dir = task_dir / "recovery_attempts" / f"attempt-{best_attempt:03d}"
+                    best_source = best_dir / "input" / "input.png"
+                    canonical_source = input_dir / "input.png"
+                    canonical_source.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(best_source, canonical_source)
+                    best_source_report = best_dir / "source_generation.json"
+                    if best_source_report.is_file():
+                        shutil.copy2(best_source_report, task_dir / "source_generation.json")
                 if best_attempt == 0:
                     set_active_scene(task_dir, "scene")
         except (AutoRecoveryError, FileNotFoundError, json.JSONDecodeError) as exc:
@@ -1168,7 +1259,10 @@ class PipelineWorker:
     def _collect_artifacts(self, output_dir: Path, scene_dir: Path, task_dir: Path | None = None) -> list[dict]:
         """Scan output and scene directories for artifacts."""
         artifacts = []
-        for search_dir in (output_dir, scene_dir):
+        search_dirs = [output_dir, scene_dir]
+        if task_dir:
+            search_dirs.append(task_dir / "input")
+        for search_dir in search_dirs:
             if not search_dir.exists():
                 continue
             for f in sorted(search_dir.rglob("*")):
@@ -1195,6 +1289,7 @@ class PipelineWorker:
                 "video_recovery.json",
                 "auto_recovery.json",
                 "source_promotion.json",
+                "source_generation.json",
             ):
                 report = task_dir / name
                 if report.is_file():

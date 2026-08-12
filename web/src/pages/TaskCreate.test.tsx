@@ -46,5 +46,6 @@ describe("TaskCreate quality configuration", () => {
     });
     expect(screen.getByText(/valid image always returns a usable result/i)).toBeInTheDocument();
     expect(screen.getByText(/3D tier depends on how many trajectories pass/i)).toBeInTheDocument();
+    expect(screen.getByText(/without an image.*generates a source view first/i)).toBeInTheDocument();
   });
 });
