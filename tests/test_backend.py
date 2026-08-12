@@ -128,31 +128,82 @@ class TestTaskStateMachine:
 
 
 class TestCheckpointResume:
+    def test_post_export_failure_accepts_valid_delivery_without_safe_retraining(self, cfg, monkeypatch, tmp_path):
+        import server.pipeline.worker as worker_module
+
+        calls = {"stage": 0, "safe": 0, "validate": 0}
+
+        async def fake_stage(**_kwargs):
+            calls["stage"] += 1
+            return False, "ZeroDivisionError: division by zero during final evaluation"
+
+        def fake_validate(*_args, **_kwargs):
+            calls["validate"] += 1
+            return {"valid": True, "gaussian_count": 845_275}
+
+        def unexpected_safe_retry(*_args, **_kwargs):
+            calls["safe"] += 1
+            raise AssertionError("a validated export must not be retrained")
+
+        monkeypatch.setattr(worker_module, "run_stage", fake_stage)
+        monkeypatch.setattr(worker_module, "validate_completed_delivery", fake_validate)
+        monkeypatch.setattr(worker_module, "prepare_safe_training_retry", unexpected_safe_retry)
+        worker = PipelineWorker(cfg)
+
+        async def run_training():
+            return await worker._run_gs_training_with_safe_fallback(
+                task_dir=tmp_path,
+                scene_dir=tmp_path / "scene",
+                task_type="worldgen",
+                stage_name="gs_training",
+                cmd=["train", "--max_steps", "2000"],
+                env={},
+                log_file=tmp_path / "training.log",
+                cwd=tmp_path,
+                cancel_event=asyncio.Event(),
+            )
+
+        success, error = asyncio.run(run_training())
+
+        assert success, error
+        assert calls == {"stage": 1, "safe": 0, "validate": 1}
+
     def test_training_oom_retries_with_frozen_means_and_no_densification(self, cfg, monkeypatch, tmp_path):
         import server.pipeline.worker as worker_module
 
         calls: list[list[str]] = []
+        validations = 0
 
         async def fake_stage(**kwargs):
             calls.append(kwargs["cmd"])
             return (False, "CUDA out of memory") if len(calls) == 1 else (True, "")
 
+        def fake_validate(*_args, **_kwargs):
+            nonlocal validations
+            validations += 1
+            if validations == 1:
+                raise worker_module.DeliveryValidationError("SPZ artifact missing after OOM")
+            return {"valid": True}
+
         monkeypatch.setattr(worker_module, "run_stage", fake_stage)
         monkeypatch.setattr(worker_module, "prepare_safe_training_retry", lambda *_args, **_kwargs: {})
-        monkeypatch.setattr(worker_module, "validate_completed_delivery", lambda *_args, **_kwargs: {"valid": True})
+        monkeypatch.setattr(worker_module, "validate_completed_delivery", fake_validate)
         worker = PipelineWorker(cfg)
 
-        success, error = asyncio.run(worker._run_gs_training_with_safe_fallback(
-            task_dir=tmp_path,
-            scene_dir=tmp_path / "scene",
-            task_type="worldgen",
-            stage_name="gs_training",
-            cmd=["train", "--max_steps", "2000"],
-            env={},
-            log_file=tmp_path / "training.log",
-            cwd=tmp_path,
-            cancel_event=asyncio.Event(),
-        ))
+        async def run_training():
+            return await worker._run_gs_training_with_safe_fallback(
+                task_dir=tmp_path,
+                scene_dir=tmp_path / "scene",
+                task_type="worldgen",
+                stage_name="gs_training",
+                cmd=["train", "--max_steps", "2000"],
+                env={},
+                log_file=tmp_path / "training.log",
+                cwd=tmp_path,
+                cancel_event=asyncio.Event(),
+            )
+
+        success, error = asyncio.run(run_training())
 
         assert success, error
         assert calls[1][calls[1].index("--means-lr") + 1] == "0"
@@ -1139,8 +1190,8 @@ class TestDeploymentContract:
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v48" in deployment
-        assert "gsstudio:a800-v48" in build
+        assert "gsstudio:a800-v49" in deployment
+        assert "gsstudio:a800-v49" in build
         assert "gsstudio:a800-v35" not in deployment
         assert "gsstudio:a800-v35" not in build
         assert "gsstudio:a800-v22" not in deployment

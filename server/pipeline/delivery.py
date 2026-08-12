@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from pathlib import Path
 import tempfile
 from typing import Any
@@ -108,13 +109,23 @@ def validate_completed_delivery(task_dir: Path, *, task_type: str) -> dict[str, 
         return {"required": False, "valid": True}
     spz_files = sorted((task_dir / "output").rglob("*.spz"))
     ply_files = sorted((task_dir / "output").rglob("*.ply"))
-    checkpoints = sorted((task_dir / "output").rglob("*.pt"))
+    checkpoints = sorted((task_dir / "output" / "ckpts").glob("ckpt_*.pt"))
     if not spz_files:
         raise DeliveryValidationError("Completed world generation requires an SPZ artifact")
     if not ply_files:
         raise DeliveryValidationError("Completed world generation requires a trained Gaussian PLY")
     if not checkpoints:
         raise DeliveryValidationError("Completed world generation requires a training checkpoint")
+    spz_step = re.search(r"point_cloud_(\d+)$", spz_files[-1].stem)
+    checkpoint_steps = {
+        match.group(1)
+        for checkpoint in checkpoints
+        if (match := re.search(r"ckpt_(\d+)_rank\d+$", checkpoint.stem))
+    }
+    if spz_step is None or spz_step.group(1) not in checkpoint_steps:
+        raise DeliveryValidationError(
+            "Completed world generation requires SPZ and checkpoint from the same training step"
+        )
     metadata = _find_viewer_metadata(task_dir)
     if metadata is None:
         raise DeliveryValidationError("Completed world generation requires parseable viewer metadata")

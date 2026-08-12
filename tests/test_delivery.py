@@ -47,6 +47,19 @@ def test_completed_worldgen_requires_validated_spz(tmp_path: Path):
         validate_completed_delivery(tmp_path, task_type="worldgen")
 
 
+def test_delivery_rejects_checkpoint_from_a_different_training_step(tmp_path: Path, monkeypatch):
+    _write_delivery_shell(tmp_path)
+    checkpoint = tmp_path / "output" / "ckpts" / "ckpt_1999_rank0.pt"
+    checkpoint.rename(checkpoint.with_name("ckpt_1500_rank0.pt"))
+    monkeypatch.setitem(sys.modules, "spz", SimpleNamespace(
+        UnpackOptions=lambda: object(),
+        load_spz=lambda *_args: _fake_cloud(alphas=np.zeros(50_000, dtype=np.float32)),
+    ))
+
+    with pytest.raises(DeliveryValidationError, match="same training step"):
+        validate_completed_delivery(tmp_path, task_type="worldgen")
+
+
 def test_non_worldgen_delivery_is_not_forced_through_worldgen_validator(tmp_path: Path):
     assert validate_completed_delivery(tmp_path, task_type="worldrecon")["required"] is False
 
@@ -54,9 +67,10 @@ def test_non_worldgen_delivery_is_not_forced_through_worldgen_validator(tmp_path
 def _write_delivery_shell(tmp_path: Path) -> None:
     output = tmp_path / "output"
     output.mkdir()
-    (output / "cloud.spz").write_bytes(b"spz")
-    (output / "cloud.ply").write_bytes(b"ply")
-    (output / "ckpt.pt").write_bytes(b"checkpoint")
+    (output / "point_cloud_1999.spz").write_bytes(b"spz")
+    (output / "point_cloud_1999.ply").write_bytes(b"ply")
+    (output / "ckpts").mkdir()
+    (output / "ckpts" / "ckpt_1999_rank0.pt").write_bytes(b"checkpoint")
     (tmp_path / "position_meta_info.json").write_text(json.dumps({
         "center_point": [0, 0, 0],
         "facing_direction": [0, 0, 1],
