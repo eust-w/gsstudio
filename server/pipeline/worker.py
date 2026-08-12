@@ -630,6 +630,11 @@ class PipelineWorker:
                             scene_dir=scene_dir,
                             log_file=logs_dir / f"{stage_name}.log",
                             quality_preset=task_config["quality_preset"],
+                            # A resumed video checkpoint still regenerates
+                            # alignment evidence, but strict trajectory count
+                            # now selects the 3D delivery tier instead of
+                            # blocking GS data preparation.
+                            enforce_alignment=stage_name != "video_gen",
                         )
                     except QualityGateError as exc:
                         update_stage(
