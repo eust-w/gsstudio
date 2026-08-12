@@ -131,6 +131,8 @@ class TestCheckpointResume:
     def test_post_export_failure_accepts_valid_delivery_without_safe_retraining(self, cfg, monkeypatch, tmp_path):
         import server.pipeline.worker as worker_module
 
+        (tmp_path / "artifact_validation.json").write_text('{"valid": false}')
+
         calls = {"stage": 0, "safe": 0, "validate": 0}
 
         async def fake_stage(**_kwargs):
@@ -139,6 +141,8 @@ class TestCheckpointResume:
 
         def fake_validate(*_args, **_kwargs):
             calls["validate"] += 1
+            if calls["validate"] == 1:
+                raise worker_module.DeliveryValidationError("SPZ artifact not exported yet")
             return {"valid": True, "gaussian_count": 845_275}
 
         def unexpected_safe_retry(*_args, **_kwargs):
@@ -166,7 +170,40 @@ class TestCheckpointResume:
         success, error = asyncio.run(run_training())
 
         assert success, error
-        assert calls == {"stage": 1, "safe": 0, "validate": 1}
+        assert calls == {"stage": 1, "safe": 0, "validate": 2}
+
+    def test_valid_existing_delivery_resumes_without_retraining(self, cfg, monkeypatch, tmp_path):
+        import server.pipeline.worker as worker_module
+
+        (tmp_path / "artifact_validation.json").write_text('{"valid": true}')
+
+        async def unexpected_stage(**_kwargs):
+            raise AssertionError("a validated 2,000-step delivery must be reused")
+
+        monkeypatch.setattr(worker_module, "run_stage", unexpected_stage)
+        monkeypatch.setattr(
+            worker_module,
+            "validate_completed_delivery",
+            lambda *_args, **_kwargs: {"valid": True, "gaussian_count": 419_723},
+        )
+        worker = PipelineWorker(cfg)
+
+        async def run_training():
+            return await worker._run_gs_training_with_safe_fallback(
+                task_dir=tmp_path,
+                scene_dir=tmp_path / "scene",
+                task_type="worldgen",
+                stage_name="gs_training",
+                cmd=["train", "--max_steps", "2000"],
+                env={},
+                log_file=tmp_path / "training.log",
+                cwd=tmp_path,
+                cancel_event=asyncio.Event(),
+            )
+
+        success, error = asyncio.run(run_training())
+
+        assert success, error
 
     def test_training_oom_retries_with_frozen_means_and_no_densification(self, cfg, monkeypatch, tmp_path):
         import server.pipeline.worker as worker_module
@@ -1190,8 +1227,8 @@ class TestDeploymentContract:
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v49" in deployment
-        assert "gsstudio:a800-v49" in build
+        assert "gsstudio:a800-v50" in deployment
+        assert "gsstudio:a800-v50" in build
         assert "gsstudio:a800-v35" not in deployment
         assert "gsstudio:a800-v35" not in build
         assert "gsstudio:a800-v22" not in deployment

@@ -301,6 +301,19 @@ class PipelineWorker:
     async def _run_gs_training_with_safe_fallback(
         self, *, task_dir: Path, scene_dir: Path, task_type: str, **kwargs
     ) -> tuple[bool, str]:
+        if (task_dir / "artifact_validation.json").is_file():
+            try:
+                validate_completed_delivery(task_dir, task_type=task_type)
+                log_file = kwargs.get("log_file")
+                if isinstance(log_file, Path):
+                    with open(log_file, "a") as log:
+                        log.write(
+                            "[Artifact Validation] Reusing an existing validated 2,000-step "
+                            "PLY/checkpoint/SPZ delivery; training will not be repeated.\n"
+                        )
+                return True, ""
+            except DeliveryValidationError:
+                pass
         success, error = await self._run_stage_resilient(task_dir=task_dir, **kwargs)
         validation_error = ""
         try:
