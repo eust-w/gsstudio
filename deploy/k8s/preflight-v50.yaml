@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gsstudio-v50-preflight
+  namespace: gsstudio
+spec:
+  nodeName: 192.168.80.136
+  enableServiceLinks: false
+  restartPolicy: Never
+  imagePullSecrets:
+    - name: gsstudio-registry
+  containers:
+    - name: preflight
+      image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v50
+      imagePullPolicy: Always
+      command: ["sh", "-lc"]
+      args:
+        - |
+          cd /app
+          python - <<'PY'
+          import asyncio
+          import json
+          from pathlib import Path
+
+          import rtree
+          import spz
+
+          from server.config import Config
+          from server.pipeline.delivery import validate_completed_delivery
+          from server.pipeline.worker import PipelineWorker
+          import server.pipeline.worker as worker_module
+
+          task_dir = Path("/data/tasks/tasks/3dc27ec897d9")
+          validation = validate_completed_delivery(task_dir, task_type="worldgen")
+          assert validation["valid"]
+          assert validation["gaussian_count"] >= 50_000
+          assert validation["checkpoint_path"].startswith("output/ckpts/ckpt_1999_")
+
+          async def forbidden_stage(**_kwargs):
+              raise AssertionError("validated 2,000-step export was retrained")
+
+          worker_module.run_stage = forbidden_stage
+
+          async def check_resume():
+              return await PipelineWorker(Config())._run_gs_training_with_safe_fallback(
+                  task_dir=task_dir,
+                  scene_dir=task_dir / "scene",
+                  task_type="worldgen",
+                  stage_name="gs_training",
+                  cmd=["false"],
+                  env={},
+                  log_file=task_dir / "logs" / "gs_training.log",
+                  cwd=task_dir,
+                  cancel_event=asyncio.Event(),
+              )
+
+          success, error = asyncio.run(check_resume())
+          assert success, error
+          print("V50_PREFLIGHT_OK", json.dumps(validation, sort_keys=True))
+          PY
+      volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: models
+          mountPath: /models
+  volumes:
+    - name: data
+      hostPath:
+        path: /home/cce/gsstudio/data
+        type: DirectoryOrCreate
+    - name: models
+      hostPath:
+        path: /home/cce/gsstudio/models
+        type: DirectoryOrCreate
