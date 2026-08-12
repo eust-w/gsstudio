@@ -84,6 +84,8 @@ class TestGsDataWhitelistPatch:
         assert "Skipping all videos is not allowed" not in patched
         assert "accepted_trajectory_ids = set" in patched
         assert "Using {len(video_paths)} accepted trajectory videos" in patched
+        assert "anchor_resolution_sources" in patched
+        assert "img_width, img_height = anchor_image.size" in patched
 
 
 class TestTrajectoryPlanValidation:

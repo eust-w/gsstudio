@@ -58,6 +58,15 @@ def patch(source: str) -> str:
             f"{indent}    rank0_log(f'[Quality] Using {{len(video_paths)}} accepted trajectory videos')\n"
             f"{indent}    if not video_paths:\n"
             f"{indent}        rank0_log('[Quality] Empty trajectory whitelist: using panorama/polar RGB-D anchors only')\n"
+            f"{indent}        anchor_resolution_sources = (\n"
+            f"{indent}            sorted(glob(f'{{pano_bank_path}}/images/*.png')) +\n"
+            f"{indent}            sorted(glob(f'{{polar_bank_path}}/images/*.png'))\n"
+            f"{indent}        )\n"
+            f"{indent}        if not anchor_resolution_sources:\n"
+            f"{indent}            raise RuntimeError('Anchored 3DGS requires panorama or polar RGB-D source views')\n"
+            f"{indent}        with Image.open(anchor_resolution_sources[0]) as anchor_image:\n"
+            f"{indent}            img_width, img_height = anchor_image.size\n"
+            f"{indent}        rank0_log(f'[Quality] Anchor output resolution: {{img_width}}x{{img_height}}')\n"
         ),
     )
     return source
