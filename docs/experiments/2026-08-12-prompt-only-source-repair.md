@@ -5,14 +5,14 @@ Date: 2026-08-12
 ## Release
 
 - Production baseline: `a800-v41`
-- Released image: `a800-v42`
-- Registry digest: `sha256:e80c0a1bf952689cc3bdaf5ad825ffdd6983b7b069bc0c632c123d78ee935c20`
+- Released image: `a800-v44`
+- Registry digest: recorded after publication below
 - Scope: only the `gsstudio/gsstudio` Deployment was updated.
-- Rollback target: `a800-v41`
+- Rollback target: `a800-v43`
 
 ## Automated gates
 
-- Backend: 131 tests passed.
+- Backend: 132 tests passed.
 - Frontend: 39 tests passed.
 - TypeScript and Vite production build passed.
 - `npm audit --audit-level=high`: zero vulnerabilities.
@@ -69,4 +69,32 @@ rollback baseline for this narrow follow-up.
 
 ## Public acceptance
 
-Pending live generation completion.
+The historical task `3dc27ec897d9` resumed in place at its original URL. Its
+seed-1024 prompt source was generated at 1024x1024 with SHA-256
+`e2d910d2ec3644b46df863b8b8c30119c39b6aec0c0d1f0029f0203787f33a7f`,
+and its panorama completed in the same model process in 820.549 seconds.
+
+The strict quality recovery then exercised its full production contract:
+
+- initial source attempt: 8 regular-first candidates plus two six-trajectory
+  conservative rescue batches;
+- isolated source attempt 1: seed 1025, a distinct 1024x1024 first view with
+  SHA-256 `515e85e30449722885ecbec9638bf8d477ec7cb4dc326f992d7c408c9c283dfe`,
+  followed by a panorama in the same process in 739.437 seconds;
+- attempt 1 also ran 8 regular-first candidates and both conservative rescue
+  batches before the atomic batch budget boundary was reached;
+- all 40 generated candidates remained below at least one unchanged strict
+  alignment threshold, so the accepted whitelist stayed empty and neither GS
+  data preparation nor 3DGS training consumed a rejected trajectory.
+
+The task finished as `completed / panorama_only`, with `gen_gs_data` and
+`gs_training` explicitly marked `skipped` and an actionable quality warning.
+This is the intended valid-input delivery fallback: it returns the generated
+first view, panorama, videos, reports, and diagnostics without fabricating a
+3D result or converting content quality into a system failure.
+
+The production task API denies unauthenticated access with HTTP 401. With the
+configured account, the original task URL and quality endpoint return the
+completed delivery tier and authenticated artifacts. The browser task page
+shows the source-generation checkpoint and opens the panorama by default
+because no SPZ was produced.

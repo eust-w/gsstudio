@@ -7,6 +7,7 @@ from pathlib import Path
 
 from server.pipeline.recovery import (
     AUTO_RECOVERY_REPORT_NAME,
+    auto_recovery_summary,
     archive_downstream_checkpoints,
     begin_source_regeneration,
     complete_auto_recovery_batch,
@@ -47,6 +48,39 @@ def _alignment(accepted: list[str]) -> dict:
 
 
 class TestAutoRecoveryStateMachine:
+    def test_completed_summary_reports_the_best_source_attempt_not_the_last_attempt(self, tmp_path):
+        (tmp_path / "source_generation.json").write_text(json.dumps({
+            "state": "completed",
+            "source_attempt": 0,
+            "seed": 1024,
+        }))
+        latest = tmp_path / "recovery_attempts" / "attempt-001"
+        latest.mkdir(parents=True)
+        (latest / "source_generation.json").write_text(json.dumps({
+            "state": "completed",
+            "source_attempt": 1,
+            "seed": 1025,
+        }))
+        (tmp_path / AUTO_RECOVERY_REPORT_NAME).write_text(json.dumps({
+            "version": 2,
+            "task_type": "worldgen",
+            "state": "completed",
+            "source_attempt": 1,
+            "best_source_attempt": 0,
+            "active_scene_relpath": "scene",
+            "accepted_trajectory_ids": [],
+            "attempted_trajectory_ids": [],
+            "pending_candidate_trajectory_ids": [],
+            "minimum_accepted_trajectories": 6,
+            "limits": {},
+        }))
+
+        summary = auto_recovery_summary(tmp_path)
+
+        assert summary["best_source_attempt"] == 0
+        assert summary["source_generation"]["source_attempt"] == 0
+        assert summary["source_generation"]["seed"] == 1024
+
     def test_starts_with_eight_regular_first_candidates(self, tmp_path):
         recovery = prepare_auto_recovery(
             tmp_path,
