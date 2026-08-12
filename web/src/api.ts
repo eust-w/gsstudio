@@ -32,6 +32,21 @@ export interface TaskDetail extends Task {
   config: Record<string, unknown>;
   artifacts: Artifact[];
   error?: string;
+  error_code?: string | null;
+  error_summary?: string | null;
+}
+
+export interface SourceGenerationStatus {
+  mode?: "image" | "prompt";
+  state?: "generating_source" | "source_ready" | "expanding_panorama" | "completed" | "failed";
+  source_attempt?: number;
+  seed?: number;
+  artifact_path?: string;
+  width?: number;
+  height?: number;
+  duration_seconds?: number;
+  error_code?: string | null;
+  error_summary?: string | null;
 }
 
 export interface TaskQualityRecovery {
@@ -58,6 +73,7 @@ export interface TaskQualityRecovery {
   transient_retry_count?: number;
   terminal_reason?: string | null;
   updated_at?: string;
+  source_generation?: SourceGenerationStatus | null;
 }
 
 export interface GpuInfo {
@@ -123,9 +139,13 @@ export async function retryTask(id: string): Promise<void> {
   if (!resp.ok) throw new Error(`Retry failed: ${resp.statusText}`);
 }
 
-export async function retryTaskSource(id: string, panorama?: File): Promise<void> {
-  const body = panorama ? new FormData() : undefined;
-  if (body && panorama) body.set("panorama", panorama);
+export async function retryTaskSource(
+  id: string,
+  source?: File,
+  taskType: Task["type"] = "worldgen_from_pano",
+): Promise<void> {
+  const body = source ? new FormData() : undefined;
+  if (body && source) body.set(taskType === "worldgen" ? "image" : "panorama", source);
   const resp = await fetch(`${API_BASE}/tasks/${id}/retry-source`, { method: "POST", body });
   if (!resp.ok) throw new Error(`Source retry failed: ${resp.statusText}`);
 }

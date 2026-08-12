@@ -165,6 +165,9 @@ export default function TaskCreate() {
               inputRef={imageInputRef}
               label="Drop an image here or click to browse"
             />
+            <p className="form-help">
+              Without an image, GSStudio generates a source view first from your prompt, then expands it into a panorama.
+            </p>
           </div>
         </>
       )}
