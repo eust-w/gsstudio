@@ -129,9 +129,24 @@ def validate_completed_delivery(task_dir: Path, *, task_type: str) -> dict[str, 
             raise DeliveryValidationError(
                 f"SPZ contains {point_count} Gaussians; at least {MINIMUM_GAUSSIANS} are required"
             )
-        arrays = (cloud.positions, cloud.colors, cloud.alphas, cloud.scales, cloud.rotations)
+        arrays = (cloud.positions, cloud.colors, cloud.scales, cloud.rotations)
         if not all(np.isfinite(values).all() for values in arrays):
             raise DeliveryValidationError("SPZ contains NaN or infinite Gaussian attributes")
+        # SPZ stores opacity as a quantized probability, while its Python
+        # decoder exposes opacity logits. Exact encoded endpoints therefore
+        # legitimately decode to -Inf/+Inf (opacity 0/1). Validate the actual
+        # opacity domain and reject NaN instead of rejecting valid endpoints.
+        alpha_logits = np.asarray(cloud.alphas, dtype=np.float64)
+        if np.isnan(alpha_logits).any():
+            raise DeliveryValidationError("SPZ contains NaN opacity values")
+        opacities = np.empty_like(alpha_logits)
+        positive = alpha_logits >= 0
+        opacities[positive] = 1.0 / (1.0 + np.exp(-alpha_logits[positive]))
+        negative_exp = np.exp(alpha_logits[~positive])
+        opacities[~positive] = negative_exp / (1.0 + negative_exp)
+        if not np.isfinite(opacities).all() or ((opacities < 0) | (opacities > 1)).any():
+            raise DeliveryValidationError("SPZ contains invalid opacity values")
+        opacity_logit_endpoint_count = int(np.isinf(alpha_logits).sum())
         positions = np.asarray(cloud.positions, dtype=np.float64).reshape(-1, 3)
         extent = positions.max(axis=0) - positions.min(axis=0)
         if not np.isfinite(extent).all() or float(np.linalg.norm(extent)) <= 1e-6:
@@ -150,6 +165,8 @@ def validate_completed_delivery(task_dir: Path, *, task_type: str) -> dict[str, 
         "metadata_path": str(metadata.relative_to(task_dir)),
         "gaussian_count": point_count,
         "finite_attributes": True,
+        "finite_opacities": True,
+        "opacity_logit_endpoint_count": opacity_logit_endpoint_count,
         "non_degenerate_bounds": True,
     }
     _write_atomic(task_dir / "artifact_validation.json", result)

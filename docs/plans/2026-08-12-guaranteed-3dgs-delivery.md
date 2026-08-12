@@ -31,9 +31,14 @@ additional deterministic source seed.
 4. Extend the quality API and task UI with the actual training mode, anchor
    count, validation status, and three user-visible quality labels. Completed
    tasks default to the 3D preview.
-5. Build immutable image `a800-v46`, update only the `gsstudio` Deployment, and
+5. Build immutable image `a800-v47`, update only the `gsstudio` Deployment, and
    resume task `3dc27ec897d9` from GS data preparation without regenerating its
    source, panorama, trajectories, or videos.
+
+`a800-v46` was rejected before deployment when its real-SPZ preflight exposed
+that the SPZ decoder represents exact opacity endpoints as infinite logits.
+The corrected validator checks decoded 0-1 opacity, retains NaN rejection, and
+uses the next immutable release tag rather than mutating the rejected image.
 
 ## Acceptance
 

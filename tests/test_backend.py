@@ -1133,8 +1133,8 @@ class TestDeploymentContract:
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v46" in deployment
-        assert "gsstudio:a800-v46" in build
+        assert "gsstudio:a800-v47" in deployment
+        assert "gsstudio:a800-v47" in build
         assert "gsstudio:a800-v35" not in deployment
         assert "gsstudio:a800-v35" not in build
         assert "gsstudio:a800-v22" not in deployment
