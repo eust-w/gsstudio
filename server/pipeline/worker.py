@@ -30,6 +30,7 @@ from .recovery import (
     create_conservative_rescue_trajectories,
     desired_rescue_candidate_count,
     prepare_auto_recovery,
+    prepare_training_delivery,
     promote_recovered_scene,
     record_recovery_render_complete,
     record_rescue_skipped,
@@ -41,6 +42,12 @@ from .recovery import (
 )
 from .worldgen import get_stage_names, get_worldgen_commands
 from .worldrecon import get_worldrecon_commands
+from .delivery import (
+    DeliveryValidationError,
+    build_training_input_manifest,
+    prepare_safe_training_retry,
+    validate_completed_delivery,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -283,6 +290,58 @@ class PipelineWorker:
         return False, "Transient retry loop exhausted"
 
     @staticmethod
+    def _replace_option(command: list[str], option: str, value: str) -> list[str]:
+        updated = list(command)
+        if option in updated:
+            updated[updated.index(option) + 1] = value
+        else:
+            updated.extend([option, value])
+        return updated
+
+    async def _run_gs_training_with_safe_fallback(
+        self, *, task_dir: Path, scene_dir: Path, task_type: str, **kwargs
+    ) -> tuple[bool, str]:
+        success, error = await self._run_stage_resilient(task_dir=task_dir, **kwargs)
+        validation_error = ""
+        if success:
+            try:
+                validate_completed_delivery(task_dir, task_type=task_type)
+                return True, ""
+            except DeliveryValidationError as exc:
+                validation_error = str(exc)
+        content_failure = validation_error or str(error)
+        lowered = content_failure.lower()
+        if not success and not any(marker in lowered for marker in (
+            "out of memory", "cuda oom", "nan", "non-finite", "diverg", "checkpoint", "spz", "gaussian"
+        )):
+            return False, error
+        try:
+            prepare_safe_training_retry(task_dir, scene_dir)
+        except DeliveryValidationError as exc:
+            return False, f"{content_failure}; safe training preparation failed: {exc}"
+        safe_command = list(kwargs["cmd"])
+        for option, value in (
+            ("--means-lr", "0"),
+            ("--strategy.refine-start-iter", "1999"),
+            ("--strategy.refine-stop-iter", "1999"),
+            ("--strategy.refine-every", "99990"),
+        ):
+            safe_command = self._replace_option(safe_command, option, value)
+        kwargs["cmd"] = safe_command
+        log_file = kwargs.get("log_file")
+        if isinstance(log_file, Path):
+            with open(log_file, "a") as log:
+                log.write(f"[Anchored Safe Training] Retrying 2,000 steps with frozen means: {content_failure}\n")
+        success, error = await self._run_stage_resilient(task_dir=task_dir, **kwargs)
+        if not success:
+            return False, error
+        try:
+            validate_completed_delivery(task_dir, task_type=task_type)
+        except DeliveryValidationError as exc:
+            return False, f"Anchored-safe training did not produce a valid delivery: {exc}"
+        return True, ""
+
+    @staticmethod
     def _missing_recovery_render_assets(
         scene_dir: Path,
         candidate_ids: list[str],
@@ -417,6 +476,9 @@ class PipelineWorker:
                 return
 
             artifacts = self._collect_artifacts(output_dir, scene_dir, task_dir)
+            if not self.config.MOCK_PIPELINE:
+                validate_completed_delivery(task_dir, task_type=task_type)
+                artifacts = self._collect_artifacts(output_dir, scene_dir, task_dir)
             update_task(
                 self.config.DB_PATH, task_id,
                 status=TaskStatus.COMPLETED.value,
@@ -535,26 +597,18 @@ class PipelineWorker:
             if cancel_event.is_set():
                 return
 
-            # Content-quality exhaustion is a completed panorama delivery, not
-            # a failed pipeline. Keep both downstream stages visibly skipped so
-            # the API never advertises a fabricated or empty 3D result.
-            if stage_name in {"gen_gs_data", "gs_training"}:
-                try:
-                    recovery_delivery = json.loads(recovery_path.read_text())
-                except (FileNotFoundError, json.JSONDecodeError):
-                    recovery_delivery = {}
-                if recovery_delivery.get("delivery_tier") == "panorama_only":
-                    update_stage(
-                        self.config.DB_PATH,
-                        task_id,
-                        stage_name,
-                        StageStatus.SKIPPED,
-                        error=str(
-                            recovery_delivery.get("quality_warning")
-                            or "3D stage skipped because fewer than four trajectories passed strict quality gates."
-                        ),
-                    )
-                    continue
+            if stage_name == "gen_gs_data" and task_type in ("worldgen", "worldgen_from_pano"):
+                recovery_delivery = prepare_training_delivery(task_dir)
+                tier = str(recovery_delivery.get("delivery_tier") or "strict_3d")
+                manifest = build_training_input_manifest(task_dir, scene_dir, tier)
+                # Low-coverage training relies more heavily on panorama and
+                # polar RGB-D anchors. These flags regenerate denser views from
+                # the source depth while rejected trajectory videos remain
+                # filtered by the unchanged whitelist.
+                if manifest["training_mode"] == "accepted_plus_anchors":
+                    cmd = [*cmd, "--regen_pano_polar", "--pano_density_mult", "3", "--polar_up_density_mult", "6"]
+                elif manifest["training_mode"] == "panorama_anchored":
+                    cmd = [*cmd, "--regen_pano_polar", "--pano_density_mult", "4", "--polar_up_density_mult", "8", "--polar_down_density_mult", "2"]
 
             # Checkpoint resume: skip completed stages
             marker = task_dir / f".stage_{stage_name}_done"
@@ -649,15 +703,23 @@ class PipelineWorker:
                 update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.FAILED, error=error)
                 raise RuntimeError(f"Stage {stage_name} failed: {error}")
 
-            success, error = await self._run_stage_resilient(
-                task_dir=task_dir,
-                stage_name=stage_name,
-                cmd=cmd,
-                env=env,
-                log_file=log_file,
-                cwd=cwd,
-                cancel_event=cancel_event,
-            )
+            stage_kwargs = {
+                "stage_name": stage_name,
+                "cmd": cmd,
+                "env": env,
+                "log_file": log_file,
+                "cwd": cwd,
+                "cancel_event": cancel_event,
+            }
+            if stage_name == "gs_training" and task_type in ("worldgen", "worldgen_from_pano"):
+                success, error = await self._run_gs_training_with_safe_fallback(
+                    task_dir=task_dir,
+                    scene_dir=scene_dir,
+                    task_type=task_type,
+                    **stage_kwargs,
+                )
+            else:
+                success, error = await self._run_stage_resilient(task_dir=task_dir, **stage_kwargs)
 
             if success:
                 try:
@@ -669,6 +731,11 @@ class PipelineWorker:
                             log_file=log_file,
                             quality_preset=task_config["quality_preset"],
                         )
+                        if stage_name == "gen_gs_data":
+                            delivery = prepare_training_delivery(task_dir)
+                            build_training_input_manifest(
+                                task_dir, scene_dir, str(delivery.get("delivery_tier") or "anchored_3d")
+                            )
                 except QualityGateError as exc:
                     update_stage(
                         self.config.DB_PATH,
@@ -1290,6 +1357,9 @@ class PipelineWorker:
                 "auto_recovery.json",
                 "source_promotion.json",
                 "source_generation.json",
+                "training_input_manifest.json",
+                "artifact_validation.json",
+                "safe_training_retry.json",
             ):
                 report = task_dir / name
                 if report.is_file():
