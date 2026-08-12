@@ -128,6 +128,36 @@ class TestTaskStateMachine:
 
 
 class TestCheckpointResume:
+    def test_training_oom_retries_with_frozen_means_and_no_densification(self, cfg, monkeypatch, tmp_path):
+        import server.pipeline.worker as worker_module
+
+        calls: list[list[str]] = []
+
+        async def fake_stage(**kwargs):
+            calls.append(kwargs["cmd"])
+            return (False, "CUDA out of memory") if len(calls) == 1 else (True, "")
+
+        monkeypatch.setattr(worker_module, "run_stage", fake_stage)
+        monkeypatch.setattr(worker_module, "prepare_safe_training_retry", lambda *_args, **_kwargs: {})
+        monkeypatch.setattr(worker_module, "validate_completed_delivery", lambda *_args, **_kwargs: {"valid": True})
+        worker = PipelineWorker(cfg)
+
+        success, error = asyncio.run(worker._run_gs_training_with_safe_fallback(
+            task_dir=tmp_path,
+            scene_dir=tmp_path / "scene",
+            task_type="worldgen",
+            stage_name="gs_training",
+            cmd=["train", "--max_steps", "2000"],
+            env={},
+            log_file=tmp_path / "training.log",
+            cwd=tmp_path,
+            cancel_event=asyncio.Event(),
+        ))
+
+        assert success, error
+        assert calls[1][calls[1].index("--means-lr") + 1] == "0"
+        assert calls[1][calls[1].index("--strategy.refine-start-iter") + 1] == "1999"
+
     def test_recovery_seeds_are_based_on_the_original_seed(self):
         assert _next_recovery_seed({"seed": 1024}, 0) == 1025
         assert _next_recovery_seed({"seed": 1025, "_recovery_base_seed": 1024}, 1) == 1026
@@ -303,6 +333,7 @@ class TestCheckpointResume:
             raise AssertionError("automatic policy must not run the legacy replenishment loop")
 
         worker = PipelineWorker(cfg)
+        monkeypatch.setattr(worker_module, "validate_completed_delivery", lambda *_args, **_kwargs: {"valid": True})
         monkeypatch.setattr(worker, "_run_auto_high_quality_video_recovery", auto_recovery)
         monkeypatch.setattr(worker, "_run_high_quality_video_recovery", legacy_recovery)
 
@@ -452,6 +483,7 @@ class TestCheckpointResume:
 
         monkeypatch.setattr(worker_module, "run_stage", fake_stage)
         worker = PipelineWorker(cfg)
+        monkeypatch.setattr(worker_module, "validate_completed_delivery", lambda *_args, **_kwargs: {"valid": True})
         async def run_recovery():
             return await worker._run_auto_high_quality_video_recovery(
                 task_dir=task_dir,
@@ -624,6 +656,7 @@ class TestCheckpointResume:
 
         monkeypatch.setattr(worker, "_run_regenerated_source_attempt", regenerate)
         monkeypatch.setattr(worker_module, "run_stage", fake_stage)
+        monkeypatch.setattr(worker_module, "validate_completed_delivery", lambda *_args, **_kwargs: {"valid": True})
 
         asyncio.run(worker.execute_task(task_id))
 
@@ -676,6 +709,7 @@ class TestCheckpointResume:
 
         monkeypatch.setattr(worker, "_run_replacement_panorama_attempt", replacement)
         monkeypatch.setattr(worker_module, "run_stage", fake_stage)
+        monkeypatch.setattr(worker_module, "validate_completed_delivery", lambda *_args, **_kwargs: {"valid": True})
 
         asyncio.run(worker.execute_task(task_id))
 
@@ -683,7 +717,7 @@ class TestCheckpointResume:
         assert called_stages == ["gen_gs_data", "gs_training"]
         assert get_task(cfg.DB_PATH, task_id)["status"] == TaskStatus.COMPLETED.value
 
-    def test_panorama_delivery_completes_with_3d_stages_explicitly_skipped(self, cfg, monkeypatch):
+    def test_legacy_panorama_delivery_is_migrated_and_runs_both_3d_stages(self, cfg, monkeypatch):
         import server.pipeline.worker as worker_module
 
         cfg.MOCK_PIPELINE = False
@@ -719,16 +753,16 @@ class TestCheckpointResume:
             return True, ""
 
         monkeypatch.setattr(worker_module, "run_stage", fake_stage)
+        monkeypatch.setattr(worker_module, "validate_completed_delivery", lambda *_args, **_kwargs: {"valid": True})
 
         asyncio.run(PipelineWorker(cfg).execute_task(task_id))
 
         task = get_task(cfg.DB_PATH, task_id)
         assert task["status"] == TaskStatus.COMPLETED.value
-        assert called_stages == []
-        assert [(stage["name"], stage["status"], stage["error"]) for stage in task["stages"]] == [
-            ("gen_gs_data", "skipped", warning),
-            ("gs_training", "skipped", warning),
-        ]
+        assert called_stages == ["gen_gs_data", "gs_training"]
+        migrated = json.loads((task_dir / "auto_recovery.json").read_text())
+        assert migrated["delivery_tier"] == "anchored_3d"
+        assert migrated["training_mode"] == "panorama_anchored"
 
     def test_worker_preserves_cancelled_terminal_status_when_a_stage_stops(self, cfg, monkeypatch):
         import server.pipeline.worker as worker_module
@@ -964,7 +998,7 @@ class TestDeploymentContract:
 
         assert "--trajectory_whitelist" in patched
         assert "accepted_trajectory_ids" in patched
-        assert "Skipping all videos is not allowed" in patched
+        assert "Empty trajectory whitelist" in patched
 
     def test_video_filter_patch_limits_worldstereo_to_planned_candidates(self, tmp_path):
         upstream = tmp_path / "video_gen.py"
@@ -1094,13 +1128,13 @@ class TestDeploymentContract:
         assert "patch_hyworld_render_filter.py" in dockerfile
         assert "/opt/hyworld2/hyworld2/worldgen/traj_render.py" in dockerfile
 
-    def test_gpu_rollout_manifests_target_the_immutable_v43_image(self):
+    def test_gpu_rollout_manifests_target_the_immutable_v46_image(self):
         root = Path(__file__).parents[1]
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v43" in deployment
-        assert "gsstudio:a800-v43" in build
+        assert "gsstudio:a800-v46" in deployment
+        assert "gsstudio:a800-v46" in build
         assert "gsstudio:a800-v35" not in deployment
         assert "gsstudio:a800-v35" not in build
         assert "gsstudio:a800-v22" not in deployment
@@ -1348,7 +1382,8 @@ class TestAPI:
         response = client.get(f"/api/tasks/{task_id}/quality")
 
         assert response.status_code == 200
-        assert response.json() == {
+        payload = response.json()
+        assert payload | {} == {
             "available": True,
             "state": "generating_rescue",
             "phase": "rescue_1",
@@ -1361,9 +1396,9 @@ class TestAPI:
             "generated_video_trajectories": 8,
             "video_seconds": 9.0,
             "limits": {
-                "maximum_video_trajectories": 56,
-                "maximum_video_seconds": 10800,
-                "maximum_source_regenerations": 2,
+                "maximum_video_trajectories": 32,
+                "maximum_video_seconds": 5400,
+                "maximum_source_regenerations": 1,
             },
             "terminal_reason": None,
             "delivery_tier": None,
@@ -1373,6 +1408,13 @@ class TestAPI:
             "transient_retry_count": 0,
             "updated_at": "2026-08-11T00:00:00Z",
             "source_generation": None,
+            "guaranteed_3d": True,
+            "training_mode": None,
+            "strict_accepted_count": 2,
+            "anchor_view_count": 0,
+            "training_input_manifest": None,
+            "artifact_validation": None,
+            "fallback_reason": None,
         }
 
     def test_retry_source_advances_generated_seed_without_relaxing_quality_policy(self, client, cfg):
