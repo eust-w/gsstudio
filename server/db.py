@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     stages TEXT DEFAULT '[]',
     artifacts TEXT DEFAULT '[]',
     error TEXT,
+    error_code TEXT,
+    error_summary TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -36,6 +38,10 @@ def init_db(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(str(db_path)) as conn:
         conn.execute(_SCHEMA)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        for name in ("error_code", "error_summary"):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} TEXT")
 
 
 def _get_conn(db_path: Path) -> sqlite3.Connection:
@@ -52,8 +58,19 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     return d
 
 
-def create_task(db_path: Path, name: str, task_type: str, config: Optional[dict] = None) -> str:
-    task_id = uuid.uuid4().hex[:12]
+def new_task_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def create_task(
+    db_path: Path,
+    name: str,
+    task_type: str,
+    config: Optional[dict] = None,
+    *,
+    task_id: Optional[str] = None,
+) -> str:
+    task_id = task_id or new_task_id()
     now = _utcnow_iso()
     with _get_conn(db_path) as conn:
         conn.execute(
@@ -89,8 +106,9 @@ def list_tasks(
         where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
         total = conn.execute(f"SELECT COUNT(*) FROM tasks {where}", params).fetchone()[0]
+        order = "ASC" if status == TaskStatus.PENDING.value else "DESC"
         rows = conn.execute(
-            f"SELECT * FROM tasks {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            f"SELECT * FROM tasks {where} ORDER BY created_at {order}, id {order} LIMIT ? OFFSET ?",
             params + [limit, offset],
         ).fetchall()
         return [_row_to_dict(r) for r in rows], total
