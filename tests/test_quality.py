@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from deploy.scripts.patch_hyworld_quality_filter import patch as patch_gs_filter
+
 from server.pipeline.quality import (
     HIGH_VIDEO_CANDIDATE_BUDGET,
     HIGH_VIDEO_RECOVERY_BATCH_SIZE,
@@ -71,6 +73,17 @@ class TestTaskQualityConfig:
     def test_rejects_unknown_quality_preset(self):
         with pytest.raises(ValueError, match="quality_preset"):
             normalize_worldgen_config({"quality_preset": "ultra"}, form_prompt=None)
+
+
+class TestGsDataWhitelistPatch:
+    def test_empty_whitelist_keeps_rgbd_anchors_and_does_not_raise(self):
+        upstream = """import json\nparser.add_argument('--result_name', default='x')\nvideo_paths = sorted(video_paths, key=lambda x: (x.split(\"/\")[-3], x.split(\"/\")[-2]))\n"""
+
+        patched = patch_gs_filter(upstream)
+
+        assert "Skipping all videos is not allowed" not in patched
+        assert "accepted_trajectory_ids = set" in patched
+        assert "Using {len(video_paths)} accepted trajectory videos" in patched
 
 
 class TestTrajectoryPlanValidation:
