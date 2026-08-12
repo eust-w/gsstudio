@@ -303,12 +303,19 @@ class PipelineWorker:
     ) -> tuple[bool, str]:
         success, error = await self._run_stage_resilient(task_dir=task_dir, **kwargs)
         validation_error = ""
-        if success:
-            try:
-                validate_completed_delivery(task_dir, task_type=task_type)
-                return True, ""
-            except DeliveryValidationError as exc:
-                validation_error = str(exc)
+        try:
+            validate_completed_delivery(task_dir, task_type=task_type)
+            if not success:
+                log_file = kwargs.get("log_file")
+                if isinstance(log_file, Path):
+                    with open(log_file, "a") as log:
+                        log.write(
+                            "[Artifact Validation] Training exited non-zero after producing "
+                            f"a valid delivery; accepting exported artifacts: {error}\n"
+                        )
+            return True, ""
+        except DeliveryValidationError as exc:
+            validation_error = str(exc)
         content_failure = validation_error or str(error)
         lowered = content_failure.lower()
         if not success and not any(marker in lowered for marker in (
@@ -333,11 +340,11 @@ class PipelineWorker:
             with open(log_file, "a") as log:
                 log.write(f"[Anchored Safe Training] Retrying 2,000 steps with frozen means: {content_failure}\n")
         success, error = await self._run_stage_resilient(task_dir=task_dir, **kwargs)
-        if not success:
-            return False, error
         try:
             validate_completed_delivery(task_dir, task_type=task_type)
         except DeliveryValidationError as exc:
+            if not success:
+                return False, error
             return False, f"Anchored-safe training did not produce a valid delivery: {exc}"
         return True, ""
 
