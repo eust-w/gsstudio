@@ -132,15 +132,35 @@ class TestTrajectoryPlanValidation:
             candidate["id"] for candidate in candidates
         ]
 
-    def test_missing_reconstruct_pairs_is_fatal(self, tmp_path):
+    def test_missing_reconstruct_pairs_is_fatal_when_segmented_targets_exist(self, tmp_path):
+        scene_dir = tmp_path / "scene"
+        _healthy_plan(scene_dir)
+        (scene_dir / "navmesh" / "reconstruct_pairs.json").unlink()
+        camera_dir = scene_dir / "camera_trajectory"
+        camera_dir.mkdir()
+        (camera_dir / "target_camera.json").write_text('[{"label": "box"}]')
+        log_file = tmp_path / "traj_generate.log"
+        log_file.write_text("planned trajectories\n")
+
+        with pytest.raises(QualityGateError, match="reconstruct_pairs.json"):
+            validate_trajectory_plan(scene_dir, log_file, quality_preset="high")
+
+    def test_missing_reconstruct_pairs_is_optional_without_segmented_targets(self, tmp_path):
         scene_dir = tmp_path / "scene"
         _healthy_plan(scene_dir)
         (scene_dir / "navmesh" / "reconstruct_pairs.json").unlink()
         log_file = tmp_path / "traj_generate.log"
         log_file.write_text("planned trajectories\n")
 
-        with pytest.raises(QualityGateError, match="reconstruct_pairs.json"):
-            validate_trajectory_plan(scene_dir, log_file, quality_preset="high")
+        report = validate_trajectory_plan(scene_dir, log_file, quality_preset="high")
+
+        planning = report["planning"]
+        assert planning["valid_trajectory_count"] == 8
+        assert planning["reconstruct_pairs_present"] is False
+        assert planning["reconstruct_pairs_required"] is False
+        assert planning["warnings"] == [
+            "reconstruct_pairs.json was not produced because no segmented reconstruction targets were available"
+        ]
 
 
 class TestAlignmentQuality:

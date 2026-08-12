@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
-# GSStudio a800-v42: atomic task input commits and single-load prompt source
-# generation, with in-place migration of the historical missing-input defect.
+# GSStudio a800-v43: v42 prompt-source delivery plus upstream-compatible
+# optional reconstruction-pair validation for scenes without segmented targets.
 # Keeping CUDA extensions and model runtimes in the v22 base makes this release
 # fast and avoids recompiling HY-World during a safety/quality-only rollout.
 FROM ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22

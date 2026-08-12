@@ -54,6 +54,19 @@ failure and reached HunyuanImage-3 text-to-image inference. Final source,
 panorama, downstream delivery tier, public artifact, and browser evidence are
 recorded below after the run completes.
 
+The source image was produced at 1216x832 and expanded to a panorama in the
+same process in 825.452 seconds. Its source SHA-256 was
+`9c0f178c06626b196434dd1fdaffcfe8d4320ce0e20152fdda5fae6b285100dd`.
+
+The subsequent planner exposed a pre-existing validation mismatch: upstream
+only writes `reconstruct_pairs.json` when segmented reconstruction targets are
+available, while GSStudio treated the file as unconditional. This scene had no
+`camera_trajectory/target_camera.json`, but it did have 15 collision-planned
+regular/exploration trajectories. The `a800-v43` follow-up keeps the file
+mandatory when segmented targets exist and records a warning otherwise; all
+trajectory-count and alignment thresholds remain unchanged. `a800-v42` is the
+rollback baseline for this narrow follow-up.
+
 ## Public acceptance
 
 Pending live generation completion.

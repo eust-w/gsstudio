@@ -142,6 +142,23 @@ def validate_trajectory_plan(
     log_text = _read_log(log_file)
     navmesh_dir = scene_dir / "navmesh"
     reconstruct_pairs = navmesh_dir / "reconstruct_pairs.json"
+    segmented_targets_path = scene_dir / "camera_trajectory" / "target_camera.json"
+    segmented_targets: list[Any] = []
+    if segmented_targets_path.is_file():
+        try:
+            loaded_targets = json.loads(segmented_targets_path.read_text())
+            if isinstance(loaded_targets, list):
+                segmented_targets = loaded_targets
+        except (json.JSONDecodeError, OSError):
+            # A malformed non-empty segmentation checkpoint means upstream was
+            # expected to construct reconstruction pairs but could not do so.
+            segmented_targets = ["invalid-segmentation-checkpoint"]
+    reconstruct_pairs_required = bool(segmented_targets)
+    planning_warnings = []
+    if not reconstruct_pairs.is_file() and not reconstruct_pairs_required:
+        planning_warnings.append(
+            "reconstruct_pairs.json was not produced because no segmented reconstruction targets were available"
+        )
     cameras = sorted((scene_dir / "render_results").glob("*/traj*/camera.json"))
     trajectories = []
     for camera in cameras:
@@ -166,6 +183,7 @@ def validate_trajectory_plan(
         "planning": {
             "navmesh_present": navmesh_dir.is_dir(),
             "reconstruct_pairs_present": reconstruct_pairs.is_file(),
+            "reconstruct_pairs_required": reconstruct_pairs_required,
             "valid_trajectory_count": len(trajectories),
             "non_regular_trajectory_count": sum(
                 count for kind, count in by_kind.items() if kind != "regular"
@@ -174,6 +192,7 @@ def validate_trajectory_plan(
             "trajectories": trajectories,
             "collision_dropped_count": _collision_drops(log_text),
             "log_errors": planning_errors,
+            "warnings": planning_warnings,
         },
     }
 
@@ -181,7 +200,7 @@ def validate_trajectory_plan(
         raise QualityGateError(
             "Navmesh Error or trajectory-planning error was found in the stage log", report
         )
-    if not reconstruct_pairs.is_file():
+    if reconstruct_pairs_required and not reconstruct_pairs.is_file():
         raise QualityGateError("Missing required NavMesh output: reconstruct_pairs.json", report)
     if quality_preset == "high":
         if len(trajectories) < QUALITY_PRESETS["high"]["minimum_trajectories"]:
