@@ -72,6 +72,10 @@ class TestAutoRecoveryStateMachine:
             "attempted_trajectory_ids": [],
             "pending_candidate_trajectory_ids": [],
             "minimum_accepted_trajectories": 6,
+            "delivery_tier": "anchored_3d",
+            "training_mode": "panorama_anchored",
+            "strict_accepted_count": 0,
+            "guaranteed_3d": True,
             "limits": {},
         }))
 
@@ -80,6 +84,9 @@ class TestAutoRecoveryStateMachine:
         assert summary["best_source_attempt"] == 0
         assert summary["source_generation"]["source_attempt"] == 0
         assert summary["source_generation"]["seed"] == 1024
+        assert summary["guaranteed_3d"] is True
+        assert summary["training_mode"] == "panorama_anchored"
+        assert summary["strict_accepted_count"] == 0
 
     def test_starts_with_eight_regular_first_candidates(self, tmp_path):
         recovery = prepare_auto_recovery(
@@ -163,7 +170,7 @@ class TestAutoRecoveryStateMachine:
         assert resumed["pending_candidate_trajectory_ids"] == first["pending_candidate_trajectory_ids"]
         assert resumed["attempted_trajectory_ids"] == []
 
-    def test_uploaded_panorama_finishes_with_panorama_delivery_after_two_rescue_rounds(self, tmp_path):
+    def test_uploaded_panorama_finishes_with_anchored_3d_after_two_rescue_rounds(self, tmp_path):
         initial = prepare_auto_recovery(
             tmp_path,
             planning=_planning(),
@@ -183,9 +190,11 @@ class TestAutoRecoveryStateMachine:
         assert rescue_one["rescue_round"] == 1
         assert rescue_two["rescue_round"] == 2
         assert completed["state"] == "completed"
-        assert completed["delivery_tier"] == "panorama_only"
+        assert completed["delivery_tier"] == "anchored_3d"
+        assert completed["training_mode"] == "panorama_anchored"
+        assert completed["guaranteed_3d"] is True
         assert completed["recovery_exhausted"] is True
-        assert "3D" in completed["quality_warning"]
+        assert "RGB-D" in completed["quality_warning"]
 
     def test_regenerated_source_keeps_the_task_wide_video_budget(self, tmp_path):
         planning = _planning()
@@ -406,10 +415,19 @@ class TestDeliveryTiersAndMigration:
         assert result["delivery_tier"] == "degraded_3d"
         assert result["quality_warning"]
 
-    def test_three_or_fewer_passed_delivers_panorama_only(self, tmp_path):
+    def test_one_to_three_passed_delivers_degraded_3d(self, tmp_path):
         result = self._exhausted_report(tmp_path, [f"view{i}/traj0" for i in range(3)])
         assert result["state"] == "completed"
-        assert result["delivery_tier"] == "panorama_only"
+        assert result["delivery_tier"] == "degraded_3d"
+        assert result["training_mode"] == "accepted_plus_anchors"
+
+    def test_zero_passed_delivers_panorama_anchored_3d(self, tmp_path):
+        result = self._exhausted_report(tmp_path, [])
+        assert result["state"] == "completed"
+        assert result["delivery_tier"] == "anchored_3d"
+        assert result["training_mode"] == "panorama_anchored"
+        assert result["strict_accepted_count"] == 0
+        assert result["guaranteed_3d"] is True
 
     def test_migrates_v1_journal_without_repeating_completed_work(self, tmp_path):
         attempted = [f"view{i}/traj0" for i in range(12)]
@@ -454,9 +472,9 @@ class TestDeliveryTiersAndMigration:
         assert result["attempted_trajectory_ids"] == attempted
         assert result["accepted_trajectory_ids"] == accepted
         assert result["limits"] == {
-            "maximum_video_trajectories": 56,
-            "maximum_video_seconds": 180 * 60,
-            "maximum_source_regenerations": 2,
+            "maximum_video_trajectories": 32,
+            "maximum_video_seconds": 90 * 60,
+            "maximum_source_regenerations": 1,
         }
 
     def test_transient_retry_is_persisted_without_resetting_recovery_progress(self, tmp_path):
