@@ -1,0 +1,225 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gsstudio-v58-preflight
+  namespace: gsstudio
+spec:
+  nodeName: 192.168.80.136
+  enableServiceLinks: false
+  restartPolicy: Never
+  imagePullSecrets:
+    - name: gsstudio-registry
+  containers:
+    - name: preflight
+      image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v58
+      imagePullPolicy: Always
+      command: ["sh", "-lc"]
+      args:
+        - |
+          cd /app
+          python - <<'PY'
+          import inspect
+          import json
+          from pathlib import Path
+          import shutil
+          import tempfile
+
+          import cv2
+          import numpy
+          import plyfile
+          import rtree
+          import torch
+          import torchmetrics
+          import trimesh
+
+          assert Path("/models/torch-cache/hub/checkpoints/vgg16-397923af.pth").is_file()
+
+          from server.pipeline.delivery import (
+              DeliveryValidationError,
+              build_training_input_manifest,
+              validate_completed_delivery,
+          )
+          from server.pipeline.navigation_stress import (
+              MICRO_TRANSLATION_PAIRS,
+              NAVIGATION_STEPS,
+              REPRESENTATIVE_VIEWS,
+              validate_stress_measurements,
+          )
+          from server.pipeline.panogen_adapter import (
+              DEFAULT_SOURCE_CANDIDATE_COUNT,
+              DEFAULT_SOURCE_IMAGE_HEIGHT,
+              DEFAULT_SOURCE_IMAGE_WIDTH,
+              generate_source_pool,
+          )
+          from server.pipeline.pilot import validate_pilot_output
+          from server.pipeline.preflight import (
+              CONTRACT_VERSION,
+              CV_WEIGHT,
+              InputPreflightError,
+              MAXIMUM_SOURCE_ATTEMPTS,
+              MAXIMUM_TASK_SECONDS,
+              MAXIMUM_WORLDSTEREO_TRAJECTORIES,
+              MINIMUM_MULTIVIEW_FRAMES,
+              VLM_WEIGHT,
+              normalize_task_contract,
+              run_multiview_preflight,
+          )
+          from server.pipeline.recovery import (
+              AUTO_RECOVERY_VERSION,
+              MAX_SOURCE_REGENERATIONS,
+              MAX_TRAJECTORIES_PER_SOURCE,
+              TARGET_ACCEPTED_TRAJECTORIES,
+          )
+          from server.pipeline.worker import PipelineWorker
+          from server.pipeline.worldgen import get_worldgen_commands
+
+          assert CONTRACT_VERSION == AUTO_RECOVERY_VERSION == 4
+          assert (DEFAULT_SOURCE_IMAGE_WIDTH, DEFAULT_SOURCE_IMAGE_HEIGHT) == (1216, 832)
+          assert DEFAULT_SOURCE_CANDIDATE_COUNT == 4
+          assert (CV_WEIGHT, VLM_WEIGHT) == (0.55, 0.45)
+          assert MINIMUM_MULTIVIEW_FRAMES == 12
+          assert TARGET_ACCEPTED_TRAJECTORIES == 10
+          assert MAXIMUM_WORLDSTEREO_TRAJECTORIES == 24
+          assert MAXIMUM_TASK_SECONDS == 4 * 60 * 60
+          assert MAXIMUM_SOURCE_ATTEMPTS == MAX_SOURCE_REGENERATIONS + 1 == 3
+          assert MAX_TRAJECTORIES_PER_SOURCE == 16
+
+          contract = normalize_task_contract({
+              "success_policy": "fast",
+              "maximum_worldstereo_trajectories": 999,
+              "maximum_task_seconds": 1,
+              "pilot_steps": 1,
+              "training_steps": 1,
+          }, "worldgen")
+          assert contract["success_policy"] == "strict_free_view"
+          assert contract["maximum_worldstereo_trajectories"] == 24
+          assert contract["maximum_task_seconds"] == 4 * 60 * 60
+          assert contract["pilot_steps"] == 500
+          assert contract["training_steps"] == 2000
+
+          generator_source = inspect.getsource(generate_source_pool)
+          assert "base_seed + index" in generator_source
+          assert "image_size=(source_height, source_width)" in generator_source
+          pilot_source = inspect.getsource(PipelineWorker._run_gs_pilot_with_content_recovery)
+          assert "request_pilot_content_recovery" in pilot_source
+          source_resume = inspect.getsource(PipelineWorker._run_regenerated_source_attempt)
+          assert "adopted_v57_source" in source_resume
+          assert "recovery_attempt_{source_attempt:03d}_input_preflight.log" in source_resume
+          commands_source = inspect.getsource(get_worldgen_commands)
+          assert '"gs_pilot"' in commands_source
+          assert '"navigation_stress"' in commands_source
+          commands = {
+              name: command for name, command, _environment, _cwd in get_worldgen_commands(
+                  task_dir=Path("/tmp/task"),
+                  input_dir=Path("/tmp/task/input"),
+                  scene_dir=Path("/tmp/task/scene"),
+                  config={},
+                  hyworld_repo=Path("/opt/hyworld2"),
+                  vllm_host="127.0.0.1",
+                  vllm_port=8100,
+                  vllm_model="Qwen/Qwen3-VL-8B-Instruct",
+                  task_type="worldgen",
+              )
+          }
+          assert "--ckpt" not in " ".join(commands["gs_training"])
+
+          # Replay the known eight-frame historical input in an isolated temp
+          # directory. The count gate must fail before VLM or GPU work.
+          tasks_root = Path("/data/tasks/tasks")
+          historical = None
+          for candidate in sorted(tasks_root.iterdir()):
+              files = sorted(
+                  path for path in (candidate / "input").glob("*")
+                  if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+              )
+              if len(files) == 8:
+                  historical = files
+                  break
+          assert historical is not None, "expected an eight-frame historical Worldrecon input"
+          with tempfile.TemporaryDirectory(prefix="gsstudio-v58-eight-") as temporary:
+              replay_task = Path(temporary)
+              replay_input = replay_task / "input"
+              replay_input.mkdir()
+              for index, source in enumerate(historical):
+                  shutil.copy2(source, replay_input / f"image_{index:04d}{source.suffix}")
+              try:
+                  run_multiview_preflight(
+                      replay_task, replay_input, host="127.0.0.1", port=1, model="unused",
+                  )
+              except InputPreflightError as exc:
+                  assert "at least 12" in str(exc)
+              else:
+                  raise AssertionError("eight-frame historical input unexpectedly passed")
+              report = json.loads((replay_task / "input_preflight.json").read_text())
+              assert report["candidate_frame_count"] == 8
+              assert report["state"] == "failed"
+
+          strict_task = tasks_root / "435d4b33616e"
+          build_training_input_manifest(strict_task, strict_task / "scene", "strict_3d")
+          strict_validation = validate_completed_delivery(strict_task, task_type="worldgen")
+          assert strict_validation["valid"]
+          assert strict_validation["free_view_eligible"] is True
+          nav = strict_validation["navigation_validation"]
+          assert nav["accepted_trajectory_count"] >= 6
+          assert nav["unique_translated_camera_centers"] >= 12
+          assert nav["azimuth_bin_count"] >= 6
+          # The validated camera centers constitute the 12+ view technical
+          # replay; this proves translation/coverage instead of duplicating RGB.
+          cameras = json.loads((strict_task / "scene" / "gs_data" / "cameras.json").read_text())
+          accepted = set(json.loads((strict_task / "alignment_quality.json").read_text())["accepted_trajectory_ids"])
+          replay_views = [
+              value["extrinsic"] for key, value in cameras.items()
+              if any(key.startswith(item.replace("/", "-") + "_") for item in accepted)
+              and value.get("source_type") not in {"panorama", "polar_up", "polar_down"}
+          ]
+          assert len(replay_views) >= 12
+
+          blocked_task = tasks_root / "3dc27ec897d9"
+          try:
+              validate_completed_delivery(blocked_task, task_type="worldgen")
+          except DeliveryValidationError:
+              pass
+          else:
+              raise AssertionError("non-strict historical task unexpectedly passed")
+
+          good_walk = {
+              "completed_steps": NAVIGATION_STEPS,
+              "accepted_steps": NAVIGATION_STEPS,
+              "all_camera_positions_finite": True,
+              "height_preserved": True,
+              "final_position_inside_bounds": True,
+              "collision_mesh_checked": True,
+          }
+          good_views = [{
+              "finite_pixels": True,
+              "giant_gaussian_count": 0,
+              "transparent_ratio": 0.1,
+              "black_white_clip_ratio": 0.1,
+          } for _ in range(REPRESENTATIVE_VIEWS)]
+          good_pairs = [{"lpips": 0.1, "brightness_delta": 0.05}
+                        for _ in range(MICRO_TRANSLATION_PAIRS)]
+          assert validate_stress_measurements(good_walk, good_views, good_pairs) == []
+
+          assert "MINIMUM_PILOT_RENDERS" in inspect.getsource(validate_pilot_output)
+          print("V58_PREFLIGHT_OK", json.dumps({
+              "contract_version": CONTRACT_VERSION,
+              "historical_eight_frame_rejected": True,
+              "strict_task": "435d4b33616e",
+              "technical_replay_views": len(replay_views),
+              "blocked_task": "3dc27ec897d9",
+          }, sort_keys=True))
+          PY
+      volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: models
+          mountPath: /models
+  volumes:
+    - name: data
+      hostPath:
+        path: /home/cce/gsstudio/data
+        type: DirectoryOrCreate
+    - name: models
+      hostPath:
+        path: /home/cce/gsstudio/models
+        type: DirectoryOrCreate

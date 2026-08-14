@@ -106,6 +106,21 @@ describe("first-person movement", () => {
       metadata!,
     );
 
-    expect(bounded.toArray()).toEqual([0, 0, 2]);
+    expect(bounded.toArray()).toEqual([0, 0, 1]);
+  });
+
+  it("does not move or change height when the camera OBB has zero width", () => {
+    const metadata = parseViewerMetadata({
+      center_point: [2, 3, 4],
+      facing_direction: [2, 2, 4],
+      up_direction: [0, 0, 1],
+      air_wall: { bbox: [-10, 10, -10, 10, -10, 10] },
+      kwargs: { camera_obb: [2, 3, 4, 0, 2, 0] },
+    });
+    const current = new THREE.Vector3(2, 3, 4);
+
+    const bounded = clampToNavigationBounds(current, new THREE.Vector3(3, 3, 9), metadata!);
+
+    expect(bounded.toArray()).toEqual([2, 3, 4]);
   });
 });

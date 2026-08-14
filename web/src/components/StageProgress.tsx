@@ -6,14 +6,35 @@ interface StageProgressProps {
 }
 
 const STAGE_LABELS: Record<string, string> = {
+  source_generate: "Source Candidate Generation",
+  input_preflight: "Input Preflight",
   panogen: "Panorama Generation",
+  post_panorama_preflight: "Generated Panorama Preflight",
   traj_generate: "Trajectory Planning",
   traj_render: "Trajectory Rendering",
   video_gen: "World Expansion",
   gen_gs_data: "GS Data Prep",
+  gs_pilot: "3DGS Pilot",
   gs_training: "3DGS Training",
   worldrecon: "3D Reconstruction",
+  navigation_stress: "Navigation Stress Test",
 };
+
+function stageErrorSummary(error: string): string {
+  if (error.includes("post_panorama_preflight") || error.includes("source_replacement_required")) {
+    return "Generated panorama is unsuitable for strict free-view reconstruction. Replace the source.";
+  }
+  if (error.includes("navigation_stress")) {
+    return "Navigation validation did not pass. Review the guided repair or source replacement action below.";
+  }
+  if (error.includes("input_preflight")) {
+    return "Input preflight did not pass. Review the rejected input conditions below.";
+  }
+  if (error.includes("pilot")) {
+    return "The 500-step pilot did not meet the strict quality gate.";
+  }
+  return "This stage did not complete. Technical details are available in the task error panel.";
+}
 
 function StageIcon({ status }: { status: string }) {
   switch (status) {
@@ -58,7 +79,7 @@ export default function StageProgress({ stages, currentStage }: StageProgressPro
               {stage.duration_seconds != null && (
                 <div className="stage-duration">{formatDuration(stage.duration_seconds)}</div>
               )}
-              {stage.error && <div className="stage-error">{stage.error}</div>}
+              {stage.error && <div className="stage-error">{stageErrorSummary(stage.error)}</div>}
             </div>
           </div>
         ))}
