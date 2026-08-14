@@ -15,7 +15,7 @@
 [![Viewer](https://img.shields.io/badge/viewer-Spark_3DGS-f97316?style=flat-square)](#browser-viewer)
 [![License](https://img.shields.io/badge/license-Internal_POC-6b7280?style=flat-square)](#license)
 
-[在线 POC](#live-poc) · [为什么是 GSStudio](#why-gsstudio) · [完整流程](#end-to-end-pipeline) · [3DGS 原理](#how-3dgs-works) · [质量门](#quality-gates) · [快速开始](#quick-start) · [API](docs/api.md) · [系统设计](docs/design.md)
+[在线 POC](#live-poc) · [为什么是 GSStudio](#why-gsstudio) · [核心模块](#hy-world-modules) · [完整流程](#end-to-end-pipeline) · [3DGS 原理](#how-3dgs-works) · [质量门](#quality-gates) · [快速开始](#quick-start) · [API](docs/api.md) · [系统设计](docs/design.md)
 
 </div>
 
@@ -83,6 +83,92 @@ flowchart LR
 ```
 
 部署采用单 Pod 形态：API、Worker 和 vLLM 协同工作，阶段通过 `CUDA_VISIBLE_DEVICES` 分配 GPU；任务阶段完成标记和 v4 `auto_recovery.json` journal 支持中断后恢复。
+
+---
+
+<a id="hy-world-modules"></a>
+
+## HY-World core modules and GPU routing
+
+WorldMirror-2、HY-Pano-2、WorldNav 和 WorldStereo-2 不是一条必须全部执行的固定链路。GSStudio 根据输入来源选择两条互斥的三维生产路线：生成式通道使用 HY-Pano-2、WorldNav 和 WorldStereo-2，多视角生产通道使用 WorldMirror-2。
+
+```mermaid
+flowchart TB
+    Entry{"输入是什么？"}
+
+    Text["文本"]
+    Image["单张透视图"]
+    Pano["已完成的 360° 全景"]
+    Multi["12–48 张真实多视角<br/>或有平移的视频"]
+
+    Source["HunyuanImage-3<br/>生成 4 个横向候选"]
+    PanoModel["HY-Pano-2<br/>局部视图 → 360° 环境"]
+    Nav["WorldNav<br/>NavMesh + VLM 相机路线规划"]
+    Stereo["WorldStereo-2<br/>沿路线补全多视角观测"]
+    GSTrain["GS data → Pilot → 3DGS training"]
+    Mirror["WorldMirror-2<br/>真实多视角直接重建"]
+    Metadata["相机 / 点云 → OBB<br/>air-wall · collision mesh"]
+    Stress["Navigation stress<br/>free_view_eligible gate"]
+
+    Entry --> Text
+    Entry --> Image
+    Entry --> Pano
+    Entry --> Multi
+    Text --> Source --> PanoModel
+    Image --> PanoModel
+    PanoModel --> Nav
+    Pano --> Nav
+    Nav --> Stereo --> GSTrain --> Stress
+    Multi --> Mirror --> Metadata --> Stress
+```
+
+### 两条通道会不会全部用到四个模块？
+
+| 核心模块 | 文本 / 单图生成 | 上传全景生成 | 多视角 / 视频重建 | 当前阶段实际 GPU |
+| --- | :---: | :---: | :---: | --- |
+| **HY-Pano-2** | ✅ | ❌ 已有全景，直接跳过 | ❌ | 5 张：GPU 0–4 |
+| **WorldNav** | ✅ | ✅ | ❌ | 路线规划 1 张：GPU 0；后续轨迹渲染为独立 5-GPU 阶段 |
+| **WorldStereo-2** | ✅ | ✅ | ❌ | 4 张：GPU 0–3 |
+| **WorldMirror-2** | ❌ | ❌ | ✅ | 默认 1 张：GPU 0；可通过 `recon_gpus=N` 启用多卡 FSDP |
+
+因此，没有任何一个入口会把四个模块全部串行执行：
+
+```text
+文本 / 单图：HY-Pano-2 → WorldNav → WorldStereo-2 → 3DGS training
+上传全景：   WorldNav → WorldStereo-2 → 3DGS training
+多视角 / 视频：WorldMirror-2 → viewer metadata → navigation stress
+```
+
+### WorldMirror-2 — 真实多视角直接重建
+
+WorldMirror-2 消费通过预检的真实多视角帧，直接输出 Gaussian、点云、相机参数、深度和法线。它依赖真实相机平移产生的运动视差，不需要先生成全景或合成 WorldStereo 轨迹，因此是默认推荐的生产通道。
+
+当前默认 `recon_gpus=1`，即只向 WorldMirror-2 暴露 GPU 0。配置 `recon_gpus > 1` 后，命令切换为 `torchrun + FSDP`。集群最多提供 5 张 GPU；当前服务端尚未单独限制 `recon_gpus` 的取值范围，生产环境应保持默认值，或只使用经过算力和显存验证的 `2–5`。
+
+### HY-Pano-2 — 将局部透视图扩展为完整环境
+
+HY-Pano-2 不直接产生最终 3D。它把预检选中的横向透视图扩展为 360° 全景，为 WorldNav 提供场景范围、可行走区域和视觉上下文。文本入口会先用 HunyuanImage-3 按 `base_seed + 0..3` 生成四个 `1216×832` 候选，再把排名最高的候选交给 HY-Pano-2；上传单图则把通过预检的原图交给它。
+
+HY-Pano-2 80B 的权重和激活分布在 GPU 0–4。运行前 Worker 会停止 GPU 0 上常驻的 Qwen3-VL/vLLM，释放显存；全景完成后，在输入评分或轨迹规划需要 VLM 时重新启动。
+
+### WorldNav — 决定相机从哪里走、朝哪里看
+
+WorldNav 是轨迹规划系统，不是最终图像或 3D 模型生成器。它组合全景、可行走区域、NavMesh、Qwen3-VL 语义理解以及相机平移/朝向约束，规划 regular、surround、exploration 和 reconstruction 等候选路线。
+
+WorldNav 规划阶段使用 GPU 0 上的 Qwen3-VL。紧随其后的 `traj_render` 是独立阶段，会向 5 个进程暴露 GPU 0–4，按照规划好的相机位姿渲染 WorldStereo 条件帧；因此“WorldNav 规划 1 GPU”和“轨迹渲染 5 GPU”不能混为一个数字。
+
+### WorldStereo-2 — 沿相机路线生成多视角观测
+
+WorldStereo-2 接收 WorldNav 路线和轨迹条件帧，沿相机移动路径补全连续的多视角视频/图像。它回答的是“相机沿这条路线移动时应该看到什么”，而不是直接输出最终 Gaussian。生成结果还必须通过 guidance、深度和对齐检查；任何被拒绝的轨迹都不会进入 GS 数据准备或训练。
+
+当前节点虽然有 5 张 GPU，但 WorldStereo-2 有 16 个 attention heads，sequence-parallel world size 必须整除 16。因此运行命令选择不超过 5 的最大合法并行度 4，即 `torchrun --nproc_per_node 4`，实际使用 GPU 0–3。执行前 vLLM 会停止，GPU 4 在这一阶段不参与 WorldStereo 推理。
+
+### GPU 预留与实际使用
+
+Kubernetes Pod 固定申请 5 张 A800，因此从集群调度角度看，GSStudio 运行期间始终独占 5 张卡；但具体阶段只会启用其中 1、4 或 5 张。GPU 0 上的 Qwen3-VL/vLLM 默认以 `tensor-parallel-size=1` 和 60% 显存上限运行，Worker 会在重模型阶段前停止它，并在预检、语义评分或 WorldNav 规划前恢复。
+
+> [!NOTE]
+> `WORLDGEN_STAGES` 中的 GPU 字段用于界面概览；精确资源数量以实际命令的 `CUDA_VISIBLE_DEVICES` 和 `torchrun --nproc_per_node` 为准。尤其是 WorldStereo-2：概览字段仍显示 GPU 0–4，但当前实际运行是 GPU 0–3 共 4 张。
 
 ---
 
