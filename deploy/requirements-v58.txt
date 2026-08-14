@@ -1,0 +1,4 @@
+# Small, pure-Python readers/evaluators used by the v58 delivery gates.
+# CUDA/PyTorch/OpenCV/trimesh remain inherited from the verified HY-World base.
+plyfile==1.1.2
+torchmetrics==1.8.1

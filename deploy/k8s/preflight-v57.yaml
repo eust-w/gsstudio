@@ -1,0 +1,158 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gsstudio-v57-preflight
+  namespace: gsstudio
+spec:
+  nodeName: 192.168.80.136
+  enableServiceLinks: false
+  restartPolicy: Never
+  imagePullSecrets:
+    - name: gsstudio-registry
+  containers:
+    - name: preflight
+      image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v57
+      imagePullPolicy: Always
+      command: ["sh", "-lc"]
+      args:
+        - |
+          cd /app
+          python - <<'PY'
+          import asyncio
+          import inspect
+          import json
+          from pathlib import Path
+
+          import rtree
+          import spz
+
+          from server.config import Config
+          from server.pipeline.delivery import (
+              DeliveryValidationError,
+              build_training_input_manifest,
+              validate_completed_delivery,
+          )
+          from server.pipeline.panogen_adapter import (
+              DEFAULT_SOURCE_IMAGE_HEIGHT,
+              DEFAULT_SOURCE_IMAGE_WIDTH,
+              SOURCE_PROMPT_MODE,
+              WORLD_GEOMETRY_PROMPT_SUFFIX,
+              expand_worldgen_prompt,
+              generate_source_and_panorama,
+          )
+          from server.pipeline.recovery import GUIDANCE_COLLAPSE_CUTOFF, _best_source_snapshot
+          from server.pipeline.worker import (
+              PipelineWorker,
+              _promote_recovery_source_artifacts,
+              _vllm_process_ids,
+          )
+          import server.pipeline.worker as worker_module
+
+          assert (DEFAULT_SOURCE_IMAGE_HEIGHT, DEFAULT_SOURCE_IMAGE_WIDTH) == (832, 1216)
+          expanded = expand_worldgen_prompt("写实的现代机器人研发办公室")
+          assert expanded.endswith(WORLD_GEOMETRY_PROMPT_SUFFIX)
+          assert "无鱼眼畸变" in expanded
+          assert "无玻璃材质" in expanded
+          assert expand_worldgen_prompt(expanded) == expanded
+          assert GUIDANCE_COLLAPSE_CUTOFF == 0.60
+          manual_best = _best_source_snapshot({
+              "source_attempt": 7,
+              "active_scene_relpath": "recovery_attempts/attempt-007/scene",
+              "accepted_trajectory_ids": [],
+              "manual_source_retry": True,
+              "source_attempts": [{
+                  "source_attempt": 0,
+                  "scene_relpath": "scene",
+                  "accepted_trajectory_ids": [],
+                  "accepted_count": 0,
+                  "quality_margin": 0.0,
+              }],
+          })
+          assert manual_best["source_attempt"] == 7
+          assert SOURCE_PROMPT_MODE == "direct_image_v1"
+          generator_source = inspect.getsource(generate_source_and_panorama)
+          assert 'bot_task="image"' in generator_source
+          assert 'bot_task="think_recaption"' not in generator_source
+          promotion_source = inspect.getsource(_promote_recovery_source_artifacts)
+          assert 'task_dir / "source_generation.json"' in promotion_source
+          assert _vllm_process_ids("802 /opt/vllm/bin/python\n803 VLLM::EngineCore") == [802, 803]
+
+          supervisor_source = Path("/etc/supervisor/conf.d/gsstudio.conf").read_text()
+          assert "stopasgroup=true" in supervisor_source
+          assert "killasgroup=true" in supervisor_source
+
+          trainer_path = Path("/opt/hyworld2/hyworld2/worldgen/world_gs_trainer.py")
+          assert trainer_path.is_file()
+          trainer_source = trainer_path.read_text()
+          assert "# GSStudio empty validation loader guard" not in trainer_source
+
+          gs_data_path = Path("/opt/hyworld2/hyworld2/worldgen/gen_gs_data.py")
+          gs_data_source = gs_data_path.read_text()
+          assert "# GSStudio trajectory whitelist patch" in gs_data_source
+          assert "empty whitelists are forbidden" in gs_data_source
+          assert "Anchored point clouds" not in gs_data_source
+
+          validated_delivery_dir = Path("/data/tasks/tasks/435d4b33616e")
+          build_training_input_manifest(
+              validated_delivery_dir,
+              validated_delivery_dir / "scene",
+              "strict_3d",
+          )
+          validation = validate_completed_delivery(validated_delivery_dir, task_type="worldgen")
+          assert validation["valid"]
+          assert validation["free_view_eligible"] is True
+          assert validation["navigation_validation"]["accepted_trajectory_count"] >= 6
+          assert validation["navigation_validation"]["unique_translated_camera_centers"] >= 12
+          assert validation["navigation_validation"]["azimuth_bin_count"] >= 6
+          assert validation["gaussian_count"] >= 50_000
+          assert validation["checkpoint_path"].startswith("output/ckpts/ckpt_1999_")
+          assert validation["metadata_path"] == "output/ply/position_meta_info.json"
+
+          blocked_task_dir = Path("/data/tasks/tasks/3dc27ec897d9")
+          try:
+              validate_completed_delivery(blocked_task_dir, task_type="worldgen")
+          except DeliveryValidationError as exc:
+              blocked_reason = str(exc)
+              assert "strict free-view coverage" in blocked_reason
+          else:
+              raise AssertionError("anchored task unexpectedly passed strict free-view validation")
+
+          async def forbidden_stage(**_kwargs):
+              raise AssertionError("validated 2,000-step export was retrained")
+
+          worker_module.run_stage = forbidden_stage
+
+          async def check_resume():
+              return await PipelineWorker(Config())._run_gs_training_with_safe_fallback(
+                  task_dir=validated_delivery_dir,
+                  scene_dir=validated_delivery_dir / "scene",
+                  task_type="worldgen",
+                  stage_name="gs_training",
+                  cmd=["false"],
+                  env={},
+                  log_file=validated_delivery_dir / "logs" / "v57_preflight_gs_training.log",
+                  cwd=validated_delivery_dir,
+                  cancel_event=asyncio.Event(),
+              )
+
+          success, error = asyncio.run(check_resume())
+          assert success, error
+          print("V57_PREFLIGHT_OK", json.dumps({
+              "strict_validation": validation,
+              "blocked_task_reason": blocked_reason,
+          }, sort_keys=True))
+          PY
+      volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: models
+          mountPath: /models
+  volumes:
+    - name: data
+      hostPath:
+        path: /home/cce/gsstudio/data
+        type: DirectoryOrCreate
+    - name: models
+      hostPath:
+        path: /home/cce/gsstudio/models
+        type: DirectoryOrCreate

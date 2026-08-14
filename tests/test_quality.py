@@ -32,6 +32,26 @@ def _write_camera(scene_dir: Path, view: str, traj: str) -> None:
     camera.write_text('{"extrinsic": [], "intrinsic": []}')
 
 
+def _write_camera_motion(
+    scene_dir: Path,
+    view: str,
+    traj: str,
+    *,
+    translation: float,
+) -> None:
+    camera = scene_dir / "render_results" / view / traj / "camera.json"
+    camera.parent.mkdir(parents=True, exist_ok=True)
+    identity = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+    moved = [row[:] for row in identity]
+    moved[0][3] = translation
+    camera.write_text(json.dumps({"extrinsic": [identity, moved], "intrinsic": []}))
+
+
 def _healthy_plan(scene_dir: Path) -> None:
     navmesh = scene_dir / "navmesh"
     navmesh.mkdir(parents=True)
@@ -53,18 +73,14 @@ class TestTaskQualityConfig:
         assert config["worldstereo_model_type"] == "worldstereo-memory"
         assert config["seed"] == 17
 
-    def test_fast_preset_maps_to_dmd(self):
-        config = normalize_worldgen_config({"quality_preset": "fast"}, form_prompt=None)
+    def test_fast_preset_is_rejected(self):
+        with pytest.raises(ValueError, match="Fast is not available"):
+            normalize_worldgen_config({"quality_preset": "fast"}, form_prompt=None)
 
-        assert config["quality_preset"] == "fast"
-        assert config["worldstereo_model_type"] == "worldstereo-memory-dmd"
-
-    def test_high_quality_defaults_to_automatic_recovery_and_fast_disables_it(self):
+    def test_high_quality_defaults_to_automatic_recovery(self):
         high = normalize_worldgen_config({}, form_prompt=None)
-        fast = normalize_worldgen_config({"quality_preset": "fast", "recovery_policy": "auto"}, form_prompt=None)
 
         assert high["recovery_policy"] == "auto"
-        assert fast["recovery_policy"] == "off"
 
     def test_rejects_unknown_recovery_policy(self):
         with pytest.raises(ValueError, match="recovery_policy"):
@@ -76,16 +92,15 @@ class TestTaskQualityConfig:
 
 
 class TestGsDataWhitelistPatch:
-    def test_empty_whitelist_keeps_rgbd_anchors_and_does_not_raise(self):
-        upstream = """import json\nparser.add_argument('--result_name', default='x')\nvideo_paths = sorted(video_paths, key=lambda x: (x.split(\"/\")[-3], x.split(\"/\")[-2]))\n"""
+    def test_empty_whitelist_is_rejected_before_gs_data_preparation(self):
+        upstream = """import json\nparser.add_argument('--result_name', default='x')\nrequired_files = [\nvideo_paths = sorted(video_paths, key=lambda x: (x.split(\"/\")[-3], x.split(\"/\")[-2]))\n"""
 
         patched = patch_gs_filter(upstream)
 
-        assert "Skipping all videos is not allowed" not in patched
         assert "accepted_trajectory_ids = set" in patched
         assert "Using {len(video_paths)} accepted trajectory videos" in patched
-        assert "anchor_resolution_sources" in patched
-        assert "img_width, img_height = anchor_image.size" in patched
+        assert "empty whitelists are forbidden" in patched
+        assert "anchor_resolution_sources" not in patched
 
 
 class TestTrajectoryPlanValidation:
@@ -146,6 +161,29 @@ class TestTrajectoryPlanValidation:
         assert json.loads(manifest.read_text())["candidate_trajectory_ids"] == [
             candidate["id"] for candidate in candidates
         ]
+
+    def test_initial_candidates_prefer_higher_estimated_camera_overlap(self, tmp_path):
+        scene_dir = tmp_path / "scene"
+        navmesh = scene_dir / "navmesh"
+        navmesh.mkdir(parents=True)
+        (navmesh / "reconstruct_pairs.json").write_text("[]")
+        for index in range(9):
+            _write_camera_motion(
+                scene_dir,
+                f"view{index}",
+                "traj0",
+                translation=10.0 if index == 0 else index / 100.0,
+            )
+        _write_camera_motion(scene_dir, "reconstruct_room", "traj0", translation=0.05)
+        log_file = tmp_path / "traj_generate.log"
+        log_file.write_text("planned trajectories\n")
+
+        planning = validate_trajectory_plan(scene_dir, log_file, quality_preset="high")["planning"]
+        selected = select_high_quality_video_candidates(planning)
+
+        assert len(selected) == 8
+        assert "view0/traj0" not in {item["id"] for item in selected}
+        assert selected[0]["estimated_overlap_score"] > selected[-1]["estimated_overlap_score"]
 
     def test_missing_reconstruct_pairs_is_fatal_when_segmented_targets_exist(self, tmp_path):
         scene_dir = tmp_path / "scene"
@@ -259,6 +297,44 @@ class TestAlignmentQuality:
         assert manifest["accepted_trajectory_ids"] == [f"view{index}/traj0" for index in range(6)]
         report = json.loads((tmp_path / "quality_report.json").read_text())
         assert report["alignment"]["accepted_trajectory_ids"] == manifest["accepted_trajectory_ids"]
+
+    def test_gs_data_postvalidation_rejects_a_silent_upstream_skip(self, tmp_path):
+        scene_dir = tmp_path / "scene"
+        scene_dir.mkdir()
+
+        with pytest.raises(QualityGateError, match="without usable cameras"):
+            postvalidate_worldgen_stage(
+                "gen_gs_data",
+                task_dir=tmp_path,
+                scene_dir=scene_dir,
+                log_file=tmp_path / "gen_gs_data.log",
+                quality_preset="high",
+            )
+
+        report = json.loads((tmp_path / "quality_report.json").read_text())
+        assert report["gs_data"]["missing_files"] == ["gs_data/cameras.json", "gs_data/points.ply"]
+
+    def test_gs_data_postvalidation_accepts_complete_anchor_outputs(self, tmp_path):
+        scene_dir = tmp_path / "scene"
+        gs_data = scene_dir / "gs_data"
+        (gs_data / "images").mkdir(parents=True)
+        (gs_data / "depths").mkdir()
+        (gs_data / "cameras.json").write_text(json.dumps({"0000": {"w2c": [], "K": []}}))
+        (gs_data / "points.ply").write_bytes(b"ply\n")
+        (gs_data / "images" / "0000.png").write_bytes(b"rgb")
+        (gs_data / "depths" / "0000.png").write_bytes(b"depth")
+
+        report = postvalidate_worldgen_stage(
+            "gen_gs_data",
+            task_dir=tmp_path,
+            scene_dir=scene_dir,
+            log_file=tmp_path / "gen_gs_data.log",
+            quality_preset="high",
+        )
+
+        assert report["camera_count"] == 1
+        assert report["image_count"] == 1
+        assert report["depth_count"] == 1
 
 
 class TestHighQualityVideoRecovery:

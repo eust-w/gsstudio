@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Iterable
@@ -71,6 +72,8 @@ def normalize_worldgen_config(
     """Normalize persisted world-generation settings at the API boundary."""
     normalized = dict(config or {})
     quality_preset = normalized.get("quality_preset", "high")
+    if quality_preset == "fast":
+        raise ValueError("Fast is not available for World Generation; use the strict high-quality preset")
     if quality_preset not in QUALITY_PRESETS:
         choices = ", ".join(sorted(QUALITY_PRESETS))
         raise ValueError(f"quality_preset must be one of: {choices}")
@@ -80,9 +83,7 @@ def normalize_worldgen_config(
     recovery_policy = normalized.get("recovery_policy", "auto")
     if recovery_policy not in {"auto", "off"}:
         raise ValueError("recovery_policy must be one of: auto, off")
-    # Fast DMD intentionally remains the inexpensive non-gated path.  It must
-    # never silently opt into the high-quality recovery loop.
-    normalized["recovery_policy"] = "off" if quality_preset == "fast" else recovery_policy
+    normalized["recovery_policy"] = recovery_policy
 
     if form_prompt is not None and form_prompt.strip():
         normalized["prompt"] = form_prompt.strip()
@@ -128,6 +129,50 @@ def _read_log(log_file: Path) -> str:
     return log_file.read_text(errors="replace") if log_file.exists() else ""
 
 
+def _camera_overlap_estimate(camera_path: Path) -> dict[str, float] | None:
+    """Estimate source-view overlap from the first and last planned poses."""
+    try:
+        payload = json.loads(camera_path.read_text())
+        extrinsic = payload.get("extrinsic", [])
+        if not isinstance(extrinsic, list) or len(extrinsic) < 2:
+            return None
+        first, last = extrinsic[0], extrinsic[-1]
+        if not all(isinstance(matrix, list) and len(matrix) >= 3 for matrix in (first, last)):
+            return None
+        first_translation = [float(first[index][3]) for index in range(3)]
+        last_translation = [float(last[index][3]) for index in range(3)]
+        translation = math.sqrt(sum(
+            (last_translation[index] - first_translation[index]) ** 2
+            for index in range(3)
+        ))
+        # Use the full R0^T R1 trace so arbitrary planned start poses work.
+        relative_trace = sum(
+            sum(float(first[k][row]) * float(last[k][row]) for k in range(3))
+            for row in range(3)
+        )
+        cosine = max(-1.0, min(1.0, (relative_trace - 1.0) / 2.0))
+        rotation_degrees = math.degrees(math.acos(cosine))
+        overlap = 1.0 / (1.0 + translation + rotation_degrees / 45.0)
+        return {
+            "camera_translation": translation,
+            "camera_rotation_degrees": rotation_degrees,
+            "estimated_overlap_score": overlap,
+        }
+    except (IndexError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _candidate_sort_key(item: dict[str, Any]) -> tuple[int, float, str]:
+    value = item.get("estimated_overlap_score")
+    try:
+        overlap = float(value)
+    except (TypeError, ValueError):
+        return (1, 0.0, str(item.get("id", "")))
+    if not math.isfinite(overlap):
+        return (1, 0.0, str(item.get("id", "")))
+    return (0, -overlap, str(item.get("id", "")))
+
+
 def validate_trajectory_plan(
     scene_dir: Path,
     log_file: Path,
@@ -164,11 +209,15 @@ def validate_trajectory_plan(
     for camera in cameras:
         relative = camera.relative_to(scene_dir / "render_results")
         view_id, traj_id = relative.parts[:2]
-        trajectories.append({
+        trajectory = {
             "id": f"{view_id}/{traj_id}",
             "kind": _trajectory_kind(view_id),
             "camera": str(camera.relative_to(scene_dir)),
-        })
+        }
+        overlap = _camera_overlap_estimate(camera)
+        if overlap:
+            trajectory.update(overlap)
+        trajectories.append(trajectory)
 
     by_kind: dict[str, int] = defaultdict(int)
     for trajectory in trajectories:
@@ -214,7 +263,7 @@ def validate_trajectory_plan(
 
 def select_high_quality_video_candidates(planning: dict[str, Any]) -> list[dict[str, Any]]:
     """Select the initial eight full-WorldStereo candidates, regular first."""
-    trajectories = sorted(planning.get("trajectories", []), key=lambda item: item["id"])
+    trajectories = sorted(planning.get("trajectories", []), key=_candidate_sort_key)
     by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for trajectory in trajectories:
         by_kind[trajectory["kind"]].append(trajectory)
@@ -233,7 +282,7 @@ def rank_high_quality_video_candidates(planning: dict[str, Any]) -> list[dict[st
     favor the paths with the most stable camera guidance without pretending
     that a rejected route is acceptable.
     """
-    trajectories = sorted(planning.get("trajectories", []), key=lambda item: item["id"])
+    trajectories = sorted(planning.get("trajectories", []), key=_candidate_sort_key)
     initial = select_high_quality_video_candidates(planning)
     selected_ids = {candidate["id"] for candidate in initial}
     ranked = list(initial)
@@ -617,5 +666,39 @@ def postvalidate_worldgen_stage(
         if enforce_alignment:
             enforce_alignment_quality(alignment, quality_preset=quality_preset)
         return alignment
+
+    if stage_name == "gen_gs_data":
+        gs_data = scene_dir / "gs_data"
+        required_files = [gs_data / "cameras.json", gs_data / "points.ply"]
+        missing = [str(path.relative_to(scene_dir)) for path in required_files if not path.is_file() or path.stat().st_size <= 0]
+        image_count = len(list((gs_data / "images").glob("*.png")))
+        depth_count = len(list((gs_data / "depths").glob("*.png")))
+        report = {
+            "required_files": [str(path.relative_to(scene_dir)) for path in required_files],
+            "missing_files": missing,
+            "image_count": image_count,
+            "depth_count": depth_count,
+        }
+        merge_quality_report(task_dir, "gs_data", report)
+        if missing or image_count == 0 or depth_count == 0:
+            raise QualityGateError(
+                "GS data preparation completed without usable cameras, points, RGB, and depth outputs",
+                report={"gs_data": report},
+            )
+        try:
+            cameras = json.loads((gs_data / "cameras.json").read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            raise QualityGateError(
+                f"GS data camera manifest is invalid: {exc}",
+                report={"gs_data": report},
+            ) from exc
+        if not isinstance(cameras, dict) or not cameras:
+            raise QualityGateError(
+                "GS data camera manifest is empty",
+                report={"gs_data": report},
+            )
+        report["camera_count"] = len(cameras)
+        merge_quality_report(task_dir, "gs_data", report)
+        return report
 
     return None

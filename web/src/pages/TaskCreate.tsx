@@ -3,32 +3,30 @@ import { useNavigate } from "react-router-dom";
 import { createTask } from "../api";
 
 type TabType = "worldgen" | "worldgen_from_pano" | "worldrecon";
-type QualityPreset = "high" | "fast";
 
 const TABS: { key: TabType; label: string; description: string }[] = [
   {
+    key: "worldrecon",
+    label: "Multi-View Reconstruction · Production recommended",
+    description: "Recommended production lane. Upload 12–48 translational views or a video; strict preflight, reconstruction, and navigation stress testing are required.",
+  },
+  {
     key: "worldgen",
-    label: "Text to World",
-    description: "Generate a 3D world from a text prompt or image using HY-Pano-2 + WorldStereo-2",
+    label: "Text / Image to World · Generative",
+    description: "Generative strict lane. Four 1216×832 source candidates are ranked before expansion; strict 3D is not guaranteed.",
   },
   {
     key: "worldgen_from_pano",
-    label: "Panorama to World",
-    description: "Upload an existing 360 panorama and generate a navigable 3D world",
-  },
-  {
-    key: "worldrecon",
-    label: "Multi-View Reconstruction",
-    description: "Reconstruct 3D from multi-view images or video using WorldMirror-2",
+    label: "Panorama to World · Generative",
+    description: "Generative strict lane. A panorama may be rejected when it lacks real translational parallax; strict 3D is not guaranteed.",
   },
 ];
 
 export default function TaskCreate() {
   const navigate = useNavigate();
-  const [activeTab, setActiveTab] = useState<TabType>("worldgen");
+  const [activeTab, setActiveTab] = useState<TabType>("worldrecon");
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
-  const [qualityPreset, setQualityPreset] = useState<QualityPreset>("high");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [configJson, setConfigJson] = useState("{}");
   const [submitting, setSubmitting] = useState(false);
@@ -64,6 +62,10 @@ export default function TaskCreate() {
       setError("Please upload multi-view images or a video");
       return;
     }
+    if (activeTab === "worldrecon" && !videoFile && imageFiles.length < 12) {
+      setError("Production preflight requires at least 12 multi-view images");
+      return;
+    }
 
     // Parse and merge advanced config. Form values intentionally win so the
     // visible prompt/quality choice can never be lost behind a stale JSON blob.
@@ -79,10 +81,12 @@ export default function TaskCreate() {
       return;
     }
     if (activeTab === "worldgen" || activeTab === "worldgen_from_pano") {
-      mergedConfig.quality_preset = qualityPreset;
-      mergedConfig.recovery_policy = qualityPreset === "high" ? "auto" : "off";
+      mergedConfig.quality_preset = "high";
+      mergedConfig.recovery_policy = "auto";
       if (prompt.trim()) mergedConfig.prompt = prompt.trim();
     }
+    mergedConfig.success_policy = "strict_free_view";
+    mergedConfig.input_lane = activeTab === "worldrecon" ? "production_multiview" : "generative_worldgen";
 
     setSubmitting(true);
 
@@ -194,8 +198,9 @@ export default function TaskCreate() {
               onFiles={setImageFiles}
               accept="image/*"
               inputRef={imagesInputRef}
-              label="Drop multiple images here or click to browse"
+              label="Drop 12–48 translated views here or click to browse"
             />
+            <p className="form-help">At least 12 usable 512px+ frames with real camera translation are required. Pure rotation is rejected.</p>
           </div>
           <div className="form-section">
             <label className="form-label">Or Video</label>
@@ -212,17 +217,17 @@ export default function TaskCreate() {
 
       {(activeTab === "worldgen" || activeTab === "worldgen_from_pano") && (
         <div className="form-section">
-          <label className="form-label" htmlFor="quality-preset">Quality preset</label>
-          <select
-            id="quality-preset"
-            className="form-input"
-            value={qualityPreset}
-            onChange={(event) => setQualityPreset(event.target.value as QualityPreset)}
-          >
-            <option value="high">High quality — full WorldStereo, quality gates, longer runtime</option>
-            <option value="fast">Fast — 4-step WorldStereo DMD</option>
-          </select>
-          <p className="form-help">High quality is the default and uses the complete model plus strict trajectory checks. A valid image always returns a usable result; the 3D tier depends on how many trajectories pass. Automatic recovery tries safe paths and deterministic source seeds without weakening the quality gates.</p>
+          <span className="form-label">Quality preset</span>
+          <p className="form-help">
+            Generative, strict but not guaranteed — four ranked sources, up to three source attempts, 24 WorldStereo trajectories or four hours. Six trajectories are the training minimum and ten are the recovery target. No anchored or degraded 3D is delivered.
+          </p>
+        </div>
+      )}
+
+      {activeTab === "worldrecon" && (
+        <div className="form-section">
+          <span className="form-label">Production contract</span>
+          <p className="form-help">Production recommended · strict free-view only · 500-step pilot where applicable · 1,000-step navigation stress test · WASD opens only after every gate passes.</p>
         </div>
       )}
 
