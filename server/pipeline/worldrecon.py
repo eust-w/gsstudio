@@ -50,4 +50,29 @@ def get_worldrecon_commands(
         "PYTHONPATH": "/opt/hyworld2",
     }
 
-    return [("worldrecon", cmd, env, hyworld_repo)]
+    preflight = [
+        "python", str(Path(__file__).with_name("preflight.py")), "multiview",
+        "--task-dir", str(task_dir),
+        "--input-dir", str(input_dir),
+        "--vllm-host", str(config.get("vllm_host", "localhost")),
+        "--vllm-port", str(config.get("vllm_port", 8100)),
+        "--vllm-model", str(config.get("vllm_model", "Qwen/Qwen3-VL-8B-Instruct")),
+    ]
+    # Reconstruction consumes only the atomically promoted preflight subset.
+    selected_input = input_dir / "preflight_selected"
+    cmd[cmd.index("--input_path") + 1] = str(selected_input)
+    stress = [
+        "python", "-m", "server.pipeline.gaussian_repair",
+        "--task-dir", str(task_dir),
+        "--task-type", "worldrecon",
+    ]
+    return [
+        ("input_preflight", preflight, {"CUDA_VISIBLE_DEVICES": "0"}, hyworld_repo),
+        ("worldrecon", cmd, env, hyworld_repo),
+        (
+            "navigation_stress",
+            stress,
+            {"CUDA_VISIBLE_DEVICES": "0", "PYTHONPATH": "/app:/opt/hyworld2"},
+            hyworld_repo,
+        ),
+    ]

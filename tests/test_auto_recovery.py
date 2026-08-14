@@ -5,13 +5,17 @@ import json
 import math
 from pathlib import Path
 
+import pytest
+
 from server.pipeline.recovery import (
     AUTO_RECOVERY_REPORT_NAME,
+    GUIDANCE_COLLAPSE_CUTOFF,
     auto_recovery_summary,
     archive_downstream_checkpoints,
     begin_source_regeneration,
     complete_auto_recovery_batch,
     desired_rescue_candidate_count,
+    migrate_non_strict_delivery,
     promote_recovered_scene,
     record_recovery_render_complete,
     record_transient_retry,
@@ -44,6 +48,25 @@ def _alignment(accepted: list[str]) -> dict:
     return {
         "accepted_trajectory_ids": accepted,
         "trajectories": {trajectory_id: {"accepted": trajectory_id in accepted} for trajectory_id in accepted},
+    }
+
+
+def _alignment_with_guidance(
+    trajectory_ids: list[str],
+    *,
+    minimum_guidance_mask: float,
+) -> dict:
+    return {
+        "accepted_trajectory_ids": [],
+        "trajectories": {
+            trajectory_id: {
+                "accepted": False,
+                "minimum_guidance_mask": minimum_guidance_mask,
+                "max_relative_deviation": 0.1,
+                "maximum_keyframe_depth_error_ratio": 0.01,
+            }
+            for trajectory_id in trajectory_ids
+        },
     }
 
 
@@ -84,9 +107,34 @@ class TestAutoRecoveryStateMachine:
         assert summary["best_source_attempt"] == 0
         assert summary["source_generation"]["source_attempt"] == 0
         assert summary["source_generation"]["seed"] == 1024
-        assert summary["guaranteed_3d"] is True
-        assert summary["training_mode"] == "panorama_anchored"
+        assert summary["state"] == "quality_blocked"
+        assert summary["guaranteed_3d"] is False
+        assert summary["free_view_eligible"] is False
+        assert summary["training_mode"] is None
         assert summary["strict_accepted_count"] == 0
+
+    def test_legacy_strict_worldgen_remains_eligible_without_a_v4_stress_report(self, tmp_path):
+        (tmp_path / AUTO_RECOVERY_REPORT_NAME).write_text(json.dumps({
+            "version": 3,
+            "contract_version": 3,
+            "task_type": "worldgen",
+            "state": "completed",
+            "delivery_tier": "strict_3d",
+            "training_mode": "accepted_trajectories",
+            "accepted_trajectory_ids": [f"view{i}/traj0" for i in range(6)],
+            "attempted_trajectory_ids": [f"view{i}/traj0" for i in range(6)],
+            "pending_candidate_trajectory_ids": [],
+            "minimum_accepted_trajectories": 6,
+            "limits": {},
+        }))
+        (tmp_path / "artifact_validation.json").write_text(json.dumps({"free_view_eligible": True}))
+        (tmp_path / "navigation_validation.json").write_text(json.dumps({"free_view_eligible": True}))
+
+        summary = auto_recovery_summary(tmp_path)
+
+        assert summary["contract_version"] == 3
+        assert summary["legacy_strict_validation"] is True
+        assert summary["free_view_eligible"] is True
 
     def test_starts_with_eight_regular_first_candidates(self, tmp_path):
         recovery = prepare_auto_recovery(
@@ -127,6 +175,96 @@ class TestAutoRecoveryStateMachine:
         assert next_step["rescue_round"] == 1
         assert next_step["pending_candidate_trajectory_ids"] == []
         assert next_step["attempted_trajectory_ids"] == first["pending_candidate_trajectory_ids"]
+
+    def test_uniformly_weak_initial_guidance_regenerates_source_before_rescue(self, tmp_path):
+        first = prepare_auto_recovery(
+            tmp_path,
+            planning=_planning(),
+            task_type="worldgen",
+            recovery_policy="auto",
+        )
+        complete_auto_recovery_batch(
+            tmp_path,
+            alignment=_alignment_with_guidance(
+                first["pending_candidate_trajectory_ids"],
+                minimum_guidance_mask=GUIDANCE_COLLAPSE_CUTOFF - 0.1,
+            ),
+            duration_seconds=10,
+        )
+
+        next_step = prepare_auto_recovery(
+            tmp_path,
+            planning=_planning(),
+            task_type="worldgen",
+            recovery_policy="auto",
+        )
+
+        assert next_step["state"] == "needs_regeneration"
+        assert next_step["phase"] == "source_guidance_collapse"
+        assert next_step["source_guidance_collapse"] is True
+        assert next_step["latest_guidance_diagnostics"] == {
+            "detected": True,
+            "diagnostic_cutoff": GUIDANCE_COLLAPSE_CUTOFF,
+            "candidate_count": 8,
+            "observed_count": 8,
+            "missing_trajectory_ids": [],
+            "best_minimum_guidance_mask": GUIDANCE_COLLAPSE_CUTOFF - 0.1,
+        }
+        assert [batch["phase"] for batch in next_step["batches"]] == ["normal_initial"]
+
+    def test_near_threshold_initial_guidance_still_uses_rescue_paths(self, tmp_path):
+        first = prepare_auto_recovery(
+            tmp_path,
+            planning=_planning(),
+            task_type="worldgen",
+            recovery_policy="auto",
+        )
+        complete_auto_recovery_batch(
+            tmp_path,
+            alignment=_alignment_with_guidance(
+                first["pending_candidate_trajectory_ids"],
+                minimum_guidance_mask=GUIDANCE_COLLAPSE_CUTOFF,
+            ),
+            duration_seconds=10,
+        )
+
+        next_step = prepare_auto_recovery(
+            tmp_path,
+            planning=_planning(),
+            task_type="worldgen",
+            recovery_policy="auto",
+        )
+
+        assert next_step["state"] == "needs_rescue"
+        assert next_step["rescue_round"] == 1
+        assert next_step["source_guidance_collapse"] is False
+
+    def test_missing_guidance_is_not_misclassified_as_source_collapse(self, tmp_path):
+        first = prepare_auto_recovery(
+            tmp_path,
+            planning=_planning(),
+            task_type="worldgen",
+            recovery_policy="auto",
+        )
+        alignment = _alignment_with_guidance(
+            first["pending_candidate_trajectory_ids"],
+            minimum_guidance_mask=0.2,
+        )
+        alignment["trajectories"].pop(first["pending_candidate_trajectory_ids"][0])
+        complete_auto_recovery_batch(tmp_path, alignment=alignment, duration_seconds=10)
+
+        next_step = prepare_auto_recovery(
+            tmp_path,
+            planning=_planning(),
+            task_type="worldgen",
+            recovery_policy="auto",
+        )
+
+        assert next_step["state"] == "needs_rescue"
+        assert next_step["source_guidance_collapse"] is False
+        assert next_step["latest_guidance_diagnostics"]["missing_trajectory_ids"] == [
+            first["pending_candidate_trajectory_ids"][0]
+        ]
 
     def test_four_to_five_accepted_adds_only_four_normal_candidates(self, tmp_path):
         first = prepare_auto_recovery(
@@ -170,7 +308,7 @@ class TestAutoRecoveryStateMachine:
         assert resumed["pending_candidate_trajectory_ids"] == first["pending_candidate_trajectory_ids"]
         assert resumed["attempted_trajectory_ids"] == []
 
-    def test_uploaded_panorama_finishes_with_anchored_3d_after_two_rescue_rounds(self, tmp_path):
+    def test_uploaded_panorama_is_blocked_after_two_failed_rescue_rounds(self, tmp_path):
         initial = prepare_auto_recovery(
             tmp_path,
             planning=_planning(),
@@ -189,12 +327,13 @@ class TestAutoRecoveryStateMachine:
         assert initial["phase"] == "normal_initial"
         assert rescue_one["rescue_round"] == 1
         assert rescue_two["rescue_round"] == 2
-        assert completed["state"] == "completed"
-        assert completed["delivery_tier"] == "anchored_3d"
-        assert completed["training_mode"] == "panorama_anchored"
-        assert completed["guaranteed_3d"] is True
+        assert completed["state"] == "quality_blocked"
+        assert completed["delivery_tier"] is None
+        assert completed["training_mode"] is None
+        assert completed["guaranteed_3d"] is False
+        assert completed["free_view_eligible"] is False
         assert completed["recovery_exhausted"] is True
-        assert "RGB-D" in completed["quality_warning"]
+        assert "source_replacement_required" in completed["terminal_reason"]
 
     def test_regenerated_source_keeps_the_task_wide_video_budget(self, tmp_path):
         planning = _planning()
@@ -395,7 +534,7 @@ class TestDeliveryTiersAndMigration:
         complete_auto_recovery_batch(tmp_path, alignment=_alignment(accepted), duration_seconds=1)
         report_path = tmp_path / AUTO_RECOVERY_REPORT_NAME
         report = json.loads(report_path.read_text())
-        report["video_seconds"] = 180 * 60
+        report["video_seconds"] = 4 * 60 * 60
         report_path.write_text(json.dumps(report))
         return prepare_auto_recovery(
             tmp_path,
@@ -409,25 +548,39 @@ class TestDeliveryTiersAndMigration:
         assert result["state"] == "completed"
         assert result["delivery_tier"] == "strict_3d"
 
-    def test_four_or_five_passed_delivers_degraded_3d(self, tmp_path):
+    @pytest.mark.parametrize("accepted_count", range(6))
+    def test_zero_through_five_passed_are_all_quality_blocked(self, tmp_path, accepted_count):
+        task_dir = tmp_path / str(accepted_count)
+        task_dir.mkdir()
+        result = self._exhausted_report(
+            task_dir,
+            [f"view{i}/traj0" for i in range(accepted_count)],
+        )
+
+        assert result["state"] == "quality_blocked"
+        assert result["delivery_tier"] is None
+        assert result["free_view_eligible"] is False
+        assert "source_replacement_required" in result["terminal_reason"]
+
+    def test_five_passed_is_quality_blocked(self, tmp_path):
         result = self._exhausted_report(tmp_path, [f"view{i}/traj0" for i in range(5)])
-        assert result["state"] == "completed"
-        assert result["delivery_tier"] == "degraded_3d"
-        assert result["quality_warning"]
+        assert result["state"] == "quality_blocked"
+        assert result["delivery_tier"] is None
+        assert "only 5 passed" in result["terminal_reason"]
 
-    def test_one_to_three_passed_delivers_degraded_3d(self, tmp_path):
+    def test_three_passed_is_quality_blocked(self, tmp_path):
         result = self._exhausted_report(tmp_path, [f"view{i}/traj0" for i in range(3)])
-        assert result["state"] == "completed"
-        assert result["delivery_tier"] == "degraded_3d"
-        assert result["training_mode"] == "accepted_plus_anchors"
+        assert result["state"] == "quality_blocked"
+        assert result["delivery_tier"] is None
+        assert result["training_mode"] is None
 
-    def test_zero_passed_delivers_panorama_anchored_3d(self, tmp_path):
+    def test_zero_passed_is_quality_blocked(self, tmp_path):
         result = self._exhausted_report(tmp_path, [])
-        assert result["state"] == "completed"
-        assert result["delivery_tier"] == "anchored_3d"
-        assert result["training_mode"] == "panorama_anchored"
+        assert result["state"] == "quality_blocked"
+        assert result["delivery_tier"] is None
+        assert result["training_mode"] is None
         assert result["strict_accepted_count"] == 0
-        assert result["guaranteed_3d"] is True
+        assert result["guaranteed_3d"] is False
 
     def test_migrates_v1_journal_without_repeating_completed_work(self, tmp_path):
         attempted = [f"view{i}/traj0" for i in range(12)]
@@ -466,16 +619,45 @@ class TestDeliveryTiersAndMigration:
             recovery_policy="auto",
         )
 
-        assert result["version"] == 2
+        assert result["version"] == 4
         assert result["state"] == "needs_rescue"
         assert result["rescue_round"] == 1
         assert result["attempted_trajectory_ids"] == attempted
         assert result["accepted_trajectory_ids"] == accepted
         assert result["limits"] == {
-            "maximum_video_trajectories": 32,
-            "maximum_video_seconds": 90 * 60,
-            "maximum_source_regenerations": 1,
+            "maximum_video_trajectories": 24,
+            "maximum_video_seconds": 4 * 60 * 60,
+            "maximum_source_regenerations": 2,
+            "maximum_source_attempts": 3,
+            "maximum_trajectories_per_source": 16,
         }
+
+    def test_non_strict_delivery_migration_is_idempotent_and_archives_evidence(self, tmp_path):
+        logs = tmp_path / "logs"
+        logs.mkdir()
+        (logs / "gs_training.log").write_text("historical training log")
+        (tmp_path / "artifact.spz").write_bytes(b"preserved")
+        (tmp_path / AUTO_RECOVERY_REPORT_NAME).write_text(json.dumps({
+            "version": 2,
+            "task_type": "worldgen",
+            "state": "completed",
+            "delivery_tier": "anchored_3d",
+            "accepted_trajectory_ids": [],
+            "limits": {},
+        }))
+
+        first = migrate_non_strict_delivery(tmp_path)
+        second = migrate_non_strict_delivery(tmp_path)
+
+        assert second == first
+        assert first["gpu_work_scheduled"] is False
+        assert (tmp_path / "artifact.spz").read_bytes() == b"preserved"
+        archive = tmp_path / first["archive_relpath"]
+        assert (archive / "auto_recovery.json").is_file()
+        assert (archive / "logs" / "gs_training.log").read_text() == "historical training log"
+        migrated = json.loads((tmp_path / AUTO_RECOVERY_REPORT_NAME).read_text())
+        assert migrated["state"] == "quality_blocked"
+        assert migrated["delivery_tier"] is None
 
     def test_transient_retry_is_persisted_without_resetting_recovery_progress(self, tmp_path):
         first = prepare_auto_recovery(
@@ -524,7 +706,7 @@ class TestDeliveryTiersAndMigration:
                 "quality_margin": 0.30,
             },
         ]
-        report["video_seconds"] = 180 * 60
+        report["video_seconds"] = 4 * 60 * 60
         (tmp_path / AUTO_RECOVERY_REPORT_NAME).write_text(json.dumps(report))
 
         completed = prepare_auto_recovery(
@@ -534,9 +716,48 @@ class TestDeliveryTiersAndMigration:
             recovery_policy="auto",
         )
 
-        assert completed["delivery_tier"] == "degraded_3d"
+        assert completed["state"] == "quality_blocked"
+        assert completed["delivery_tier"] is None
         assert completed["best_source_attempt"] == 0
         assert completed["accepted_trajectory_ids"] == [f"view{i}/traj0" for i in range(5)]
+
+    def test_manual_replacement_wins_a_blocked_zero_coverage_tie(self, tmp_path):
+        planning = _planning()
+        report = prepare_auto_recovery(
+            tmp_path,
+            planning=planning,
+            task_type="worldgen",
+            recovery_policy="auto",
+        )
+        report["source_attempt"] = 7
+        report["active_scene_relpath"] = "recovery_attempts/attempt-007/scene"
+        report["manual_source_retry"] = True
+        report["accepted_trajectory_ids"] = []
+        report["pending_candidate_trajectory_ids"] = []
+        report["source_attempts"] = [
+            {
+                "source_attempt": 0,
+                "scene_relpath": "scene",
+                "accepted_trajectory_ids": [],
+                "accepted_count": 0,
+                "quality_margin": 0.0,
+            }
+        ]
+        report["video_seconds"] = 4 * 60 * 60
+        (tmp_path / AUTO_RECOVERY_REPORT_NAME).write_text(json.dumps(report))
+
+        completed = prepare_auto_recovery(
+            tmp_path,
+            planning=planning,
+            task_type="worldgen",
+            recovery_policy="auto",
+        )
+
+        assert completed["state"] == "quality_blocked"
+        assert completed["delivery_tier"] is None
+        assert completed["best_source_attempt"] == 7
+        assert completed["best_scene_relpath"] == "recovery_attempts/attempt-007/scene"
+        assert completed["accepted_trajectory_ids"] == []
 
     def test_restores_best_attempt_whitelist_without_copying_stale_recovery_journal(self, tmp_path):
         reports = tmp_path / "recovery_attempts" / "attempt-000" / "reports"

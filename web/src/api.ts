@@ -47,16 +47,24 @@ export interface SourceGenerationStatus {
   duration_seconds?: number;
   error_code?: string | null;
   error_summary?: string | null;
+  original_prompt?: string;
+  effective_prompt?: string;
+  requested_source_width?: number;
+  requested_source_height?: number;
 }
 
 export interface TaskQualityRecovery {
   available: boolean;
+  contract_version?: number;
+  input_lane?: "production_multiview" | "generative_worldgen";
+  success_policy?: "strict_free_view";
   state?: string;
   phase?: string | null;
   rescue_round?: number | null;
   source_attempt?: number;
   accepted_trajectories?: number;
   required_trajectories?: number;
+  target_trajectories?: number;
   attempted_trajectories?: number;
   pending_trajectories?: number;
   generated_video_trajectories?: number;
@@ -65,10 +73,89 @@ export interface TaskQualityRecovery {
     maximum_video_trajectories?: number;
     maximum_video_seconds?: number;
     maximum_source_regenerations?: number;
+    maximum_source_attempts?: number;
+    maximum_trajectories_per_source?: number;
   };
-  delivery_tier?: "strict_3d" | "degraded_3d" | "anchored_3d" | "panorama_only" | null;
-  guaranteed_3d?: boolean;
-  training_mode?: "accepted_trajectories" | "accepted_plus_anchors" | "panorama_anchored" | null;
+  delivery_tier?: "strict_3d" | null;
+  free_view_eligible?: boolean;
+  product_state?: "processing" | "repair_available" | "repairing" | "source_replacement_required" | "ready";
+  user_message?: string;
+  next_action?: "wait" | "repair_model" | "replace_source" | "view_3d";
+  repair_eligibility?: {
+    eligible?: boolean;
+    requires_reanalysis?: boolean;
+    reason?: string;
+    offending_gaussian_count?: number;
+    offending_gaussian_fraction?: number;
+    attempts_used?: number;
+    maximum_attempts?: number;
+  };
+  repair_report?: {
+    state?: "running" | "repaired_pending_validation" | "passed" | "failed" | "failed_validation";
+    attempt?: number;
+    source_gaussian_count?: number;
+    removed_gaussian_count?: number;
+    result_gaussian_count?: number;
+    original_artifacts_preserved?: boolean;
+    navigation_stress_passed?: boolean;
+    failure_reason?: string;
+  } | null;
+  post_panorama_preflight?: {
+    state?: "passed" | "failed";
+    composite_score?: number;
+    failure_reasons?: string[];
+  } | null;
+  navigation_validation?: {
+    free_view_eligible?: boolean;
+    accepted_trajectory_count?: number;
+    unique_translated_camera_centers?: number;
+    camera_obb_half_width?: number;
+    camera_obb_half_height?: number;
+    human_scale?: number;
+    azimuth_bin_count?: number;
+    validation_render_count?: number;
+    metrics?: { psnr?: number | null; ssim?: number | null; lpips?: number | null };
+    failure_reasons?: string[];
+  } | null;
+  source_pool?: {
+    state?: string;
+    selected_candidate_id?: string | null;
+    accepted_candidate_count?: number;
+    ranking?: string[];
+    selected_ids?: string[];
+    candidates?: Array<{
+      id?: string;
+      seed?: number;
+      composite_score?: number;
+      accepted?: boolean;
+      rejection_reasons?: string[];
+    }>;
+  } | null;
+  input_preflight?: {
+    state?: string;
+    input_mode?: string;
+    candidate_frame_count?: number;
+    selected_frame_count?: number;
+    failure_reasons?: string[];
+  } | null;
+  pilot_validation?: {
+    state?: string;
+    validation_render_count?: number;
+    gaussian_count?: number;
+    metrics?: { psnr?: number | null; ssim?: number | null; lpips?: number | null };
+    failure_reasons?: string[];
+  } | null;
+  navigation_stress?: {
+    state?: string;
+    free_view_eligible?: boolean;
+    gaussian_count?: number;
+    walk?: { completed_steps?: number; accepted_steps?: number };
+    representative_views?: unknown[];
+    micro_translation_pairs?: unknown[];
+    failure_reasons?: string[];
+  } | null;
+  global_budget?: Record<string, number>;
+  training_mode?: "accepted_trajectories" | null;
   strict_accepted_count?: number;
   anchor_view_count?: number;
   training_input_manifest?: Record<string, unknown> | null;
@@ -78,6 +165,15 @@ export interface TaskQualityRecovery {
   quality_warning?: string | null;
   recovery_exhausted?: boolean;
   transient_retry_count?: number;
+  source_guidance_collapse?: boolean;
+  guidance_diagnostics?: {
+    detected?: boolean;
+    diagnostic_cutoff?: number;
+    candidate_count?: number;
+    observed_count?: number;
+    missing_trajectory_ids?: string[];
+    best_minimum_guidance_mask?: number | null;
+  } | null;
   terminal_reason?: string | null;
   updated_at?: string;
   source_generation?: SourceGenerationStatus | null;
@@ -146,13 +242,26 @@ export async function retryTask(id: string): Promise<void> {
   if (!resp.ok) throw new Error(`Retry failed: ${resp.statusText}`);
 }
 
+export async function repairTaskModel(id: string): Promise<void> {
+  const resp = await fetch(`${API_BASE}/tasks/${id}/repair`, { method: "POST" });
+  if (!resp.ok) {
+    const detail = await resp.json().catch(() => null);
+    throw new Error(detail?.detail || `Model repair failed: ${resp.statusText}`);
+  }
+}
+
 export async function retryTaskSource(
   id: string,
   source?: File,
   taskType: Task["type"] = "worldgen_from_pano",
+  images?: File[],
+  video?: File,
 ): Promise<void> {
-  const body = source ? new FormData() : undefined;
+  const hasUpload = Boolean(source || images?.length || video);
+  const body = hasUpload ? new FormData() : undefined;
   if (body && source) body.set(taskType === "worldgen" ? "image" : "panorama", source);
+  images?.forEach((file) => body?.append("images", file));
+  if (body && video) body.set("video", video);
   const resp = await fetch(`${API_BASE}/tasks/${id}/retry-source`, { method: "POST", body });
   if (!resp.ok) throw new Error(`Source retry failed: ${resp.statusText}`);
 }

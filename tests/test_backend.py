@@ -23,7 +23,13 @@ from server.db import create_task, get_task, init_db, list_tasks, set_task_stage
 from server.models import StageStatus, TaskStatus
 from server.pipeline.stage_runner import run_stage
 from server.pipeline.worldgen import get_worldgen_commands
-from server.pipeline.worker import PipelineWorker, VLLM_FREE_STAGES, _next_recovery_seed
+from server.pipeline.worker import (
+    PipelineWorker,
+    VLLM_FREE_STAGES,
+    _next_recovery_seed,
+    _promote_recovery_source_artifacts,
+    _vllm_process_ids,
+)
 
 
 def png_bytes(color=(120, 80, 40)) -> bytes:
@@ -32,9 +38,35 @@ def png_bytes(color=(120, 80, 40)) -> bytes:
     return buffer.getvalue()
 
 
+def test_recovery_source_promotion_updates_uploaded_image_and_report(tmp_path):
+    attempt_dir = tmp_path / "recovery_attempts" / "attempt-007"
+    attempt_input = attempt_dir / "input"
+    attempt_input.mkdir(parents=True)
+    (attempt_input / "input.png").write_bytes(b"replacement-source")
+    (attempt_dir / "source_generation.json").write_text('{"source_attempt": 7, "mode": "image"}')
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "input.png").write_bytes(b"old-source")
+    (tmp_path / "source_generation.json").write_text('{"source_attempt": 0}')
+
+    _promote_recovery_source_artifacts(
+        attempt_dir=attempt_dir,
+        attempt_input_dir=attempt_input,
+        task_dir=tmp_path,
+        input_dir=input_dir,
+    )
+
+    assert (input_dir / "input.png").read_bytes() == b"replacement-source"
+    assert json.loads((tmp_path / "source_generation.json").read_text()) == {
+        "source_attempt": 7,
+        "mode": "image",
+    }
+
+
 @pytest.fixture
 def cfg():
     c = Config()
+    c.MANAGE_VLLM = False
     c.DATA_DIR.mkdir(parents=True, exist_ok=True)
     c.tasks_dir.mkdir(parents=True, exist_ok=True)
     init_db(c.DB_PATH)
@@ -208,6 +240,8 @@ class TestCheckpointResume:
     def test_training_oom_retries_with_frozen_means_and_no_densification(self, cfg, monkeypatch, tmp_path):
         import server.pipeline.worker as worker_module
 
+        (tmp_path / "output").mkdir()
+        (tmp_path / "output" / "partial.pt").write_bytes(b"failed-attempt-evidence")
         calls: list[list[str]] = []
         validations = 0
 
@@ -243,12 +277,24 @@ class TestCheckpointResume:
         success, error = asyncio.run(run_training())
 
         assert success, error
+        assert (
+            tmp_path / "recovery_attempts" / "incomplete-final-training-001" / "output" / "partial.pt"
+        ).read_bytes() == b"failed-attempt-evidence"
         assert calls[1][calls[1].index("--means-lr") + 1] == "0"
         assert calls[1][calls[1].index("--strategy.refine-start-iter") + 1] == "1999"
 
     def test_recovery_seeds_are_based_on_the_original_seed(self):
         assert _next_recovery_seed({"seed": 1024}, 0) == 1025
         assert _next_recovery_seed({"seed": 1025, "_recovery_base_seed": 1024}, 1) == 1026
+
+    def test_vllm_process_detection_includes_orphan_engine_children(self):
+        process_table = """
+          282 python -m uvicorn server.main:app
+          802 /opt/vllm/bin/python -B -c from multiprocessing.resource_tracker import main
+          803 VLLM::EngineCore
+        """
+
+        assert _vllm_process_ids(process_table) == [802, 803]
 
     def test_checkpoint_marker(self, cfg, task_id):
         task_dir = cfg.task_dir(task_id)
@@ -500,6 +546,7 @@ class TestCheckpointResume:
             ("video_gen", 8),
             ("traj_render", 6),
             ("video_gen", 6),
+            ("video_gen", 4),
         ]
         assert calls[1][1] == [f"view_recovery_r1_{index}/traj0" for index in range(6)]
 
@@ -716,6 +763,10 @@ class TestCheckpointResume:
             "source_attempt": 1,
             "source_seed": 1025,
             "active_scene_relpath": "recovery_attempts/attempt-001/scene",
+            "accepted_trajectory_ids": [f"view{i}/traj0" for i in range(6)],
+        }))
+        (task_dir / "alignment_quality.json").write_text(json.dumps({
+            "accepted_trajectory_ids": [f"view{i}/traj0" for i in range(6)],
         }))
         monkeypatch.setattr(
             worker_module,
@@ -744,6 +795,7 @@ class TestCheckpointResume:
 
         monkeypatch.setattr(worker, "_run_regenerated_source_attempt", regenerate)
         monkeypatch.setattr(worker_module, "run_stage", fake_stage)
+        monkeypatch.setattr(worker_module, "postvalidate_worldgen_stage", lambda *_args, **_kwargs: None)
         monkeypatch.setattr(worker_module, "validate_completed_delivery", lambda *_args, **_kwargs: {"valid": True})
 
         asyncio.run(worker.execute_task(task_id))
@@ -770,6 +822,10 @@ class TestCheckpointResume:
             "state": "replacing_panorama_source",
             "source_attempt": 1,
             "active_scene_relpath": "recovery_attempts/attempt-001/scene",
+            "accepted_trajectory_ids": [f"view{i}/traj0" for i in range(6)],
+        }))
+        (task_dir / "alignment_quality.json").write_text(json.dumps({
+            "accepted_trajectory_ids": [f"view{i}/traj0" for i in range(6)],
         }))
         monkeypatch.setattr(
             worker_module,
@@ -797,6 +853,7 @@ class TestCheckpointResume:
 
         monkeypatch.setattr(worker, "_run_replacement_panorama_attempt", replacement)
         monkeypatch.setattr(worker_module, "run_stage", fake_stage)
+        monkeypatch.setattr(worker_module, "postvalidate_worldgen_stage", lambda *_args, **_kwargs: None)
         monkeypatch.setattr(worker_module, "validate_completed_delivery", lambda *_args, **_kwargs: {"valid": True})
 
         asyncio.run(worker.execute_task(task_id))
@@ -805,7 +862,7 @@ class TestCheckpointResume:
         assert called_stages == ["gen_gs_data", "gs_training"]
         assert get_task(cfg.DB_PATH, task_id)["status"] == TaskStatus.COMPLETED.value
 
-    def test_legacy_panorama_delivery_is_migrated_and_runs_both_3d_stages(self, cfg, monkeypatch):
+    def test_legacy_panorama_delivery_is_blocked_before_3d_stages(self, cfg, monkeypatch):
         import server.pipeline.worker as worker_module
 
         cfg.MOCK_PIPELINE = False
@@ -841,16 +898,19 @@ class TestCheckpointResume:
             return True, ""
 
         monkeypatch.setattr(worker_module, "run_stage", fake_stage)
+        monkeypatch.setattr(worker_module, "postvalidate_worldgen_stage", lambda *_args, **_kwargs: None)
         monkeypatch.setattr(worker_module, "validate_completed_delivery", lambda *_args, **_kwargs: {"valid": True})
 
         asyncio.run(PipelineWorker(cfg).execute_task(task_id))
 
         task = get_task(cfg.DB_PATH, task_id)
-        assert task["status"] == TaskStatus.COMPLETED.value
-        assert called_stages == ["gen_gs_data", "gs_training"]
+        assert task["status"] == TaskStatus.FAILED.value
+        assert task["error_code"] == "insufficient_free_view_coverage"
+        assert called_stages == []
         migrated = json.loads((task_dir / "auto_recovery.json").read_text())
-        assert migrated["delivery_tier"] == "anchored_3d"
-        assert migrated["training_mode"] == "panorama_anchored"
+        assert migrated["state"] == "quality_blocked"
+        assert migrated["delivery_tier"] is None
+        assert migrated["training_mode"] is None
 
     def test_worker_preserves_cancelled_terminal_status_when_a_stage_stops(self, cfg, monkeypatch):
         import server.pipeline.worker as worker_module
@@ -961,22 +1021,19 @@ class TestWorldgenCommands:
         assert by_stage["gs_training"][by_stage["gs_training"].index("--strategy.refine-every") + 1] == "133"
         assert env_by_stage["gs_training"]["TORCH_HOME"] == "/models/torch-cache"
 
-    def test_fast_quality_keeps_dmd_model_type_in_every_downstream_stage(self, tmp_path):
-        commands = get_worldgen_commands(
-            task_dir=tmp_path / "task",
-            scene_dir=tmp_path / "scene",
-            input_dir=tmp_path / "input",
-            config={"quality_preset": "fast"},
-            hyworld_repo=Path("/opt/hyworld2"),
-            vllm_host="localhost",
-            vllm_port=8100,
-            vllm_model="Qwen/Qwen3-VL-8B-Instruct",
-            task_type="worldgen_from_pano",
-        )
-        by_stage = {name: command for name, command, _, _ in commands}
-
-        assert by_stage["video_gen"][by_stage["video_gen"].index("--model_type") + 1] == "worldstereo-memory-dmd"
-        assert by_stage["gen_gs_data"][by_stage["gen_gs_data"].index("--result_name") + 1] == "worldstereo-memory-dmd"
+    def test_fast_quality_is_rejected_for_world_generation(self, tmp_path):
+        with pytest.raises(ValueError, match="Fast is not available"):
+            get_worldgen_commands(
+                task_dir=tmp_path / "task",
+                scene_dir=tmp_path / "scene",
+                input_dir=tmp_path / "input",
+                config={"quality_preset": "fast"},
+                hyworld_repo=Path("/opt/hyworld2"),
+                vllm_host="localhost",
+                vllm_port=8100,
+                vllm_model="Qwen/Qwen3-VL-8B-Instruct",
+                task_type="worldgen_from_pano",
+            )
 
     def test_panogen_uses_isolated_runtime_and_supported_attention(self, tmp_path):
         commands = get_worldgen_commands(
@@ -1081,6 +1138,7 @@ class TestDeploymentContract:
             "import argparse\nimport json\n"
             "parser = argparse.ArgumentParser()\n"
             "parser.add_argument('--result_name', '-n', type=str, default='worldstereo-memory-dmd')\n"
+            "required_files = [\n"
             "video_paths = sorted(video_paths, key=lambda x: (x.split(\"/\")[-3], x.split(\"/\")[-2]))\n"
             "video_paths = video_paths[rank::world_size]\n"
         )
@@ -1091,8 +1149,9 @@ class TestDeploymentContract:
 
         assert "--trajectory_whitelist" in patched
         assert "accepted_trajectory_ids" in patched
-        assert "Empty trajectory whitelist" in patched
-        assert "Anchor output resolution" in patched
+        assert "empty whitelists are forbidden" in patched
+        assert "Anchor output resolution" not in patched
+        assert "Anchored point clouds" not in patched
 
     def test_video_filter_patch_limits_worldstereo_to_planned_candidates(self, tmp_path):
         upstream = tmp_path / "video_gen.py"
@@ -1222,17 +1281,33 @@ class TestDeploymentContract:
         assert "patch_hyworld_render_filter.py" in dockerfile
         assert "/opt/hyworld2/hyworld2/worldgen/traj_render.py" in dockerfile
 
-    def test_gpu_rollout_manifests_target_the_immutable_v46_image(self):
+    def test_image_does_not_patch_empty_validation_loaders(self):
+        dockerfile = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
+
+        assert "patch_world_gs_empty_eval.py" not in dockerfile
+        assert "/opt/hyworld2/hyworld2/worldgen/world_gs_trainer.py" not in dockerfile
+
+    def test_gpu_rollout_manifests_target_the_immutable_v66_product_image(self):
         root = Path(__file__).parents[1]
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v50" in deployment
-        assert "gsstudio:a800-v50" in build
+        assert "gsstudio:a800-v66" in deployment
+        assert "gsstudio:a800-v66" in build
+        assert "rollback-image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v65" in deployment
+        assert "sha256:08f681ddec830d2fcffc19c339f035b28d0a783ab841532f12cf200003e3a9cc" in deployment
+        assert "gsstudio:a800-v56" not in deployment
+        assert "gsstudio:a800-v56" not in build
         assert "gsstudio:a800-v35" not in deployment
         assert "gsstudio:a800-v35" not in build
         assert "gsstudio:a800-v22" not in deployment
         assert "gsstudio:a800-v22" not in build
+
+    def test_vllm_supervisor_stops_the_complete_process_group(self):
+        source = (Path(__file__).parents[1] / "deploy/supervisord.conf").read_text()
+
+        assert "stopasgroup=true" in source
+        assert "killasgroup=true" in source
 
     def test_entrypoint_maps_upstream_hf_cache_to_persistent_hub(self):
         source = (Path(__file__).parents[1] / "deploy/scripts/entrypoint.sh").read_text()
@@ -1292,7 +1367,7 @@ class TestDeploymentContract:
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
 
         assert "FROM ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v22" in source
-        assert "GSStudio a800-v43" in source
+        assert "GSStudio A800" in source
 
     def test_image_patches_worldstereo_transformer_for_local_only_loading(self):
         source = (Path(__file__).parents[1] / "Dockerfile.a800").read_text()
@@ -1315,7 +1390,8 @@ class TestAPI:
     @pytest.fixture
     def client(self, cfg):
         from fastapi.testclient import TestClient
-        from server.main import app
+        from server.main import app, worker as app_worker
+        app_worker.config.MANAGE_VLLM = False
         token = base64.b64encode(b"poc-user:poc-password").decode()
         with TestClient(app, headers={"Authorization": f"Basic {token}"}) as c:
             yield c
@@ -1384,14 +1460,33 @@ class TestAPI:
 
         assert resp.status_code == 201
         task = client.get(f"/api/tasks/{resp.json()['task_id']}").json()
-        assert task["config"] == {
-            "prompt": "form prompt wins",
-            "quality_preset": "high",
-            "recovery_policy": "auto",
-            "seed": 17,
-            "worldstereo_model_type": "worldstereo-memory",
-            "input_mode": "image",
-        }
+        assert task["config"]["prompt"] == "form prompt wins"
+        assert task["config"]["quality_preset"] == "high"
+        assert task["config"]["recovery_policy"] == "auto"
+        assert task["config"]["seed"] == 17
+        assert task["config"]["worldstereo_model_type"] == "worldstereo-memory"
+        assert task["config"]["input_mode"] == "image"
+        assert task["config"]["contract_version"] == 4
+        assert task["config"]["success_policy"] == "strict_free_view"
+        assert task["config"]["input_lane"] == "generative_worldgen"
+        assert task["config"]["maximum_worldstereo_trajectories"] == 24
+        assert task["config"]["maximum_task_seconds"] == 4 * 60 * 60
+
+    def test_worldgen_api_rejects_new_fast_tasks(self, client, monkeypatch):
+        monkeypatch.setenv("HF_TOKEN", "test-token")
+
+        response = client.post(
+            "/api/tasks",
+            data={
+                "type": "worldgen",
+                "name": "forbidden-fast",
+                "prompt": "robotics office",
+                "config": json.dumps({"quality_preset": "fast"}),
+            },
+        )
+
+        assert response.status_code == 400
+        assert "Fast is not available" in response.json()["detail"]
 
     def test_prompt_only_worldgen_is_queued_without_a_fake_input_image(self, client, monkeypatch):
         monkeypatch.setenv("HF_TOKEN", "test-token")
@@ -1477,39 +1572,80 @@ class TestAPI:
 
         assert response.status_code == 200
         payload = response.json()
-        assert payload | {} == {
-            "available": True,
-            "state": "generating_rescue",
-            "phase": "rescue_1",
-            "rescue_round": 1,
-            "source_attempt": 0,
-            "accepted_trajectories": 2,
-            "required_trajectories": 6,
-            "attempted_trajectories": 1,
-            "pending_trajectories": 1,
-            "generated_video_trajectories": 8,
-            "video_seconds": 9.0,
-            "limits": {
-                "maximum_video_trajectories": 32,
-                "maximum_video_seconds": 5400,
-                "maximum_source_regenerations": 1,
-            },
-            "terminal_reason": None,
-            "delivery_tier": None,
-            "best_source_attempt": 0,
-            "quality_warning": None,
-            "recovery_exhausted": False,
-            "transient_retry_count": 0,
-            "updated_at": "2026-08-11T00:00:00Z",
-            "source_generation": None,
-            "guaranteed_3d": True,
-            "training_mode": None,
-            "strict_accepted_count": 2,
-            "anchor_view_count": 0,
-            "training_input_manifest": None,
-            "artifact_validation": None,
-            "fallback_reason": None,
-        }
+        assert payload["available"] is True
+        assert payload["state"] == "generating_rescue"
+        assert payload["accepted_trajectories"] == 2
+        assert payload["required_trajectories"] == 6
+        assert payload["delivery_tier"] is None
+        assert payload["free_view_eligible"] is False
+        assert payload["navigation_validation"] is None
+        assert payload["guaranteed_3d"] is False
+
+    def test_sparse_giant_failure_can_queue_one_bounded_model_repair(self, client, cfg):
+        task_id = create_task(
+            cfg.DB_PATH,
+            name="repairable-navigation",
+            task_type="worldgen",
+            config={"quality_preset": "high", "recovery_policy": "auto"},
+        )
+        update_task(
+            cfg.DB_PATH,
+            task_id,
+            status=TaskStatus.FAILED.value,
+            error_code="navigation_stress_failed",
+        )
+        task_dir = cfg.task_dir(task_id)
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / "auto_recovery.json").write_text(json.dumps({
+            "version": 4,
+            "state": "completed",
+            "delivery_tier": "strict_3d",
+            "accepted_trajectory_ids": [f"view{index}/traj0" for index in range(6)],
+        }))
+        (task_dir / "navigation_stress.json").write_text(json.dumps({
+            "state": "failed",
+            "free_view_eligible": False,
+            "failure_reasons": ["view_01_giant_gaussian"],
+        }))
+
+        quality = client.get(f"/api/tasks/{task_id}/quality").json()
+        assert quality["product_state"] == "repair_available"
+        assert quality["next_action"] == "repair_model"
+        response = client.post(f"/api/tasks/{task_id}/repair")
+
+        assert response.status_code == 200
+        assert get_task(cfg.DB_PATH, task_id)["status"] == TaskStatus.PENDING.value
+        request = json.loads((task_dir / "gaussian_repair_request.json").read_text())
+        assert request["state"] == "queued"
+        assert request["eligibility_at_request"]["requires_reanalysis"] is True
+
+    def test_quality_slo_excludes_preflight_passed_tasks_without_terminal_outcomes(
+        self, client, monkeypatch
+    ):
+        import server.routes.tasks as task_routes
+
+        tasks = [
+            {"id": "still-running", "status": "running", "created_at": "2026-08-13T02:00:00Z", "config": {}},
+            {"id": "resolved-failure", "status": "failed", "created_at": "2026-08-13T01:00:00Z", "config": {}},
+        ]
+        monkeypatch.setattr(task_routes, "list_tasks", lambda *_args, **_kwargs: (tasks, len(tasks)))
+        monkeypatch.setattr(task_routes, "auto_recovery_summary", lambda *_args, **_kwargs: {
+            "contract_version": 4,
+            "input_lane": "production_multiview",
+            "input_preflight": {"state": "passed"},
+            "free_view_eligible": False,
+            "navigation_stress": None,
+            "global_budget": {},
+        })
+
+        response = client.get("/api/quality/summary")
+
+        assert response.status_code == 200
+        lane = response.json()["lanes"]["production_multiview"]
+        assert lane["preflight_passed"] == 2
+        assert lane["preflight_resolved"] == 1
+        assert lane["strict_completion_rate"] == 0
+        assert lane["recent_20_slo"]["sample_size"] == 1
 
     def test_retry_source_advances_generated_seed_without_relaxing_quality_policy(self, client, cfg):
         task_id = create_task(
@@ -1542,6 +1678,60 @@ class TestAPI:
         assert report["state"] == "regenerating_panorama"
         assert report["source_seed"] == 1025
         assert get_task(cfg.DB_PATH, task_id)["config"]["recovery_policy"] == "auto"
+
+    def test_worldrecon_retry_atomically_archives_and_promotes_twelve_images(self, client, cfg):
+        task_id = create_task(cfg.DB_PATH, name="recon-retry", task_type="worldrecon", config={})
+        update_task(cfg.DB_PATH, task_id, status=TaskStatus.FAILED.value, error="input_preflight_failed")
+        task_dir = cfg.task_dir(task_id)
+        old_input = task_dir / "input"
+        old_output = task_dir / "output"
+        old_input.mkdir(parents=True)
+        old_output.mkdir()
+        (old_input / "old.png").write_bytes(png_bytes((1, 2, 3)))
+        (old_output / "old.ply").write_bytes(b"evidence")
+        (task_dir / "input_preflight.json").write_text(json.dumps({"state": "failed"}))
+        (task_dir / ".stage_input_preflight_done").touch()
+
+        response = client.post(
+            f"/api/tasks/{task_id}/retry-source",
+            files=[
+                ("images", (f"view-{index:02d}.png", png_bytes((index, 20, 30)), "image/png"))
+                for index in range(12)
+            ],
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "pending"
+        assert response.json()["config"]["contract_version"] == 4
+        assert len(list((task_dir / "input").glob("image_*"))) == 12
+        archive = task_dir / "source_replacements" / "attempt-001"
+        assert (archive / "input" / "old.png").is_file()
+        assert (archive / "output" / "old.ply").is_file()
+        assert (archive / "input_preflight.json").is_file()
+        assert (archive / ".stage_input_preflight_done").is_file()
+        retry = json.loads((task_dir / "source_retry.json").read_text())
+        assert retry["input_mode"] == "images"
+
+    def test_worldrecon_retry_rejects_corrupt_group_before_mutating_task(self, client, cfg):
+        task_id = create_task(cfg.DB_PATH, name="recon-corrupt-retry", task_type="worldrecon", config={})
+        update_task(cfg.DB_PATH, task_id, status=TaskStatus.FAILED.value, error="input_preflight_failed")
+        task_dir = cfg.task_dir(task_id)
+        old_input = task_dir / "input"
+        old_input.mkdir(parents=True)
+        original = png_bytes((1, 2, 3))
+        (old_input / "old.png").write_bytes(original)
+        uploads = [
+            ("images", (f"view-{index:02d}.png", png_bytes((index, 20, 30)), "image/png"))
+            for index in range(11)
+        ]
+        uploads.append(("images", ("view-11.png", b"not-an-image", "image/png")))
+
+        response = client.post(f"/api/tasks/{task_id}/retry-source", files=uploads)
+
+        assert response.status_code == 400
+        assert (old_input / "old.png").read_bytes() == original
+        assert not (task_dir / "source_replacements").exists()
+        assert get_task(cfg.DB_PATH, task_id)["status"] == TaskStatus.FAILED.value
 
     def test_image_worldgen_retry_accepts_a_replacement_source(self, client, cfg):
         task_id = create_task(
@@ -1616,21 +1806,21 @@ class TestAPI:
         assert get_task(cfg.DB_PATH, task_id)["status"] == "failed"
         assert not (task_dir / "recovery_attempts" / "attempt-001").exists()
 
-    def test_completed_degraded_delivery_can_request_a_higher_quality_source(self, client, cfg):
+    def test_migrated_degraded_delivery_can_request_a_higher_quality_source(self, client, cfg):
         task_id = create_task(
             cfg.DB_PATH,
             name="degraded-source-retry",
             task_type="worldgen",
             config={"quality_preset": "high", "recovery_policy": "auto", "seed": 1024},
         )
-        update_task(cfg.DB_PATH, task_id, status=TaskStatus.COMPLETED.value)
+        update_task(cfg.DB_PATH, task_id, status=TaskStatus.FAILED.value)
         task_dir = cfg.task_dir(task_id)
         task_dir.mkdir(parents=True)
         (task_dir / "auto_recovery.json").write_text(json.dumps({
             "version": 2,
             "task_type": "worldgen",
-            "state": "completed",
-            "delivery_tier": "degraded_3d",
+            "state": "quality_blocked",
+            "delivery_tier": None,
             "recovery_exhausted": True,
             "source_attempt": 2,
             "attempt_history": [],
@@ -1654,6 +1844,55 @@ class TestAPI:
         assert report["source_seed"] == 1027
         assert report["delivery_tier"] is None
         assert report["recovery_exhausted"] is False
+
+    def test_migrated_anchored_delivery_accepts_a_replacement_source_image(self, client, cfg):
+        task_id = create_task(
+            cfg.DB_PATH,
+            name="anchored-source-retry",
+            task_type="worldgen",
+            config={
+                "quality_preset": "high",
+                "recovery_policy": "auto",
+                "seed": 1024,
+                "input_mode": "prompt",
+            },
+        )
+        update_task(cfg.DB_PATH, task_id, status=TaskStatus.FAILED.value)
+        task_dir = cfg.task_dir(task_id)
+        task_dir.mkdir(parents=True)
+        (task_dir / "auto_recovery.json").write_text(json.dumps({
+            "version": 2,
+            "task_type": "worldgen",
+            "state": "quality_blocked",
+            "delivery_tier": None,
+            "recovery_exhausted": True,
+            "source_attempt": 1,
+            "attempt_history": [],
+            "source_attempts": [],
+            "accepted_trajectory_ids": [],
+            "attempted_trajectory_ids": [],
+            "pending_candidate_trajectory_ids": [],
+            "batches": [],
+            "generated_video_trajectory_count": 16,
+            "video_seconds": 3600,
+            "minimum_accepted_trajectories": 6,
+            "limits": {},
+        }))
+
+        response = client.post(
+            f"/api/tasks/{task_id}/retry-source",
+            files={"image": ("real-office.jpg", png_bytes((10, 20, 30)), "image/jpeg")},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "pending"
+        assert response.json()["config"]["input_mode"] == "image"
+        replacement = task_dir / "recovery_attempts" / "attempt-002" / "input" / "input.png"
+        assert Image.open(replacement).mode == "RGB"
+        report = json.loads((task_dir / "auto_recovery.json").read_text())
+        assert report["source_attempt"] == 2
+        assert report["delivery_tier"] is None
+        assert report["source_guidance_collapse"] is False
 
     def test_retry_source_requires_and_preserves_a_replacement_panorama(self, client, cfg):
         task_id = create_task(

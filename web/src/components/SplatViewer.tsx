@@ -8,6 +8,7 @@ import { areSplatWorkersIdle, disposeSplatResourcesWhenIdle } from "./splatClean
 import { isEditableTarget } from "./splatNavigation";
 import {
   clampToNavigationBounds,
+  hasNavigableBounds,
   initialCameraPose,
   moveOnGround,
   parseViewerMetadata,
@@ -22,6 +23,7 @@ interface SplatViewerProps {
   url: string;
   metadataUrl?: string;
   collisionMeshUrl?: string;
+  navigationEnabled?: boolean;
   onLoad?: () => void;
   onError?: (err: Error) => void;
 }
@@ -67,20 +69,17 @@ function resolveCollision(
     if (wallHit) return current.clone();
   }
 
-  // Re-anchor the camera eye on the simplified collision mesh when a nearby
-  // ground surface is present.  Vertical motion itself stays disabled.
-  const eyeHeight = Math.max(metadata.humanScale * 1.6, 0.4);
-  raycaster.set(bounded.clone().addScaledVector(up, eyeHeight), up.clone().negate());
-  raycaster.near = 0;
-  raycaster.far = eyeHeight * 2;
-  const groundHit = raycaster.intersectObject(collisionMesh, false)[0];
-  if (groundHit) {
-    return groundHit.point.clone().addScaledVector(up, eyeHeight);
-  }
   return bounded;
 }
 
-export default function SplatViewer({ url, metadataUrl, collisionMeshUrl, onLoad, onError }: SplatViewerProps) {
+export default function SplatViewer({
+  url,
+  metadataUrl,
+  collisionMeshUrl,
+  navigationEnabled = false,
+  onLoad,
+  onError,
+}: SplatViewerProps) {
   const viewerRef = useRef<HTMLDivElement>(null);
   const canvasContainerRef = useRef<HTMLDivElement>(null);
   const pressedKeysRef = useRef(new Set<string>());
@@ -93,7 +92,7 @@ export default function SplatViewer({ url, metadataUrl, collisionMeshUrl, onLoad
   const [keyboardActive, setKeyboardActive] = useState(false);
   const [pointerLockAvailable, setPointerLockAvailable] = useState(true);
   const [navigationStatus, setNavigationStatus] = useState<NavigationStatus>(
-    collisionMeshUrl ? "loading" : "unavailable",
+    navigationEnabled && collisionMeshUrl ? "loading" : "unavailable",
   );
   const [metadataMode, setMetadataMode] = useState<"loading" | "official" | "fallback">(
     metadataUrl ? "loading" : "fallback",
@@ -109,6 +108,7 @@ export default function SplatViewer({ url, metadataUrl, collisionMeshUrl, onLoad
     let fallbackReset: (() => void) | null = null;
     let collisionMesh: THREE.Mesh | null = null;
     let collisionReady = false;
+    let navigationReady = false;
     let splatReady = false;
     const raycaster = new THREE.Raycaster();
     (raycaster as THREE.Raycaster & { firstHitOnly?: boolean }).firstHitOnly = true;
@@ -117,7 +117,7 @@ export default function SplatViewer({ url, metadataUrl, collisionMeshUrl, onLoad
     setError("");
     setProgress(0);
     setLoadedBytes(0);
-    setNavigationStatus(collisionMeshUrl ? "loading" : "unavailable");
+    setNavigationStatus(navigationEnabled && collisionMeshUrl ? "loading" : "unavailable");
     setMetadataMode(metadataUrl ? "loading" : "fallback");
 
     const scene = new THREE.Scene();
@@ -178,6 +178,24 @@ export default function SplatViewer({ url, metadataUrl, collisionMeshUrl, onLoad
     };
     resetViewRef.current = applyInitialPose;
 
+    const updateNavigationReadiness = () => {
+      navigationReady = Boolean(
+        navigationEnabled
+        && collisionReady
+        && metadata
+        && hasNavigableBounds(metadata),
+      );
+      if (!navigationEnabled || !collisionMeshUrl) {
+        setNavigationStatus("unavailable");
+      } else if (navigationReady) {
+        setNavigationStatus("ready");
+      } else if (metadata && !hasNavigableBounds(metadata)) {
+        setNavigationStatus("unavailable");
+      } else {
+        setNavigationStatus("loading");
+      }
+    };
+
     const handleError = (cause: unknown) => {
       if (disposed) return;
       const nextError = cause instanceof Error ? cause : new Error(String(cause));
@@ -196,10 +214,14 @@ export default function SplatViewer({ url, metadataUrl, collisionMeshUrl, onLoad
           if (disposed) return;
           metadata = parseViewerMetadata(payload);
           setMetadataMode(metadata ? "official" : "fallback");
+          updateNavigationReadiness();
           applyInitialPose();
         })
         .catch(() => {
-          if (!disposed) setMetadataMode("fallback");
+          if (!disposed) {
+            setMetadataMode("fallback");
+            setNavigationStatus(navigationEnabled ? "error" : "unavailable");
+          }
         });
     }
 
@@ -216,11 +238,11 @@ export default function SplatViewer({ url, metadataUrl, collisionMeshUrl, onLoad
           collisionMesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial());
           collisionMesh.updateMatrixWorld(true);
           collisionReady = true;
-          setNavigationStatus("ready");
+          updateNavigationReadiness();
         },
         undefined,
         () => {
-          if (!disposed) setNavigationStatus("error");
+          if (!disposed) setNavigationStatus(navigationEnabled ? "error" : "unavailable");
         },
       );
     }
@@ -270,7 +292,7 @@ export default function SplatViewer({ url, metadataUrl, collisionMeshUrl, onLoad
         resetViewRef.current();
         return;
       }
-      if (!navigationCodes.has(event.code) || !collisionReady) return;
+      if (!navigationCodes.has(event.code) || !navigationReady) return;
       event.preventDefault();
       pressedKeysRef.current.add(event.code);
       setKeyboardActive(true);
@@ -297,7 +319,7 @@ export default function SplatViewer({ url, metadataUrl, collisionMeshUrl, onLoad
         ? 0
         : Math.min((frameTime - previousFrameTime) / 1000, 0.1);
       previousFrameTime = frameTime;
-      if (collisionReady && metadata && pressedKeysRef.current.size > 0) {
+      if (navigationReady && metadata && pressedKeysRef.current.size > 0) {
         const candidate = moveOnGround(
           camera.position,
           camera.getWorldDirection(new THREE.Vector3()),
@@ -354,7 +376,7 @@ export default function SplatViewer({ url, metadataUrl, collisionMeshUrl, onLoad
         },
       );
     };
-  }, [url, metadataUrl, collisionMeshUrl, onLoad, onError]);
+  }, [url, metadataUrl, collisionMeshUrl, navigationEnabled, onLoad, onError]);
 
   const loadedMegabytes = loadedBytes / 1024 / 1024;
   const navigationHint = navigationStatus === "ready"
@@ -365,7 +387,9 @@ export default function SplatViewer({ url, metadataUrl, collisionMeshUrl, onLoad
       ? "Preparing collision mesh… WASD is temporarily disabled"
       : navigationStatus === "error"
         ? "Collision mesh failed to load — WASD is disabled"
-        : "Collision mesh unavailable — WASD is disabled";
+        : navigationEnabled
+          ? "Validated navigation bounds are unavailable — WASD is disabled"
+          : "Free-view validation is unavailable — rotation and R reset remain enabled";
 
   return (
     <div
@@ -373,7 +397,9 @@ export default function SplatViewer({ url, metadataUrl, collisionMeshUrl, onLoad
       className={`splat-viewer ${keyboardActive ? "keyboard-active" : ""}`}
       tabIndex={0}
       data-keyboard-viewer
-      aria-label="Interactive first-person 3D model viewer. Use WASD to move, Shift to move faster, and R to reset the view."
+      aria-label={navigationEnabled
+        ? "Interactive first-person 3D model viewer. Use WASD to move, Shift to move faster, and R to reset the official view."
+        : "Interactive 3D model viewer. Rotate the view and press R to reset the official view; WASD is disabled."}
       onFocus={() => setKeyboardActive(true)}
       onBlur={() => {
         pressedKeysRef.current.clear();

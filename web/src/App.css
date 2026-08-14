@@ -491,12 +491,14 @@ body {
 /* Tab Bar */
 .tab-bar {
   display: flex;
+  flex-wrap: wrap;
   gap: 0;
   margin-bottom: 16px;
   border-bottom: 2px solid var(--border);
 }
 
 .tab-btn {
+  flex: 1 1 240px;
   padding: 12px 24px;
   background: transparent;
   border: none;
@@ -506,6 +508,7 @@ body {
   font-size: 0.95rem;
   margin-bottom: -2px;
   transition: all 0.2s;
+  line-height: 1.35;
 }
 
 .tab-btn:hover {
@@ -641,6 +644,58 @@ body {
   border-color: rgba(34, 197, 94, 0.42);
 }
 
+.product-state {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid rgba(96, 165, 250, 0.4);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.55);
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.product-state strong {
+  color: var(--text-primary);
+  font-size: 0.9rem;
+}
+
+.product-state-ready {
+  border-color: rgba(34, 197, 94, 0.55);
+  background: rgba(22, 101, 52, 0.18);
+}
+
+.product-state-repair_available,
+.product-state-repairing {
+  border-color: rgba(59, 130, 246, 0.58);
+  background: rgba(30, 64, 175, 0.18);
+}
+
+.product-state-source_replacement_required {
+  border-color: rgba(251, 191, 36, 0.58);
+  background: rgba(120, 72, 16, 0.2);
+}
+
+.legacy-warning {
+  border-color: rgba(251, 191, 36, 0.5);
+  background: rgba(120, 72, 16, 0.2);
+}
+
+.source-ranking {
+  margin: 0.4rem 0 0.7rem 1.25rem;
+  padding: 0;
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.legacy-warning h3 {
+  color: #fbbf24;
+}
+
 .recovery-diagnosis {
   color: #fbbf24 !important;
 }
@@ -663,8 +718,6 @@ body {
   color: #86efac;
 }
 
-.delivery-tier-degraded_3d strong,
-.delivery-tier-panorama_only strong,
 .quality-warning {
   color: #fbbf24 !important;
 }
@@ -675,6 +728,20 @@ body {
   align-items: flex-start;
   gap: 10px;
   margin-top: 12px;
+}
+
+.model-repair-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(96, 165, 250, 0.24);
+}
+
+.model-repair-controls p {
+  margin: 0;
 }
 
 .source-retry-controls .form-label {

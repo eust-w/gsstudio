@@ -163,17 +163,31 @@ function isInsideCameraObb(position: THREE.Vector3, metadata: ViewerMetadata): b
   return Math.abs(localWidth) <= halfWidth && Math.abs(localHeight) <= halfHeight;
 }
 
+export function hasNavigableBounds(metadata: ViewerMetadata): boolean {
+  const obb = metadata.cameraObb;
+  if (!obb) return false;
+  const halfWidth = obb[3];
+  const halfHeight = obb[4];
+  return Number.isFinite(halfWidth)
+    && Number.isFinite(halfHeight)
+    && halfWidth > 0
+    && halfHeight > 0;
+}
+
 export function clampToNavigationBounds(
   currentPosition: THREE.Vector3,
   candidatePosition: THREE.Vector3,
   metadata: ViewerMetadata,
 ): THREE.Vector3 {
   const bounded = clampAirWall(candidatePosition, metadata.airWall);
+  // WASD is horizontal-only. Air-wall clamping must not silently teleport the
+  // camera to a different eye height when an official pose lies near a bound.
+  const heightDelta = bounded.clone().sub(currentPosition).dot(metadata.upDirection);
+  bounded.addScaledVector(metadata.upDirection, -heightDelta);
+  if (!hasNavigableBounds(metadata)) return currentPosition.clone();
   if (isInsideCameraObb(bounded, metadata)) return bounded;
 
-  // The trainer OBB bounds only the ground plane.  Preserve a vertically
-  // clamped move while rejecting the unsafe horizontal component.
-  const up = metadata.upDirection;
-  const verticalDistance = bounded.clone().sub(currentPosition).dot(up);
-  return currentPosition.clone().addScaledVector(up, verticalDistance);
+  // The trainer OBB bounds the ground plane. Reject unsafe horizontal moves
+  // without changing the current camera height.
+  return currentPosition.clone();
 }

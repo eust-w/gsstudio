@@ -8,16 +8,26 @@ from .quality import normalize_worldgen_config
 
 
 WORLDGEN_STAGES = [
+    {"name": "source_generate", "description": "Four-source candidate generation", "gpu": "0,1,2,3,4"},
+    {"name": "input_preflight", "description": "OpenCV and Qwen3-VL input preflight", "gpu": "0"},
     {"name": "panogen", "description": "Panorama generation (HY-Pano-2 80B)", "gpu": "0,1,2,3,4"},
+    {"name": "post_panorama_preflight", "description": "Generated panorama reconstruction preflight", "gpu": "0"},
     {"name": "traj_generate", "description": "Trajectory planning (WorldNav)", "gpu": "0"},
     {"name": "traj_render", "description": "Trajectory rendering", "gpu": "0,1,2,3,4"},
     {"name": "video_gen", "description": "World expansion (WorldStereo-2)", "gpu": "0,1,2,3,4"},
     {"name": "gen_gs_data", "description": "GS data preparation", "gpu": "0,1,2,3,4"},
+    {"name": "gs_pilot", "description": "Independent 500-step 3DGS pilot", "gpu": "0,1,2,3,4"},
     {"name": "gs_training", "description": "3DGS training", "gpu": "0,1,2,3,4"},
+    {"name": "navigation_stress", "description": "1,000-step free-view navigation stress", "gpu": "0"},
 ]
 
-# Stages for worldgen_from_pano (skip panogen)
-WORLDGEN_FROM_PANO_STAGES = WORLDGEN_STAGES[1:]
+# Panorama input skips source generation and expansion, but still must pass
+# the generative strict-lane preflight.
+WORLDGEN_FROM_PANO_STAGES = [
+    WORLDGEN_STAGES[1],
+    WORLDGEN_STAGES[3],
+    *WORLDGEN_STAGES[4:],
+]
 
 
 def get_stage_names(task_type: str) -> list[str]:
@@ -26,7 +36,7 @@ def get_stage_names(task_type: str) -> list[str]:
     elif task_type == "worldgen_from_pano":
         return [s["name"] for s in WORLDGEN_FROM_PANO_STAGES]
     elif task_type == "worldrecon":
-        return ["worldrecon"]
+        return ["input_preflight", "worldrecon", "navigation_stress"]
     return []
 
 
@@ -76,11 +86,47 @@ def get_worldgen_commands(
 
     commands = []
 
-    # Stage 0: Panogen (only for worldgen type)
+    # Stage 0/1: build an immutable four-candidate pool, then score it while
+    # vLLM is resident. Uploaded images form a one-candidate pool.
     if task_type == "worldgen":
-        input_image = input_dir / config.get("input_image", "input.png")
-        pano_output = scene_dir / "panorama.png"
+        original_input_image = input_dir / config.get("input_image", "input.png")
         source_attempt = int(config.get("_source_attempt", 0))
+        source_generate_cmd = [
+            config.get("panogen_python", "/opt/panogen/bin/python"),
+            str(Path(__file__).with_name("panogen_adapter.py")),
+            "--panogen-dir", str(panogen_dir),
+            "--input-mode", str(config.get("input_mode", "image")),
+            "--image", str(original_input_image),
+            "--save", str(scene_dir / ".unused-panorama.png"),
+            "--report", str(task_dir / "source_generation.json"),
+            "--seed", str(int(config.get("seed", 1024))),
+            "--source-attempt", str(source_attempt),
+            "--source-pool-only",
+            "--candidate-dir", str(input_dir / "source_candidates"),
+            "--pool-report", str(task_dir / "source_pool.json"),
+            "--candidate-count", "4",
+        ]
+        if config.get("prompt"):
+            source_generate_cmd.extend(["--prompt", config["prompt"]])
+        commands.append(("source_generate", source_generate_cmd, {
+            "CUDA_VISIBLE_DEVICES": gpu_list,
+            "HF_HOME": config.get("hf_home", "/models/hf-cache"),
+        }, panogen_dir))
+
+    preflight_cmd = [
+        "python", str(Path(__file__).with_name("preflight.py")), "generative",
+        "--task-dir", str(task_dir),
+        "--input-dir", str(input_dir),
+        "--vllm-host", vllm_host,
+        "--vllm-port", str(vllm_port),
+        "--vllm-model", vllm_model,
+    ]
+    commands.append(("input_preflight", preflight_cmd, {"CUDA_VISIBLE_DEVICES": "0"}, hyworld_repo))
+
+    # Stage 2: expand only the preflight-selected source.
+    if task_type == "worldgen":
+        input_image = input_dir / "selected_source.png"
+        pano_output = scene_dir / "panorama.png"
         source_report = (
             scene_dir.parent / "source_generation.json"
             if source_attempt > 0
@@ -90,7 +136,7 @@ def get_worldgen_commands(
             config.get("panogen_python", "/opt/panogen/bin/python"),
             str(Path(__file__).with_name("panogen_adapter.py")),
             "--panogen-dir", str(panogen_dir),
-            "--input-mode", str(config.get("input_mode", "image")),
+            "--input-mode", "image",
             "--image", str(input_image),
             "--save", str(pano_output),
             "--report", str(source_report),
@@ -104,6 +150,22 @@ def get_worldgen_commands(
             "HF_HOME": config.get("hf_home", "/models/hf-cache"),
         }
         commands.append(("panogen", panogen_cmd, panogen_env, panogen_dir))
+
+    post_panorama_cmd = [
+        "python", str(Path(__file__).with_name("preflight.py")), "panorama",
+        "--task-dir", str(task_dir),
+        "--input-dir", str(input_dir),
+        "--panorama", str(scene_dir / "panorama.png"),
+        "--vllm-host", vllm_host,
+        "--vllm-port", str(vllm_port),
+        "--vllm-model", vllm_model,
+    ]
+    commands.append((
+        "post_panorama_preflight",
+        post_panorama_cmd,
+        {"CUDA_VISIBLE_DEVICES": "0"},
+        hyworld_repo,
+    ))
 
     # Stage 1: Trajectory generation
     traj_gen_cmd = [
@@ -182,12 +244,17 @@ def get_worldgen_commands(
     }
     commands.append(("gen_gs_data", gen_gs_cmd, gen_gs_env, worldgen_dir))
 
-    # Stage 5: 3DGS training
+    # Stage 6/7: the pilot is evaluation-only. Full training always writes to
+    # a different directory and starts from scratch.
     output_dir = task_dir / "output"
     gs_train_cmd = [
         "python", "-m", "world_gs_trainer", "default",
         "--data_dir", str(scene_dir / "gs_data"),
         "--result_dir", str(output_dir),
+        # Six accepted trajectories still need at least eight held-out views.
+        # Anchor frames are excluded from evaluation, so every 24th frame can
+        # still yield only seven renders; every 16th keeps a safe margin.
+        "--test-every", "16",
         "--max_steps", str(max_steps),
         "--save_steps", str(max_steps),
         "--eval_steps", str(max_steps),
@@ -220,6 +287,30 @@ def get_worldgen_commands(
         # on the persistent model volume so every worker starts offline.
         "TORCH_HOME": config.get("torch_home", "/models/torch-cache"),
     }
+    pilot_cmd = list(gs_train_cmd)
+    for option, value in (
+        ("--result_dir", str(task_dir / "pilot_output")),
+        ("--max_steps", "500"),
+        ("--save_steps", "500"),
+        ("--eval_steps", "500"),
+        ("--ply_steps", "500"),
+    ):
+        pilot_cmd[pilot_cmd.index(option) + 1] = value
+    for flag in ("--convert_to_spz", "--export_mesh"):
+        if flag in pilot_cmd:
+            pilot_cmd.remove(flag)
+    commands.append(("gs_pilot", pilot_cmd, gs_train_env, worldgen_dir))
     commands.append(("gs_training", gs_train_cmd, gs_train_env, worldgen_dir))
+
+    stress_cmd = [
+        "python", "-m", "server.pipeline.gaussian_repair",
+        "--task-dir", str(task_dir),
+        "--task-type", task_type,
+    ]
+    commands.append(("navigation_stress", stress_cmd, {
+        "CUDA_VISIBLE_DEVICES": "0",
+        "PYTHONPATH": "/app:/opt/hyworld2",
+        "TORCH_HOME": config.get("torch_home", "/models/torch-cache"),
+    }, hyworld_repo))
 
     return commands

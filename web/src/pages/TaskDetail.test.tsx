@@ -6,10 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import TaskDetail, { preferredPanoramaArtifact, preferredSplatArtifact } from "./TaskDetail";
 
-const { deleteTaskMock, getTaskMock, getTaskQualityMock, retryTaskSourceMock, updateTaskMock } = vi.hoisted(() => ({
+const { deleteTaskMock, getTaskMock, getTaskQualityMock, repairTaskModelMock, retryTaskSourceMock, updateTaskMock } = vi.hoisted(() => ({
   deleteTaskMock: vi.fn().mockResolvedValue(undefined),
   getTaskMock: vi.fn(),
   getTaskQualityMock: vi.fn().mockResolvedValue({ available: false }),
+  repairTaskModelMock: vi.fn().mockResolvedValue(undefined),
   retryTaskSourceMock: vi.fn().mockResolvedValue(undefined),
   updateTaskMock: vi.fn().mockResolvedValue(undefined),
 }));
@@ -45,6 +46,7 @@ vi.mock("../api", () => ({
   getArtifactUrl: (_taskId: string, path: string) => `/api/artifacts/${path}`,
   getTask: getTaskMock,
   getTaskQuality: getTaskQualityMock,
+  repairTaskModel: repairTaskModelMock,
   retryTaskSource: retryTaskSourceMock,
   updateTask: updateTaskMock,
 }));
@@ -56,8 +58,8 @@ vi.mock("../components/PanoViewer", () => ({
   default: ({ url }: { url: string }) => <div data-testid="panorama-viewer">{url}</div>,
 }));
 vi.mock("../components/SplatViewer", () => ({
-  default: ({ url, metadataUrl, collisionMeshUrl }: { url: string; metadataUrl?: string; collisionMeshUrl?: string }) => (
-    <div data-testid="splat-viewer">{[url, metadataUrl, collisionMeshUrl].filter(Boolean).join("|")}</div>
+  default: ({ url, metadataUrl, collisionMeshUrl, navigationEnabled }: { url: string; metadataUrl?: string; collisionMeshUrl?: string; navigationEnabled?: boolean }) => (
+    <div data-testid="splat-viewer">{[url, metadataUrl, collisionMeshUrl, `nav:${Boolean(navigationEnabled)}`].filter(Boolean).join("|")}</div>
   ),
 }));
 
@@ -69,6 +71,7 @@ afterEach(() => {
 
 beforeEach(() => {
   getTaskMock.mockResolvedValue(taskFixture);
+  getTaskQualityMock.mockResolvedValue({ available: false });
 });
 
 describe("TaskDetail", () => {
@@ -193,9 +196,9 @@ describe("TaskDetail", () => {
     );
 
     expect(await screen.findByText("worldstereo-memory")).toBeInTheDocument();
-    expect(screen.getByText(/minimum 8 valid trajectories/i)).toBeInTheDocument();
-    expect(screen.getByText(/starts with 8 regular-first candidates/i)).toBeInTheDocument();
-    expect(screen.getByText(/5 GPUs.*2,000 steps.*200.*1000.*133/i)).toBeInTheDocument();
+    expect(screen.getByText(/first batch 8 regular trajectories.*at least 6 alignment-approved.*target 10/i)).toBeInTheDocument();
+    expect(screen.getByText(/target 10.*minimum 6.*24 trajectories.*4 hours.*3 ranked sources/i)).toBeInTheDocument();
+    expect(screen.getByText(/500-step pilot.*2,000-step final training/i)).toBeInTheDocument();
   });
 
   it("shows live conservative-recovery progress and its GPU budget", async () => {
@@ -223,17 +226,25 @@ describe("TaskDetail", () => {
 
     expect(await screen.findByRole("heading", { name: "Automatic recovery" })).toBeInTheDocument();
     expect(screen.getByText(/Conservative safe trajectories/i)).toBeInTheDocument();
-    expect(screen.getByText(/2 of 6 accepted/i)).toBeInTheDocument();
+    expect(screen.getByText(/2 accepted.*minimum 6.*target 10/i)).toBeInTheDocument();
     expect(screen.getByText(/8 of 40 WorldStereo trajectories/i)).toBeInTheDocument();
   });
 
-  it("shows limited 3DGS delivery, best attempt, warning, and recovery budget", async () => {
+  it("blocks a five-trajectory Worldgen delivery and hides 3D navigation", async () => {
+    getTaskMock.mockResolvedValue({
+      ...taskFixture,
+      type: "worldgen",
+      status: "failed",
+      error_code: "insufficient_free_view_coverage",
+      error: "insufficient_free_view_coverage",
+    });
     getTaskQualityMock.mockResolvedValue({
       available: true,
-      state: "completed",
-      delivery_tier: "degraded_3d",
+      state: "quality_blocked",
+      delivery_tier: null,
+      free_view_eligible: false,
       best_source_attempt: 1,
-      quality_warning: "Only 5 trajectories passed; 3D coverage is reduced.",
+      terminal_reason: "insufficient_free_view_coverage: only 5 passed. Replace the source and retry.",
       recovery_exhausted: true,
       transient_retry_count: 2,
       accepted_trajectories: 5,
@@ -255,16 +266,180 @@ describe("TaskDetail", () => {
       </MemoryRouter>,
     );
 
-    expect(await screen.findByText("Limited 3DGS")).toBeInTheDocument();
+    expect(await screen.findByText("Source needs replacement")).toBeInTheDocument();
     expect(screen.getByText("Best source attempt").closest("p")).toHaveTextContent("1");
     expect(screen.getByText(/31 of 32 WorldStereo trajectories/i)).toBeInTheDocument();
-    expect(screen.getByText(/Only 5 trajectories passed/i)).toBeInTheDocument();
+    expect(screen.getByText(/only 5 passed/i)).toBeInTheDocument();
     expect(screen.getByText("Infrastructure retries").closest("p")).toHaveTextContent("2");
+    expect(screen.queryByRole("button", { name: "3D Model" })).not.toBeInTheDocument();
   });
 
-  it("defaults a panorama-only completed result to panorama and never renders an empty 3D viewer", async () => {
+  it("offers one guided repair for a sparse giant-Gaussian-only failure", async () => {
     getTaskMock.mockResolvedValue({
       ...taskFixture,
+      type: "worldgen",
+      status: "failed",
+      error_code: "navigation_stress_failed",
+      error: "internal navigation traceback",
+    });
+    getTaskQualityMock.mockResolvedValue({
+      available: true,
+      product_state: "repair_available",
+      next_action: "repair_model",
+      user_message: "模型主体质量合格，仅检测到少量巨大 Gaussian。",
+      free_view_eligible: false,
+      repair_eligibility: {
+        eligible: true,
+        offending_gaussian_count: 119,
+        offending_gaussian_fraction: 0.000179,
+        attempts_used: 0,
+        maximum_attempts: 1,
+      },
+      navigation_stress: {
+        state: "failed",
+        walk: { completed_steps: 1000, accepted_steps: 992 },
+        representative_views: Array.from({ length: 32 }),
+        micro_translation_pairs: Array.from({ length: 16 }),
+        failure_reasons: ["view_01_giant_gaussian"],
+      },
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes><Route path="/tasks/:taskId" element={<TaskDetail />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("Safe repair available")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "3D Model" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Revalidate and repair model" }));
+    await waitFor(() => expect(repairTaskModelMock).toHaveBeenCalledWith("recon-task"));
+    expect(retryTaskSourceMock).not.toHaveBeenCalled();
+  });
+
+  it("requires source replacement when generated panorama preflight fails", async () => {
+    getTaskMock.mockResolvedValue({
+      ...taskFixture,
+      type: "worldgen",
+      status: "failed",
+      error_code: "source_replacement_required",
+      error: "post_panorama_preflight_failed",
+    });
+    getTaskQualityMock.mockResolvedValue({
+      available: true,
+      product_state: "source_replacement_required",
+      next_action: "replace_source",
+      user_message: "生成后的全景不适合稳定自由视角重建。",
+      post_panorama_preflight: {
+        state: "failed",
+        composite_score: 0.41,
+        failure_reasons: ["person", "perspective_conflict"],
+      },
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes><Route path="/tasks/:taskId" element={<TaskDetail />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("Source replacement required")).toBeInTheDocument();
+    expect(screen.getByText("Generated panorama preflight").closest("p")).toHaveTextContent("failed");
+    expect(screen.queryByRole("button", { name: "Revalidate and repair model" })).not.toBeInTheDocument();
+  });
+
+  it("shows 3D and enables navigation only for a validated strict Worldgen delivery", async () => {
+    getTaskMock.mockResolvedValue({ ...taskFixture, type: "worldgen", status: "completed" });
+    getTaskQualityMock.mockResolvedValue({
+      available: true,
+      state: "completed",
+      delivery_tier: "strict_3d",
+      free_view_eligible: true,
+      accepted_trajectories: 6,
+      required_trajectories: 6,
+      navigation_validation: {
+        free_view_eligible: true,
+        unique_translated_camera_centers: 12,
+        azimuth_bin_count: 6,
+        validation_render_count: 4,
+      },
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes><Route path="/tasks/:taskId" element={<TaskDetail />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("Strict free-view 3DGS")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "3D Model" })).toBeInTheDocument();
+    expect(screen.getByTestId("splat-viewer")).toHaveTextContent("nav:true");
+    expect(screen.getByText(/12 translated centers.*6\/8 azimuth bins.*4 validation renders/i)).toBeInTheDocument();
+  });
+
+  it("hides v4 Worldrecon 3D when navigation stress did not pass", async () => {
+    getTaskMock.mockResolvedValue({ ...taskFixture, type: "worldrecon", status: "failed", error_code: "navigation_stress_failed" });
+    getTaskQualityMock.mockResolvedValue({
+      available: true,
+      contract_version: 4,
+      input_lane: "production_multiview",
+      free_view_eligible: false,
+      input_preflight: { state: "passed", candidate_frame_count: 24, selected_frame_count: 16 },
+      navigation_stress: { state: "failed", free_view_eligible: false, failure_reasons: ["view_03_giant_gaussian"] },
+    });
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes><Route path="/tasks/:taskId" element={<TaskDetail />} /></Routes>
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText(/v4.*production_multiview/i)).toBeInTheDocument();
+    expect(screen.getByText(/passed.*16\/24 frames selected/i)).toBeInTheDocument();
+    expect(screen.getByText(/failed.*0\/1000 steps.*0\/32 views.*0\/16 micro pairs/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "3D Model" })).not.toBeInTheDocument();
+  });
+
+  it("opens WASD for v4 Worldrecon only after every strict gate passes", async () => {
+    getTaskQualityMock.mockResolvedValue({
+      available: true,
+      contract_version: 4,
+      input_lane: "production_multiview",
+      free_view_eligible: true,
+      input_preflight: { state: "passed", candidate_frame_count: 24, selected_frame_count: 18 },
+      navigation_stress: {
+        state: "passed",
+        free_view_eligible: true,
+        walk: { completed_steps: 1000 },
+        representative_views: Array.from({ length: 32 }),
+        micro_translation_pairs: Array.from({ length: 16 }),
+      },
+    });
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes><Route path="/tasks/:taskId" element={<TaskDetail />} /></Routes>
+      </MemoryRouter>,
+    );
+    expect(await screen.findByRole("button", { name: "3D Model" })).toBeInTheDocument();
+    expect(screen.getByTestId("splat-viewer")).toHaveTextContent("nav:true");
+    expect(screen.queryByText("Legacy unvalidated")).not.toBeInTheDocument();
+  });
+
+  it("keeps legacy Worldrecon rotation-only and disables WASD", async () => {
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes><Route path="/tasks/:taskId" element={<TaskDetail />} /></Routes>
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText("Legacy unvalidated")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "3D Model" })).toBeInTheDocument();
+    expect(screen.getByTestId("splat-viewer")).toHaveTextContent("nav:false");
+  });
+
+  it("defaults a quality-blocked result to panorama and never renders an empty 3D viewer", async () => {
+    getTaskMock.mockResolvedValue({
+      ...taskFixture,
+      type: "worldgen",
+      status: "failed",
+      error_code: "insufficient_free_view_coverage",
       artifacts: [
         { name: "panorama.png", path: "output/panorama.png", type: "image", size: 256 },
         { name: "render.mp4", path: "output/render.mp4", type: "video", size: 2048 },
@@ -273,9 +448,10 @@ describe("TaskDetail", () => {
     });
     getTaskQualityMock.mockResolvedValue({
       available: true,
-      state: "completed",
-      delivery_tier: "panorama_only",
-      quality_warning: "3D training was safely skipped.",
+      state: "quality_blocked",
+      delivery_tier: null,
+      free_view_eligible: false,
+      terminal_reason: "insufficient_free_view_coverage: replace the source and retry.",
       accepted_trajectories: 3,
       required_trajectories: 6,
       generated_video_trajectories: 20,
@@ -291,11 +467,11 @@ describe("TaskDetail", () => {
       </MemoryRouter>,
     );
 
-    expect(await screen.findByText("Panorama result")).toBeInTheDocument();
+    expect(await screen.findByText("Source needs replacement")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Panorama" })).toHaveClass("active");
     expect(screen.queryByRole("button", { name: "3D Model" })).not.toBeInTheDocument();
     expect(screen.queryByTestId("splat-viewer")).not.toBeInTheDocument();
-    expect(screen.getByText(/3D training was safely skipped/i)).toBeInTheDocument();
+    expect(screen.getByText(/insufficient_free_view_coverage/i)).toBeInTheDocument();
   });
 
   it("prefers panorama over PLY when no streaming SPZ is available", async () => {
@@ -349,7 +525,65 @@ describe("TaskDetail", () => {
     fireEvent.change(screen.getByLabelText("Replacement panorama"), { target: { files: [panorama] } });
     fireEvent.click(screen.getByRole("button", { name: "Retry with replacement panorama" }));
 
-    await waitFor(() => expect(retryTaskSourceMock).toHaveBeenCalledWith("recon-task", panorama, "worldgen_from_pano"));
+    await waitFor(() => expect(retryTaskSourceMock).toHaveBeenCalledWith(
+      "recon-task", panorama, "worldgen_from_pano", [], undefined,
+    ));
+  });
+
+  it("offers a quality-blocked prompt task a real source replacement and shows source diagnostics", async () => {
+    getTaskMock.mockResolvedValue({
+      ...taskFixture,
+      type: "worldgen",
+      status: "failed",
+      error_code: "insufficient_free_view_coverage",
+      config: {
+        ...taskFixture.config,
+        input_mode: "prompt",
+      },
+    });
+    getTaskQualityMock.mockResolvedValue({
+      available: true,
+      state: "quality_blocked",
+      delivery_tier: null,
+      free_view_eligible: false,
+      recovery_exhausted: true,
+      terminal_reason: "insufficient_free_view_coverage: replace the source and retry.",
+      source_guidance_collapse: true,
+      guidance_diagnostics: {
+        detected: true,
+        diagnostic_cutoff: 0.6,
+        best_minimum_guidance_mask: 0.409,
+      },
+      source_generation: {
+        mode: "prompt",
+        state: "completed",
+        source_attempt: 0,
+        seed: 1024,
+        original_prompt: "robotics office",
+        effective_prompt: "robotics office with geometry guidance",
+        requested_source_width: 1216,
+        requested_source_height: 832,
+      },
+    });
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes><Route path="/tasks/:taskId" element={<TaskDetail />} /></Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByRole("heading", { name: "Automatic recovery" });
+
+    expect(screen.getByText(/Automatic geometry guidance applied/i)).toBeInTheDocument();
+    expect(screen.getByText(/1216×832 fixed landscape/i)).toBeInTheDocument();
+    expect(screen.getByText(/best worst-frame 0.409/i)).toBeInTheDocument();
+    const replacement = new File(["real office"], "office.jpg", { type: "image/jpeg" });
+    fireEvent.change(screen.getByLabelText("Replacement source image (recommended)"), {
+      target: { files: [replacement] },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Retry with replacement source" }));
+
+    await waitFor(() => expect(retryTaskSourceMock).toHaveBeenCalledWith(
+      "recon-task", replacement, "worldgen", [], undefined,
+    ));
   });
 
   it("defaults to 3D and exposes fullscreen for every preview type", async () => {

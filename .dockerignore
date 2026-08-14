@@ -1,0 +1,12 @@
+.git
+.venv
+**/__pycache__
+**/*.pyc
+web/node_modules
+web/src
+web/public
+web/coverage
+tests
+docs
+data
+*.log

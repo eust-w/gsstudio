@@ -1,7 +1,7 @@
 """Task CRUD and log streaming endpoints."""
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import asyncio
 import json
@@ -18,6 +18,18 @@ from ..config import Config
 from ..db import create_task, delete_task, get_task, list_tasks, new_task_id, update_task
 from ..models import TaskDetail, TaskListResponse, TaskResponse, TaskStatus, TaskUpdate
 from ..pipeline.quality import normalize_worldgen_config
+from ..pipeline.preflight import (
+    CONTRACT_VERSION,
+    MINIMUM_MULTIVIEW_FRAMES,
+    normalize_task_contract,
+    strict_contract,
+    write_json_atomic,
+)
+from ..pipeline.gaussian_repair import (
+    GaussianRepairError,
+    assess_repair_eligibility,
+    request_gaussian_repair,
+)
 from ..pipeline.recovery import (
     AutoRecoveryError,
     archive_downstream_checkpoints,
@@ -144,12 +156,15 @@ async def create_task_endpoint(
             config_dict = normalize_worldgen_config(config_dict, form_prompt=prompt)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+    config_dict = normalize_task_contract(config_dict, type)
 
     normalized_prompt = str(config_dict.get("prompt") or "").strip()
     if len(normalized_prompt) > MAX_PROMPT_CHARS:
         raise HTTPException(400, f"Prompt must be at most {MAX_PROMPT_CHARS} characters")
     if type == "worldgen" and image is None and not normalized_prompt:
         raise HTTPException(400, "Text to World requires an image or a non-empty prompt")
+    if type == "worldgen_from_pano" and panorama is None:
+        raise HTTPException(400, "Panorama to World requires a panorama image")
     if type == "worldgen":
         config_dict["input_mode"] = "image" if image is not None else "prompt"
 
@@ -214,6 +229,7 @@ async def create_task_endpoint(
         final_dir = cfg.task_dir(task_id)
         final_dir.parent.mkdir(parents=True, exist_ok=True)
         incoming_dir.replace(final_dir)
+        write_json_atomic(final_dir / "task_contract.json", strict_contract(type))
         try:
             create_task(cfg.DB_PATH, name=name, task_type=type, config=config_dict, task_id=task_id)
         except Exception:
@@ -258,6 +274,91 @@ async def get_task_quality_endpoint(task_id: str):
     if not get_task(cfg.DB_PATH, task_id):
         raise HTTPException(404, "Task not found")
     return auto_recovery_summary(cfg.task_dir(task_id))
+
+
+@router.get("/quality/summary")
+async def get_quality_summary_endpoint():
+    """Aggregate the strict v4 funnel and rolling-20 SLO by input lane."""
+    cfg = _get_config()
+    tasks: list[dict] = []
+    offset = 0
+    while True:
+        page, total = list_tasks(cfg.DB_PATH, limit=100, offset=offset)
+        tasks.extend(page)
+        offset += len(page)
+        if not page or offset >= total:
+            break
+    lanes: dict[str, dict[str, Any]] = {}
+    eligible_total = 0
+    incorrectly_opened = 0
+    for task in tasks:
+        quality = auto_recovery_summary(cfg.task_dir(task["id"]))
+        contract_version = int(quality.get("contract_version", 0) or 0)
+        if contract_version < CONTRACT_VERSION:
+            continue
+        lane = str(quality.get("input_lane") or (task.get("config") or {}).get("input_lane") or "unknown")
+        stats = lanes.setdefault(lane, {
+            "tasks": 0,
+            "preflight_passed": 0,
+            "preflight_resolved": 0,
+            "strict_completed": 0,
+            "failure_stages": {},
+            "worldstereo_trajectories": 0,
+            "gpu_seconds": 0.0,
+            "recent": [],
+        })
+        stats["tasks"] += 1
+        if (quality.get("input_preflight") or {}).get("state") == "passed":
+            stats["preflight_passed"] += 1
+        resolved = task.get("status") in {"completed", "failed"}
+        if resolved and (quality.get("input_preflight") or {}).get("state") == "passed":
+            stats["preflight_resolved"] += 1
+        if task.get("status") == "completed" and quality.get("free_view_eligible") is True:
+            stats["strict_completed"] += 1
+        if quality.get("free_view_eligible") is True:
+            eligible_total += 1
+        if quality.get("free_view_eligible") is True and (quality.get("navigation_stress") or {}).get("state") != "passed":
+            incorrectly_opened += 1
+        error_code = str(task.get("error_code") or "")
+        if task.get("status") == "failed":
+            stats["failure_stages"][error_code or "pipeline_failed"] = stats["failure_stages"].get(error_code or "pipeline_failed", 0) + 1
+        budget = quality.get("global_budget") or {}
+        stats["worldstereo_trajectories"] += int(budget.get("worldstereo_trajectories_used", 0) or 0)
+        stats["gpu_seconds"] += float(budget.get("worldstereo_seconds_used", 0.0) or 0.0)
+        stats["recent"].append({
+            "id": task["id"],
+            "created_at": task.get("created_at"),
+            "preflight_passed": (quality.get("input_preflight") or {}).get("state") == "passed",
+            "resolved": resolved,
+            "strict_completed": task.get("status") == "completed" and quality.get("free_view_eligible") is True,
+        })
+    for stats in lanes.values():
+        stats["preflight_pass_rate"] = stats["preflight_passed"] / stats["tasks"] if stats["tasks"] else 0.0
+        stats["strict_completion_rate"] = stats["strict_completed"] / stats["preflight_resolved"] if stats["preflight_resolved"] else None
+        eligible_recent = sorted(
+            [
+                item for item in stats.pop("recent")
+                if item["preflight_passed"] and item["resolved"]
+            ],
+            key=lambda item: str(item.get("created_at") or ""),
+            reverse=True,
+        )[:20]
+        stats["recent_20_slo"] = {
+            "sample_size": len(eligible_recent),
+            "successes": sum(1 for item in eligible_recent if item["strict_completed"]),
+            "success_rate": (
+                sum(1 for item in eligible_recent if item["strict_completed"]) / len(eligible_recent)
+                if eligible_recent else None
+            ),
+            "target": 0.95,
+        }
+    return {
+        "contract_version": CONTRACT_VERSION,
+        "success_policy": "strict_free_view",
+        "lanes": lanes,
+        "free_view_eligible_tasks": eligible_total,
+        "incorrect_wasd_openings": incorrectly_opened,
+    }
 
 
 @router.patch("/tasks/{task_id}")
@@ -331,31 +432,194 @@ async def retry_task_endpoint(task_id: str):
     return get_task(cfg.DB_PATH, task_id)
 
 
+@router.post("/tasks/{task_id}/repair")
+async def repair_task_model_endpoint(task_id: str):
+    """Queue one bounded model repair without rerunning paid upstream stages."""
+    cfg = _get_config()
+    task = get_task(cfg.DB_PATH, task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    if task["status"] not in (TaskStatus.FAILED.value, TaskStatus.CANCELLED.value):
+        raise HTTPException(409, f"Cannot repair task in status: {task['status']}")
+    if task["type"] not in ("worldgen", "worldgen_from_pano", "worldrecon"):
+        raise HTTPException(409, "This task type does not support model repair")
+    task_dir = cfg.task_dir(task_id)
+    post_panorama = {}
+    try:
+        post_panorama = json.loads((task_dir / "post_panorama_preflight.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    if post_panorama.get("state") == "failed":
+        raise HTTPException(409, "Generated panorama preflight failed; replace the source instead")
+    assessment = assess_repair_eligibility(task_dir)
+    if not (assessment.get("eligible") or assessment.get("requires_reanalysis")):
+        raise HTTPException(409, str(assessment.get("reason") or "Model repair is not available"))
+    try:
+        request = request_gaussian_repair(task_dir)
+    except GaussianRepairError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    navigation_marker = task_dir / ".stage_navigation_stress_done"
+    if navigation_marker.exists():
+        navigation_marker.unlink()
+    update_task(
+        cfg.DB_PATH,
+        task_id,
+        status=TaskStatus.PENDING.value,
+        progress=0.0,
+        current_stage=None,
+        error=None,
+        error_code=None,
+        error_summary=None,
+    )
+    return {
+        "task_id": task_id,
+        "status": "pending",
+        "repair_request": request,
+    }
+
+
 @router.post("/tasks/{task_id}/retry-source")
 async def retry_task_source_endpoint(
     task_id: str,
     panorama: Optional[UploadFile] = File(None),
     image: Optional[UploadFile] = File(None),
+    images: Optional[list[UploadFile]] = File(None),
+    video: Optional[UploadFile] = File(None),
 ):
     """Queue a user-approved new source without weakening the quality gate."""
     cfg = _get_config()
     task = get_task(cfg.DB_PATH, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    if task["type"] not in ("worldgen", "worldgen_from_pano"):
-        raise HTTPException(409, "Only World Generation tasks support source retry")
+    if task["type"] not in ("worldgen", "worldgen_from_pano", "worldrecon"):
+        raise HTTPException(409, "This task type does not support source retry")
     task_dir = cfg.task_dir(task_id)
     current = auto_recovery_summary(task_dir)
-    completed_recovery_retry = (
-        task["status"] == TaskStatus.COMPLETED.value
-        and current.get("recovery_exhausted") is True
-        and current.get("delivery_tier") in {"degraded_3d", "panorama_only"}
-    )
-    if task["status"] not in (TaskStatus.FAILED.value, TaskStatus.CANCELLED.value) and not completed_recovery_retry:
+    if task["status"] not in (TaskStatus.FAILED.value, TaskStatus.CANCELLED.value):
         raise HTTPException(409, f"Cannot replace the source in status: {task['status']}")
     config = dict(task.get("config") or {})
-    if config.get("quality_preset", "high") != "high" or config.get("recovery_policy", "auto") != "auto":
+    if task["type"] != "worldrecon" and (
+        config.get("quality_preset", "high") != "high" or config.get("recovery_policy", "auto") != "auto"
+    ):
         raise HTTPException(409, "Source retry is available only for high-quality tasks with automatic recovery enabled")
+    if task["type"] == "worldrecon":
+        if not video and not images:
+            raise HTTPException(400, "Upload a replacement video or at least 12 multi-view images")
+        if images and len(images) < MINIMUM_MULTIVIEW_FRAMES:
+            raise HTTPException(400, "At least 12 replacement multi-view images are required")
+        retry_id = uuid.uuid4().hex
+        staging = task_dir / ".incoming-retry" / retry_id
+        staged_input = staging / "input"
+        staged_input.mkdir(parents=True, exist_ok=False)
+        total_limit = 2 * 1024 * 1024 * 1024
+        total = 0
+        uploads = images or []
+        try:
+            for index, upload in enumerate(uploads):
+                if not (upload.content_type or "").startswith("image/"):
+                    raise HTTPException(400, "Every replacement multi-view file must be an image")
+                raw = staged_input / f"image_{index:04d}_{Path(upload.filename or 'image').name}"
+                with raw.open("wb") as handle:
+                    while chunk := await upload.read(1024 * 1024):
+                        total += len(chunk)
+                        if total > total_limit:
+                            raise HTTPException(400, "Replacement upload exceeds the 2 GiB limit")
+                        handle.write(chunk)
+                if raw.stat().st_size == 0:
+                    raise HTTPException(400, "Replacement image is empty")
+            if video:
+                if not (video.content_type or "").startswith("video/"):
+                    raise HTTPException(400, "Replacement video must be a video file")
+                raw = staged_input / "input_video.mp4"
+                with raw.open("wb") as handle:
+                    while chunk := await video.read(1024 * 1024):
+                        total += len(chunk)
+                        if total > total_limit:
+                            raise HTTPException(400, "Replacement upload exceeds the 2 GiB limit")
+                        handle.write(chunk)
+                if raw.stat().st_size == 0:
+                    raise HTTPException(400, "Replacement video is empty")
+            if uploads:
+                from PIL import Image, UnidentifiedImageError
+                for path in sorted(staged_input.glob("image_*")):
+                    try:
+                        with Image.open(path) as decoded:
+                            decoded.verify()
+                    except (UnidentifiedImageError, OSError, ValueError) as exc:
+                        raise HTTPException(400, f"Replacement image is corrupt: {path.name}") from exc
+            if video:
+                import cv2
+                capture = cv2.VideoCapture(str(staged_input / "input_video.mp4"))
+                frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+                ok, _ = capture.read()
+                capture.release()
+                if not ok or frame_count < 24:
+                    raise HTTPException(400, "Replacement video must contain at least 24 decodable frames")
+            replacement_root = task_dir / "source_replacements"
+            replacement_root.mkdir(parents=True, exist_ok=True)
+            attempt = len([item for item in replacement_root.glob("attempt-*") if item.is_dir()]) + 1
+            archive = replacement_root / f"attempt-{attempt:03d}"
+            archive.mkdir(parents=True, exist_ok=False)
+            moved: list[tuple[Path, Path]] = []
+            replacement_input = task_dir / "input"
+            try:
+                for name in ("input", "output"):
+                    current_path = task_dir / name
+                    if current_path.exists():
+                        destination = archive / name
+                        os.replace(current_path, destination)
+                        moved.append((destination, current_path))
+                for name in (
+                    "input_preflight.json", "post_panorama_preflight.json", "source_pool.json",
+                    "navigation_stress.json", "viewer_metadata_validation.json",
+                    "artifact_validation.json", "gaussian_repair.json",
+                    "gaussian_repair_request.json",
+                ):
+                    current_path = task_dir / name
+                    if current_path.exists():
+                        destination = archive / name
+                        os.replace(current_path, destination)
+                        moved.append((destination, current_path))
+                for marker in sorted(task_dir.glob(".stage_*_done")):
+                    destination = archive / marker.name
+                    os.replace(marker, destination)
+                    moved.append((destination, marker))
+                os.replace(staged_input, replacement_input)
+                write_json_atomic(task_dir / "source_retry.json", {
+                    "version": CONTRACT_VERSION,
+                    "state": "queued",
+                    "source_attempt": attempt,
+                    "archive_path": str(archive.relative_to(task_dir)),
+                    "input_mode": "video" if video else "images",
+                })
+                update_task(
+                    cfg.DB_PATH, task_id, status=TaskStatus.PENDING.value, progress=0.0,
+                    current_stage=None, error=None, error_code=None, error_summary=None,
+                    config=normalize_task_contract(config, "worldrecon"),
+                )
+            except Exception:
+                # All validation happened before this transaction. If any
+                # same-filesystem promotion fails, restore every archived path
+                # in reverse order so the task never observes a half retry.
+                if replacement_input.exists() and not staged_input.exists():
+                    staged_input.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(replacement_input, staged_input)
+                for archived, original in reversed(moved):
+                    if archived.exists() and not original.exists():
+                        os.replace(archived, original)
+                retry_report = task_dir / "source_retry.json"
+                if retry_report.exists():
+                    retry_report.unlink()
+                try:
+                    archive.rmdir()
+                except OSError:
+                    pass
+                raise
+            shutil.rmtree(staging, ignore_errors=True)
+            return get_task(cfg.DB_PATH, task_id)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
     if task["type"] == "worldgen_from_pano" and panorama is None:
         raise HTTPException(400, "Upload a replacement panorama to retry this panorama-based task")
     if panorama is not None and not (panorama.content_type or "").startswith("image/"):

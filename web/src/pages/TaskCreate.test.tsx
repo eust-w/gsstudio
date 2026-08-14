@@ -27,7 +27,10 @@ describe("TaskCreate quality configuration", () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByLabelText("Quality preset")).toHaveValue("high");
+    expect(screen.getByRole("button", { name: /Multi-View Reconstruction.*Production recommended/i })).toHaveClass("active");
+    fireEvent.click(screen.getByRole("button", { name: /Text.*Image to World.*Generative/i }));
+    expect(screen.getByText("Quality preset")).toBeInTheDocument();
+    expect(screen.queryByText(/Fast —/i)).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Task Name"), { target: { value: "quality task" } });
     fireEvent.change(screen.getByLabelText("Text Prompt"), { target: { value: "form prompt" } });
     fireEvent.click(screen.getByRole("button", { name: /show advanced config/i }));
@@ -43,9 +46,22 @@ describe("TaskCreate quality configuration", () => {
       quality_preset: "high",
       recovery_policy: "auto",
       seed: 17,
+      success_policy: "strict_free_view",
+      input_lane: "generative_worldgen",
     });
-    expect(screen.getByText(/valid image always returns a usable result/i)).toBeInTheDocument();
-    expect(screen.getByText(/3D tier depends on how many trajectories pass/i)).toBeInTheDocument();
+    expect(screen.getByText(/Six trajectories are the training minimum/i)).toBeInTheDocument();
+    expect(screen.getByText(/four ranked sources/i)).toBeInTheDocument();
     expect(screen.getByText(/without an image.*generates a source view first/i)).toBeInTheDocument();
+  });
+
+  it("requires twelve images when no production video is provided", async () => {
+    render(<MemoryRouter><TaskCreate /></MemoryRouter>);
+    fireEvent.change(screen.getByLabelText("Task Name"), { target: { value: "too-few" } });
+    const input = document.querySelector('input[type="file"][multiple]') as HTMLInputElement;
+    const files = Array.from({ length: 11 }, (_, index) => new File(["x"], `frame-${index}.png`, { type: "image/png" }));
+    fireEvent.change(input, { target: { files } });
+    fireEvent.click(screen.getByRole("button", { name: "Create Task" }));
+    expect(await screen.findByText(/requires at least 12 multi-view images/i)).toBeInTheDocument();
+    expect(createTaskMock).not.toHaveBeenCalled();
   });
 });
