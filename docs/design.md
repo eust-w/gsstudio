@@ -144,12 +144,15 @@ Based on pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel. All CUDA extensions are co
    transformers <5, which conflicts with the main HY-World env
    (torch 2.7.1 + transformers 5.2.0). Pipeline talks to vLLM only over HTTP.
 
-## Deployment Status (verified 2026-08-13)
+## Deployment Status (verified 2026-08-17)
 
-- Image: `ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v66`
-- Digest: `sha256:08f681ddec830d2fcffc19c339f035b28d0a783ab841532f12cf200003e3a9cc`
-- Rollback image: `a800-v65`
-- Pod: `gsstudio-54d57d77b-89jjv`, 1/1 Running, restart count 0, 5x A800
+- Image: `ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v67`
+- Digest: `sha256:3e2d48c91eedf1b80ce386a24ab86156a1af7b3f4fc1bc8337f45a1ca3cfff74`
+- Rollback image: `a800-v66`
+- Pod: `gsstudio-97c85f46c-gfpsx`, 1/1 Running, restart count 0, 5x A800
+- Service integration: Bearer service-token authentication, idempotent task
+  creation, task-root-contained artifact downloads, and checksum-backed
+  `gsstudio.delivery/v1` manifests are deployed for the Drobodata connector.
 - Public IP URL: http://120.48.33.45 (CCE load balancer + Basic Auth)
 - TLS URL: https://geneva-ingredients-expression-located.trycloudflare.com (Cloudflare Tunnel TLS + Basic Auth)
 - One-time world generation prerequisite: approved access to gated
