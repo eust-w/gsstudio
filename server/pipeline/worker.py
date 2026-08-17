@@ -15,6 +15,7 @@ from pathlib import Path
 
 from ..config import Config
 from ..db import get_task, list_tasks, set_task_stages, update_stage, update_task
+from ..delivery_manifest import write_delivery_manifest
 from ..models import StageStatus, TaskStatus
 from .stage_runner import run_stage
 from .quality import (
@@ -1011,6 +1012,12 @@ class PipelineWorker:
                 progress=1.0,
                 artifacts=artifacts,
             )
+            completed_task = get_task(self.config.DB_PATH, task_id)
+            if completed_task is None:
+                raise RuntimeError("Completed task disappeared before delivery manifest creation")
+            write_delivery_manifest(task_dir, completed_task, artifacts)
+            artifacts = self._collect_artifacts(output_dir, scene_dir, task_dir)
+            update_task(self.config.DB_PATH, task_id, artifacts=artifacts)
             logger.info("Task %s completed", task_id)
 
         except Exception as e:
@@ -1072,6 +1079,14 @@ class PipelineWorker:
                 error_summary=error_summary,
                 artifacts=artifacts,
             )
+            try:
+                failed_task = get_task(self.config.DB_PATH, task_id)
+                if failed_task is not None:
+                    write_delivery_manifest(task_dir, failed_task, artifacts)
+                    artifacts = self._collect_artifacts(output_dir, scene_dir, task_dir)
+                    update_task(self.config.DB_PATH, task_id, artifacts=artifacts)
+            except Exception:
+                logger.exception("Could not write failed-task delivery manifest for %s", task_id)
         finally:
             # Make sure vLLM is restored even if the task failed mid-way.
             try:
@@ -2060,6 +2075,7 @@ class PipelineWorker:
                 "source_retry.json",
                 "safe_training_retry.json",
                 "strict_free_view_migration.json",
+                "delivery_manifest.json",
             ):
                 report = task_dir / name
                 if report.is_file():

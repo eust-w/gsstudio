@@ -9,6 +9,7 @@ class Config:
     PORT: int = int(os.environ.get("GSSTUDIO_PORT", "8000"))
     BASIC_AUTH_USER: str = os.environ.get("GSSTUDIO_BASIC_AUTH_USER", "")
     BASIC_AUTH_PASSWORD: str = os.environ.get("GSSTUDIO_BASIC_AUTH_PASSWORD", "")
+    SERVICE_TOKEN: str = os.environ.get("GSSTUDIO_SERVICE_TOKEN", "")
 
     # Data directories
     DATA_DIR: Path = Path(os.environ.get("GSSTUDIO_DATA_DIR", "./data"))
