@@ -29,6 +29,19 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 """
 
+_IDEMPOTENCY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS task_idempotency (
+    idempotency_key TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL UNIQUE,
+    request_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+"""
+
+
+class IdempotencyConflictError(ValueError):
+    """An idempotency key was reused for a different task request."""
+
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -38,6 +51,7 @@ def init_db(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(str(db_path)) as conn:
         conn.execute(_SCHEMA)
+        conn.execute(_IDEMPOTENCY_SCHEMA)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
         for name in ("error_code", "error_summary"):
             if name not in columns:
@@ -70,14 +84,75 @@ def create_task(
     *,
     task_id: Optional[str] = None,
 ) -> str:
+    created_task_id, _ = create_task_idempotent(
+        db_path,
+        name,
+        task_type,
+        config,
+        task_id=task_id,
+    )
+    return created_task_id
+
+
+def create_task_idempotent(
+    db_path: Path,
+    name: str,
+    task_type: str,
+    config: Optional[dict] = None,
+    *,
+    task_id: Optional[str] = None,
+    idempotency_key: str = "",
+    request_fingerprint: str = "",
+) -> tuple[str, bool]:
+    """Create one task or replay the task already bound to the same request.
+
+    ``BEGIN IMMEDIATE`` serializes competing submissions before either can
+    reserve the same key, preventing workflow retries from launching duplicate
+    paid GPU work.
+    """
     task_id = task_id or new_task_id()
     now = _utcnow_iso()
+    key = idempotency_key.strip()
+    fingerprint = request_fingerprint.strip()
     with _get_conn(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if key:
+            existing = conn.execute(
+                "SELECT task_id, request_fingerprint FROM task_idempotency WHERE idempotency_key = ?",
+                (key,),
+            ).fetchone()
+            if existing:
+                if existing["request_fingerprint"] != fingerprint:
+                    conn.rollback()
+                    raise IdempotencyConflictError(
+                        "Idempotency-Key is already bound to a different request"
+                    )
+                conn.commit()
+                return str(existing["task_id"]), True
         conn.execute(
             "INSERT INTO tasks (id, name, type, status, config, stages, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
             (task_id, name, task_type, TaskStatus.PENDING.value, json.dumps(config or {}), "[]", now, now),
         )
-    return task_id
+        if key:
+            conn.execute(
+                "INSERT INTO task_idempotency (idempotency_key, task_id, request_fingerprint, created_at) VALUES (?,?,?,?)",
+                (key, task_id, fingerprint, now),
+            )
+        conn.commit()
+    return task_id, False
+
+
+def get_task_by_idempotency_key(db_path: Path, idempotency_key: str) -> Optional[dict]:
+    key = idempotency_key.strip()
+    if not key:
+        return None
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT tasks.* FROM task_idempotency JOIN tasks ON tasks.id = task_idempotency.task_id "
+            "WHERE task_idempotency.idempotency_key = ?",
+            (key,),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
 
 
 def get_task(db_path: Path, task_id: str) -> Optional[dict]:
@@ -130,6 +205,7 @@ def update_task(db_path: Path, task_id: str, **updates) -> None:
 
 def delete_task(db_path: Path, task_id: str) -> bool:
     with _get_conn(db_path) as conn:
+        conn.execute("DELETE FROM task_idempotency WHERE task_id = ?", (task_id,))
         cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cursor.rowcount > 0
 

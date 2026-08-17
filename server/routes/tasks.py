@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -12,10 +13,19 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, Response, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, File, Form, Header, HTTPException, Query, Response, UploadFile, WebSocket, WebSocketDisconnect
 
 from ..config import Config
-from ..db import create_task, delete_task, get_task, list_tasks, new_task_id, update_task
+from ..db import (
+    IdempotencyConflictError,
+    create_task_idempotent,
+    delete_task,
+    get_task,
+    list_tasks,
+    new_task_id,
+    update_task,
+)
+from ..delivery_manifest import build_delivery_manifest
 from ..models import TaskDetail, TaskListResponse, TaskResponse, TaskStatus, TaskUpdate
 from ..pipeline.quality import normalize_worldgen_config
 from ..pipeline.preflight import (
@@ -43,6 +53,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["tasks"])
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_PROMPT_CHARS = 2000
+MAX_IDEMPOTENCY_KEY_CHARS = 200
 
 # Will be set by main.py
 _config: Optional[Config] = None
@@ -115,8 +126,69 @@ def _sam3_is_cached(hf_home: str) -> bool:
     )
 
 
+def _normalized_idempotency_key(value: str | None) -> str:
+    key = str(value or "").strip()
+    if not key:
+        return ""
+    if len(key) > MAX_IDEMPOTENCY_KEY_CHARS:
+        raise HTTPException(400, f"Idempotency-Key must be at most {MAX_IDEMPOTENCY_KEY_CHARS} characters")
+    if not all(character.isalnum() or character in "._:-" for character in key):
+        raise HTTPException(400, "Idempotency-Key contains unsupported characters")
+    return key
+
+
+def _request_fingerprint(
+    *,
+    task_type: str,
+    name: str,
+    prompt: str,
+    config: dict[str, Any],
+    input_dir: Path,
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(json.dumps({
+        "type": task_type,
+        "name": name,
+        "prompt": prompt,
+        "config": config,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode())
+    for path in sorted(input_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        digest.update(str(path.relative_to(input_dir)).encode())
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sanitize_user_config(config: dict[str, Any], task_type: str) -> dict[str, Any]:
+    """Reject client overrides of executable paths, hosts, and model storage."""
+    public_keys = {"prompt", "seed", "quality_preset", "recovery_policy"}
+    if task_type == "worldrecon":
+        public_keys.add("recon_gpus")
+    ignored_contract_keys = set(strict_contract(task_type))
+    unsupported = sorted(set(config) - public_keys - ignored_contract_keys)
+    if unsupported:
+        raise HTTPException(
+            400,
+            "config contains unsupported server-managed keys: " + ", ".join(unsupported),
+        )
+    sanitized = dict(config)
+    if "recon_gpus" in sanitized:
+        try:
+            recon_gpus = int(sanitized["recon_gpus"])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "recon_gpus must be an integer from 1 to 5") from exc
+        if recon_gpus < 1 or recon_gpus > 5:
+            raise HTTPException(400, "recon_gpus must be an integer from 1 to 5")
+        sanitized["recon_gpus"] = recon_gpus
+    return sanitized
+
+
 @router.post("/tasks", status_code=201)
 async def create_task_endpoint(
+    response: Response,
     type: str = Form(...),
     name: str = Form(...),
     prompt: Optional[str] = Form(None),
@@ -125,8 +197,10 @@ async def create_task_endpoint(
     images: Optional[list[UploadFile]] = File(None),
     video: Optional[UploadFile] = File(None),
     config: str = Form("{}"),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     cfg = _get_config()
+    request_key = _normalized_idempotency_key(idempotency_key)
 
     # Validate task type
     if type not in ("worldgen", "worldgen_from_pano", "worldrecon"):
@@ -145,12 +219,14 @@ async def create_task_endpoint(
         )
 
     # Parse config
+    final_dir: Path | None = None
     try:
         config_dict = json.loads(config)
     except json.JSONDecodeError:
         raise HTTPException(400, "Invalid JSON in config field")
     if not isinstance(config_dict, dict):
         raise HTTPException(400, "config field must contain a JSON object")
+    config_dict = _sanitize_user_config(config_dict, type)
     if type in ("worldgen", "worldgen_from_pano"):
         try:
             config_dict = normalize_worldgen_config(config_dict, form_prompt=prompt)
@@ -230,20 +306,58 @@ async def create_task_endpoint(
         final_dir.parent.mkdir(parents=True, exist_ok=True)
         incoming_dir.replace(final_dir)
         write_json_atomic(final_dir / "task_contract.json", strict_contract(type))
+        fingerprint = _request_fingerprint(
+            task_type=type,
+            name=name,
+            prompt=normalized_prompt,
+            config=config_dict,
+            input_dir=final_dir / "input",
+        )
         try:
-            create_task(cfg.DB_PATH, name=name, task_type=type, config=config_dict, task_id=task_id)
+            created_task_id, replayed = create_task_idempotent(
+                cfg.DB_PATH,
+                name=name,
+                task_type=type,
+                config=config_dict,
+                task_id=task_id,
+                idempotency_key=request_key,
+                request_fingerprint=fingerprint,
+            )
         except Exception:
             shutil.rmtree(final_dir, ignore_errors=True)
             raise
+        if replayed:
+            shutil.rmtree(final_dir, ignore_errors=True)
+            existing = get_task(cfg.DB_PATH, created_task_id)
+            if existing is None:
+                raise HTTPException(409, "Idempotent task no longer exists")
+            response.status_code = 200
+            return {
+                "task_id": created_task_id,
+                "status": existing["status"],
+                "created_at": existing["created_at"],
+                "idempotent_replay": True,
+            }
+    except IdempotencyConflictError as exc:
+        if final_dir is not None:
+            shutil.rmtree(final_dir, ignore_errors=True)
+        raise HTTPException(409, str(exc)) from exc
     except HTTPException:
         shutil.rmtree(incoming_dir, ignore_errors=True)
         raise
     except Exception as exc:
         shutil.rmtree(incoming_dir, ignore_errors=True)
+        if final_dir is not None:
+            shutil.rmtree(final_dir, ignore_errors=True)
         logger.exception("Atomic task creation failed")
         raise HTTPException(500, "Task input could not be stored safely") from exc
 
-    return {"task_id": task_id, "status": "pending", "created_at": get_task(cfg.DB_PATH, task_id)["created_at"]}
+    return {
+        "task_id": task_id,
+        "status": "pending",
+        "created_at": get_task(cfg.DB_PATH, task_id)["created_at"],
+        "idempotent_replay": False,
+    }
 
 
 @router.get("/tasks")
@@ -274,6 +388,19 @@ async def get_task_quality_endpoint(task_id: str):
     if not get_task(cfg.DB_PATH, task_id):
         raise HTTPException(404, "Task not found")
     return auto_recovery_summary(cfg.task_dir(task_id))
+
+
+@router.get("/tasks/{task_id}/delivery-manifest")
+async def get_task_delivery_manifest_endpoint(task_id: str):
+    """Return a checksum-backed cross-system delivery contract."""
+    cfg = _get_config()
+    task = get_task(cfg.DB_PATH, task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    try:
+        return build_delivery_manifest(cfg.task_dir(task_id), task)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(409, f"Delivery manifest is incomplete: {exc}") from exc
 
 
 @router.get("/quality/summary")

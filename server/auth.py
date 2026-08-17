@@ -16,12 +16,14 @@ class BasicAuthMiddleware:
         app: ASGIApp,
         username: str = "",
         password: str = "",
+        service_token: str = "",
         exempt_paths: Iterable[str] = ("/api/health",),
     ) -> None:
         self.app = app
         self.username = username
         self.password = password
-        self.enabled = bool(username and password)
+        self.service_token = service_token
+        self.enabled = bool((username and password) or service_token)
         self.exempt_paths = frozenset(exempt_paths)
 
     def _authorized(self, scope: Scope) -> bool:
@@ -30,13 +32,19 @@ class BasicAuthMiddleware:
                 continue
             try:
                 scheme, encoded = value.decode("latin-1").split(" ", 1)
-                if scheme.lower() != "basic":
-                    return False
-                decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
-                username, password = decoded.split(":", 1)
+                if scheme.lower() == "bearer":
+                    return bool(self.service_token) and hmac.compare_digest(encoded, self.service_token)
+                if scheme.lower() == "basic":
+                    decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+                    username, password = decoded.split(":", 1)
+                    return (
+                        bool(self.username and self.password)
+                        and hmac.compare_digest(username, self.username)
+                        and hmac.compare_digest(password, self.password)
+                    )
+                return False
             except (ValueError, UnicodeDecodeError, binascii.Error):
                 return False
-            return hmac.compare_digest(username, self.username) and hmac.compare_digest(password, self.password)
         return False
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

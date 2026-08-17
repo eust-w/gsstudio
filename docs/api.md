@@ -10,6 +10,12 @@ POST /api/tasks
 
 Content-Type: multipart/form-data
 
+Long-running workflow clients should send a stable `Idempotency-Key` header,
+for example `droboticflow:<run_id>:<node_id>`. Replaying the identical request
+returns the original task with `idempotent_replay=true` and does not enqueue a
+second GPU job. Reusing the key for different metadata or file bytes returns
+`409 Conflict`.
+
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | type | string | yes | worldgen, worldgen_from_pano, or worldrecon |
@@ -19,7 +25,7 @@ Content-Type: multipart/form-data
 | image | file | conditional | Single input image (required for worldgen) |
 | images | file[] | conditional | At least 12 multi-view images for the recommended worldrecon lane |
 | video | file | no | Video input; 24 candidates are sampled before frame/parallax filtering |
-| config | JSON string | no | Optional model/runtime config; v4 budgets and quality thresholds cannot be overridden |
+| config | JSON string | no | Optional safe config (`seed`, `recon_gpus=1..5`); v4 policy fields are ignored and executable paths, hosts, model storage, budgets, and quality thresholds cannot be overridden |
 
 The server always writes `contract_version=4`,
 `success_policy=strict_free_view`, and either
@@ -178,6 +184,21 @@ The quality response also includes stable product fields:
 `repair_report`, and `post_panorama_preflight`. Product states are
 `processing`, `repair_available`, `repairing`,
 `source_replacement_required`, or `ready`.
+
+### Get Delivery Manifest
+
+GET /api/tasks/{task_id}/delivery-manifest
+
+Returns the cross-system `gsstudio.delivery/v1` contract. Every registered
+artifact includes its task-relative path, byte size, MIME type, semantic role,
+SHA-256 digest, and authenticated download path. The manifest repeats the task
+status, input lane, strict delivery tier, product state, and
+`free_view_eligible` decision so workflow systems do not infer delivery from a
+PLY/SPZ file alone.
+
+Terminal tasks also persist `delivery_manifest.json` in the task directory.
+Artifact downloads reject absolute paths and symlinks that resolve outside the
+owning task directory.
 
 ### Retry From Journal
 

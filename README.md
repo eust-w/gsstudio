@@ -547,12 +547,15 @@ git diff --check
 | `POST /api/tasks` | 创建严格 Worldgen 或 Multi-View Reconstruction 任务 |
 | `GET /api/tasks/{id}` | 获取任务、阶段、日志和产物状态 |
 | `GET /api/tasks/{id}/quality` | 获取 v4 合同、候选、预检、Pilot、导航和预算报告 |
+| `GET /api/tasks/{id}/delivery-manifest` | 获取带 SHA-256、角色和严格交付状态的跨系统产物清单 |
 | `POST /api/tasks/{id}/retry-source` | 原子校验并归档新的图片组、视频或生成式来源 |
 | `GET /api/quality/summary` | 按通道统计预检率、严格完成率、失败阶段和最近 20 个任务 SLO |
 | `GET /api/gpu/status` | 查看 GPU 与工作负载状态 |
 | `GET /api/health` | 服务健康检查 |
 
 完整请求和响应结构见 [docs/api.md](docs/api.md)。
+
+外部工作流客户端应使用 `Idempotency-Key` 防止重试重复创建 GPU 任务，并通过 Kubernetes Secret 提供 `GSSTUDIO_SERVICE_TOKEN`，使用 Bearer token 访问集群内 API。不要把 service token 写入工作流 JSON 或镜像。
 
 ---
 

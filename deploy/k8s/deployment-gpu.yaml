@@ -50,6 +50,12 @@ spec:
                 secretKeyRef:
                   name: gsstudio-basic-auth
                   key: password
+            - name: GSSTUDIO_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gsstudio-service-auth
+                  key: token
+                  optional: true
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
