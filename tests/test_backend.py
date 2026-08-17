@@ -1,6 +1,7 @@
 """Backend tests for GSStudio."""
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import subprocess
@@ -17,9 +18,21 @@ os.environ["GSSTUDIO_MOCK_PIPELINE"] = "true"
 os.environ["GSSTUDIO_DATA_DIR"] = tempfile.mkdtemp()
 os.environ["GSSTUDIO_BASIC_AUTH_USER"] = "poc-user"
 os.environ["GSSTUDIO_BASIC_AUTH_PASSWORD"] = "poc-password"
+os.environ["GSSTUDIO_SERVICE_TOKEN"] = "workflow-service-token"
 
 from server.config import Config
-from server.db import create_task, get_task, init_db, list_tasks, set_task_stages, update_stage, update_task
+from server.db import (
+    IdempotencyConflictError,
+    create_task,
+    create_task_idempotent,
+    get_task,
+    init_db,
+    list_tasks,
+    set_task_stages,
+    update_stage,
+    update_task,
+)
+from server.delivery_manifest import ArtifactPathError, resolve_task_artifact
 from server.models import StageStatus, TaskStatus
 from server.pipeline.stage_runner import run_stage
 from server.pipeline.worldgen import get_worldgen_commands
@@ -89,6 +102,72 @@ class TestDB:
 
     def test_get_task_not_found(self, cfg):
         assert get_task(cfg.DB_PATH, "nonexistent") is None
+
+    def test_idempotent_task_creation_replays_same_request(self, cfg):
+        first, replayed = create_task_idempotent(
+            cfg.DB_PATH,
+            name="workflow-task",
+            task_type="worldrecon",
+            task_id="first-task",
+            idempotency_key="droboticflow:run-1:node-1",
+            request_fingerprint="same-request",
+        )
+        second, second_replayed = create_task_idempotent(
+            cfg.DB_PATH,
+            name="workflow-task",
+            task_type="worldrecon",
+            task_id="second-task",
+            idempotency_key="droboticflow:run-1:node-1",
+            request_fingerprint="same-request",
+        )
+
+        assert first == second == "first-task"
+        assert replayed is False
+        assert second_replayed is True
+        assert get_task(cfg.DB_PATH, "second-task") is None
+
+    def test_idempotent_task_creation_rejects_different_request(self, cfg):
+        create_task_idempotent(
+            cfg.DB_PATH,
+            name="workflow-task",
+            task_type="worldrecon",
+            idempotency_key="droboticflow:run-2:node-1",
+            request_fingerprint="first-request",
+        )
+
+        with pytest.raises(IdempotencyConflictError, match="different request"):
+            create_task_idempotent(
+                cfg.DB_PATH,
+                name="other-task",
+                task_type="worldrecon",
+                idempotency_key="droboticflow:run-2:node-1",
+                request_fingerprint="other-request",
+            )
+
+
+class TestArtifactContainment:
+    def test_resolves_file_inside_task_root(self, tmp_path):
+        output = tmp_path / "output"
+        output.mkdir()
+        artifact = output / "model.spz"
+        artifact.write_bytes(b"spz")
+
+        assert resolve_task_artifact(tmp_path, "output/model.spz") == artifact.resolve()
+
+    def test_rejects_absolute_path(self, tmp_path):
+        with pytest.raises(ArtifactPathError, match="relative"):
+            resolve_task_artifact(tmp_path, "/etc/hosts")
+
+    def test_rejects_symlink_that_escapes_task_root(self, tmp_path):
+        task_dir = tmp_path / "task"
+        task_dir.mkdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_text("outside")
+        link = task_dir / "escaped.txt"
+        link.symlink_to(outside)
+
+        with pytest.raises(ArtifactPathError, match="escapes"):
+            resolve_task_artifact(task_dir, "escaped.txt")
 
     def test_list_tasks(self, cfg):
         create_task(cfg.DB_PATH, name="t1", task_type="worldgen")
@@ -1406,6 +1485,20 @@ class TestAPI:
         resp = client.get("/api/tasks", headers={"Authorization": f"Basic {token}"})
         assert resp.status_code == 401
 
+    def test_service_bearer_token_is_accepted(self, client):
+        resp = client.get(
+            "/api/tasks",
+            headers={"Authorization": "Bearer workflow-service-token"},
+        )
+        assert resp.status_code == 200
+
+    def test_wrong_service_bearer_token_is_rejected(self, client):
+        resp = client.get(
+            "/api/tasks",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert resp.status_code == 401
+
     def test_health_does_not_require_auth(self, client):
         resp = client.get("/api/health", headers={"Authorization": ""})
         assert resp.status_code == 200
@@ -1443,6 +1536,129 @@ class TestAPI:
         resp = client.get(f"/api/tasks/{task_id}")
         assert resp.status_code == 200
         assert resp.json()["name"] == "test-api-task"
+
+    def test_create_task_idempotency_replays_without_duplicate_gpu_task(self, client):
+        headers = {"Idempotency-Key": "droboticflow:run-api:node-gsstudio"}
+        payload = {"type": "worldrecon", "name": "idempotent-api", "config": "{}"}
+
+        first = client.post("/api/tasks", data=payload, headers=headers)
+        second = client.post("/api/tasks", data=payload, headers=headers)
+
+        assert first.status_code == 201
+        assert second.status_code == 200
+        assert first.json()["task_id"] == second.json()["task_id"]
+        assert first.json()["idempotent_replay"] is False
+        assert second.json()["idempotent_replay"] is True
+
+    def test_create_task_idempotency_rejects_key_reuse_for_different_input(self, client):
+        headers = {"Idempotency-Key": "droboticflow:run-api:node-conflict"}
+        first = client.post(
+            "/api/tasks",
+            data={"type": "worldrecon", "name": "first", "config": "{}"},
+            headers=headers,
+        )
+        second = client.post(
+            "/api/tasks",
+            data={"type": "worldrecon", "name": "different", "config": "{}"},
+            headers=headers,
+        )
+
+        assert first.status_code == 201
+        assert second.status_code == 409
+        assert "different request" in second.json()["detail"]
+
+    def test_create_task_rejects_server_managed_runtime_config(self, client):
+        response = client.post(
+            "/api/tasks",
+            data={
+                "type": "worldrecon",
+                "name": "unsafe-runtime",
+                "config": json.dumps({"vllm_host": "attacker.example", "hf_home": "/tmp/other"}),
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == (
+            "config contains unsupported server-managed keys: hf_home, vllm_host"
+        )
+
+    @pytest.mark.parametrize("recon_gpus", [0, 6, "many"])
+    def test_create_task_bounds_worldmirror_gpu_count(self, client, recon_gpus):
+        response = client.post(
+            "/api/tasks",
+            data={
+                "type": "worldrecon",
+                "name": "bounded-recon",
+                "config": json.dumps({"recon_gpus": recon_gpus}),
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "recon_gpus must be an integer from 1 to 5"
+
+    def test_delivery_manifest_includes_checksum_and_strict_state(self, client):
+        from server.config import Config
+
+        cfg = Config()
+        task_id = create_task(cfg.DB_PATH, name="manifest", task_type="worldrecon", config={})
+        task_dir = cfg.task_dir(task_id)
+        output = task_dir / "output"
+        output.mkdir(parents=True, exist_ok=True)
+        model = output / "gaussians.ply"
+        model.write_bytes(b"ply\nstrict-model")
+        (task_dir / "task_contract.json").write_text(json.dumps({
+            "contract_version": 4,
+            "success_policy": "strict_free_view",
+            "input_lane": "production_multiview",
+        }))
+        (task_dir / "input_preflight.json").write_text('{"state":"passed"}')
+        (task_dir / "navigation_stress.json").write_text(
+            '{"state":"passed","free_view_eligible":true}'
+        )
+        (task_dir / "artifact_validation.json").write_text(
+            '{"valid":true,"free_view_eligible":true}'
+        )
+        update_task(
+            cfg.DB_PATH,
+            task_id,
+            status=TaskStatus.COMPLETED.value,
+            artifacts=[{
+                "name": model.name,
+                "path": "output/gaussians.ply",
+                "size": model.stat().st_size,
+                "type": "3dgs",
+            }],
+        )
+
+        response = client.get(f"/api/tasks/{task_id}/delivery-manifest")
+
+        assert response.status_code == 200
+        manifest = response.json()
+        assert manifest["schema_version"] == "gsstudio.delivery/v1"
+        assert manifest["free_view_eligible"] is True
+        assert manifest["artifacts"][0]["sha256"] == hashlib.sha256(model.read_bytes()).hexdigest()
+        assert manifest["artifacts"][0]["role"] == "gaussian_ply"
+
+    @pytest.mark.parametrize(
+        "encoded_path",
+        ["%2Fetc%2Fhosts", "%2E%2E%2F%2E%2E%2Fetc%2Fhosts"],
+    )
+    def test_artifact_endpoint_never_serves_encoded_paths_outside_task_root(
+        self, client, encoded_path
+    ):
+        from server.config import Config
+
+        cfg = Config()
+        task_id = create_task(cfg.DB_PATH, name="artifact-security", task_type="worldrecon")
+        cfg.task_dir(task_id).mkdir(parents=True, exist_ok=True)
+
+        response = client.get(
+            f"/api/tasks/{task_id}/artifacts/{encoded_path}",
+            follow_redirects=False,
+        )
+
+        assert response.status_code in {400, 404}
+        assert b"root:" not in response.content
 
     def test_worldgen_form_prompt_overrides_advanced_config_and_persists_high_defaults(self, client, monkeypatch):
         monkeypatch.setenv("HF_TOKEN", "test-token")

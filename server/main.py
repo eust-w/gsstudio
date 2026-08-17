@@ -68,6 +68,7 @@ app.add_middleware(
     BasicAuthMiddleware,
     username=config.BASIC_AUTH_USER,
     password=config.BASIC_AUTH_PASSWORD,
+    service_token=config.SERVICE_TOKEN,
     exempt_paths=("/api/health",),
 )
 

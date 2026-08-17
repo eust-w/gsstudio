@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 
 from ..config import Config
 from ..db import get_task
+from ..delivery_manifest import ArtifactPathError, resolve_task_artifact
 
 router = APIRouter(tags=["artifacts"])
 
@@ -43,25 +44,15 @@ async def download_artifact(task_id: str, file_path: str):
     if not task:
         raise HTTPException(404, "Task not found")
 
-    # Security: prevent path traversal
-    if ".." in file_path:
-        raise HTTPException(400, "Invalid path")
-
-    # Search in output and scene directories
     task_dir = cfg.task_dir(task_id)
-    candidates = [
-        task_dir / file_path,
-        task_dir / "output" / file_path,
-        task_dir / "scene" / file_path,
-        task_dir / "input" / file_path,
-    ]
-
-    for candidate in candidates:
-        if candidate.exists() and candidate.is_file():
-            return FileResponse(
-                path=str(candidate),
-                filename=candidate.name,
-                media_type="application/octet-stream",
-            )
-
-    raise HTTPException(404, "Artifact not found")
+    try:
+        artifact = resolve_task_artifact(task_dir, file_path)
+    except ArtifactPathError as exc:
+        raise HTTPException(400, "Invalid artifact path") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Artifact not found") from exc
+    return FileResponse(
+        path=str(artifact),
+        filename=artifact.name,
+        media_type="application/octet-stream",
+    )
