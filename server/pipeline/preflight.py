@@ -285,9 +285,14 @@ PANORAMA_VLM_SYSTEM_PROMPT = """You are a strict 3D reconstruction inspector eva
 equirectangular panorama after panorama generation. Return one JSON object only. Score
 reconstruction_suitability from 0 to 1 and set each boolean flag accurately: person,
 mirror_or_glass, large_reflection, curved_walls, unwalkable_floor, perspective_conflict.
-Ignore only the normal projection warp at the far left and right panorama seam; still flag
-curved physical walls, duplicated structures, inconsistent perspective, people, reflections,
-or unusable walking space. Also provide a short reasons array. Do not use markdown."""
+Account for normal equirectangular projection across the entire panorama: straight physical
+ceiling and floor boundaries can appear as smooth curves away from the horizon, not only at
+the left/right seam. Do not set curved_walls merely because ceiling or floor lines have this
+expected projection curve. Set curved_walls only when the wall surface itself is physically
+bowed, cylindrical, or structurally inconsistent after accounting for equirectangular
+projection. Still flag duplicated structures, inconsistent vanishing geometry, people,
+reflections, or unusable walking space. Also provide a short reasons array. Do not use
+markdown."""
 
 
 def qwen_vlm_score(
