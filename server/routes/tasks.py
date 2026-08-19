@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import time
@@ -54,6 +55,7 @@ router = APIRouter(tags=["tasks"])
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_PROMPT_CHARS = 2000
 MAX_IDEMPOTENCY_KEY_CHARS = 200
+GENERATIVE_MINIMUM_SHORT_EDGE = 512
 
 # Will be set by main.py
 _config: Optional[Config] = None
@@ -89,10 +91,58 @@ def cleanup_stale_incoming(config: Config, *, max_age_seconds: int = 86400) -> i
     return removed
 
 
-async def _stage_retry_image(upload: UploadFile, staging_dir: Path) -> tuple[Path, Path]:
-    """Validate a replacement before any durable recovery state is changed."""
+def normalize_uploaded_generation_image(source: Path, destination: Path) -> dict[str, Any]:
+    """Decode and deterministically normalize a generative source image.
+
+    The strict preflight still evaluates blur, features, exposure, edges, and
+    perspective.  This bounded normalization only prevents an otherwise good
+    image from failing because a browser or chat client resized it slightly
+    below the 512-pixel transport contract.  Original bytes are retained next
+    to the normalized PNG for audit.
+    """
     from PIL import Image, UnidentifiedImageError
 
+    try:
+        with Image.open(source) as decoded:
+            decoded.verify()
+        with Image.open(source) as decoded:
+            image = decoded.convert("RGB")
+            original_width, original_height = image.size
+            short_edge = min(original_width, original_height)
+            if short_edge <= 0:
+                raise ValueError("Image dimensions must be positive")
+            upscale_applied = short_edge < GENERATIVE_MINIMUM_SHORT_EDGE
+            if upscale_applied:
+                scale = GENERATIVE_MINIMUM_SHORT_EDGE / short_edge
+                normalized_size = (
+                    math.ceil(original_width * scale),
+                    math.ceil(original_height * scale),
+                )
+                image = image.resize(normalized_size, Image.Resampling.LANCZOS)
+            image.save(destination, format="PNG")
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise HTTPException(400, "Uploaded image is corrupt or unsupported") from exc
+
+    normalized_width, normalized_height = image.size
+    return {
+        "version": 1,
+        "original_name": source.name,
+        "original_width": original_width,
+        "original_height": original_height,
+        "original_short_edge": min(original_width, original_height),
+        "normalized_name": destination.name,
+        "normalized_width": normalized_width,
+        "normalized_height": normalized_height,
+        "normalized_short_edge": min(normalized_width, normalized_height),
+        "upscale_applied": upscale_applied,
+        "resampling": "lanczos" if upscale_applied else "none",
+        "original_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "normalized_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+    }
+
+
+async def _stage_retry_image(upload: UploadFile, staging_dir: Path) -> tuple[Path, Path]:
+    """Validate a replacement before any durable recovery state is changed."""
     staging_dir.mkdir(parents=True, exist_ok=False)
     suffix = Path(upload.filename or "source.png").suffix.lower() or ".png"
     raw = staging_dir / f"source_upload{suffix}"
@@ -107,12 +157,10 @@ async def _stage_retry_image(upload: UploadFile, staging_dir: Path) -> tuple[Pat
         raise HTTPException(400, "Replacement source is empty")
     normalized = staging_dir / "input.png"
     try:
-        with Image.open(raw) as decoded:
-            decoded.verify()
-        with Image.open(raw) as decoded:
-            decoded.convert("RGB").save(normalized, format="PNG")
-    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        report = normalize_uploaded_generation_image(raw, normalized)
+    except HTTPException as exc:
         raise HTTPException(400, "Replacement source is corrupt or unsupported") from exc
+    write_json_atomic(staging_dir / "input_normalization.json", report)
     return raw, normalized
 
 
@@ -269,22 +317,13 @@ async def create_task_endpoint(
         saved_files.append(str(fpath))
         return fpath
 
-    def normalize_image(source: Path, destination: Path) -> None:
-        try:
-            from PIL import Image, UnidentifiedImageError
-            with Image.open(source) as decoded:
-                decoded.verify()
-            with Image.open(source) as decoded:
-                decoded.convert("RGB").save(destination, format="PNG")
-        except (UnidentifiedImageError, OSError, ValueError) as exc:
-            raise HTTPException(400, "Uploaded image is corrupt or unsupported") from exc
-
     try:
         if panorama:
             suffix = Path(panorama.filename or "panorama.png").suffix.lower() or ".png"
             original = await save_upload(panorama, f"source_upload{suffix}", max_bytes=MAX_IMAGE_BYTES)
             normalized = input_dir / "panorama.png"
-            normalize_image(original, normalized)
+            normalization = normalize_uploaded_generation_image(original, normalized)
+            write_json_atomic(input_dir / "panorama_normalization.json", normalization)
             if type == "worldgen_from_pano":
                 scene_dir = incoming_dir / "scene"
                 scene_dir.mkdir(parents=True, exist_ok=True)
@@ -293,7 +332,8 @@ async def create_task_endpoint(
         if image:
             suffix = Path(image.filename or "input.png").suffix.lower() or ".png"
             original = await save_upload(image, f"source_upload{suffix}", max_bytes=MAX_IMAGE_BYTES)
-            normalize_image(original, input_dir / "input.png")
+            normalization = normalize_uploaded_generation_image(original, input_dir / "input.png")
+            write_json_atomic(input_dir / "input_normalization.json", normalization)
 
         if images:
             for index, img in enumerate(images):
@@ -802,6 +842,9 @@ async def retry_task_source_endpoint(
         attempt_input.mkdir(parents=True, exist_ok=True)
         shutil.copy2(staged_raw, attempt_input / staged_raw.name)
         shutil.copy2(staged_normalized, attempt_input / "input.png")
+        staged_report = staged_normalized.parent / "input_normalization.json"
+        if staged_report.is_file():
+            shutil.copy2(staged_report, attempt_input / "input_normalization.json")
         config["input_mode"] = "image"
 
     update_task(

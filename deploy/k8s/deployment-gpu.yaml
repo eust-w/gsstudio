@@ -109,17 +109,28 @@ spec:
             - name: dshm
               mountPath: /dev/shm
           readinessProbe:
-            httpGet:
-              path: /api/health
-              port: 8000
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - curl -fsS --max-time 3 http://127.0.0.1:8000/api/health >/dev/null && nvidia-smi -L >/dev/null
             initialDelaySeconds: 15
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           livenessProbe:
-            httpGet:
-              path: /api/health
-              port: 8000
-            initialDelaySeconds: 30
-            periodSeconds: 60
+            # Long-lived GPU Pods can retain a healthy HTTP process after their
+            # NVIDIA device mount becomes stale. Restart the container so the
+            # runtime re-injects CUDA/NVML devices and the task journal resumes.
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - nvidia-smi -L >/dev/null
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
       volumes:
         - name: data
           hostPath:
