@@ -27,6 +27,7 @@ from server.pipeline.preflight import (
     InputPreflightError,
     MAXIMUM_TASK_SECONDS,
     MAXIMUM_WORLDSTEREO_TRAJECTORIES,
+    PANORAMA_VLM_SYSTEM_PROMPT,
     normalize_task_contract,
     run_post_panorama_preflight,
     run_multiview_preflight,
@@ -53,6 +54,13 @@ from server.pipeline.worker import (
 
 def _passing_vlm(_path: Path) -> dict:
     return {"vlm_score": 0.95, "hard_flags": {}, "reasons": []}
+
+
+def test_panorama_vlm_prompt_distinguishes_projection_curves_from_physical_walls():
+    assert "normal equirectangular projection across the entire panorama" in PANORAMA_VLM_SYSTEM_PROMPT
+    assert "Do not set curved_walls merely because ceiling or floor lines" in PANORAMA_VLM_SYSTEM_PROMPT
+    assert "physically" in PANORAMA_VLM_SYSTEM_PROMPT
+    assert "bowed, cylindrical" in PANORAMA_VLM_SYSTEM_PROMPT
 
 
 def test_server_contract_ignores_advanced_budget_and_threshold_overrides():
