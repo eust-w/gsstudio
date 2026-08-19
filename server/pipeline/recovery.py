@@ -1100,6 +1100,39 @@ def request_source_retry(
     return _persist(task_dir, report)
 
 
+def initialize_pretrajectory_source_retry(task_dir: Path, *, task_type: str) -> dict[str, Any]:
+    """Create the recovery journal for a strict pre-trajectory content block.
+
+    Input and generated-panorama preflight run before trajectory planning, so
+    the normal recovery journal does not exist yet.  A user-approved retry is
+    still valid: initialize the same bounded journal from immutable failure
+    reports, then let ``request_source_retry`` advance the deterministic seed.
+    """
+    stored = _read_object(task_dir / AUTO_RECOVERY_REPORT_NAME)
+    if stored:
+        return _persist(task_dir, _migrate_report(stored, task_type=task_type))
+    if task_type not in {"worldgen", "worldgen_from_pano"}:
+        raise AutoRecoveryError("Pre-trajectory source retry is available only for world generation")
+    failures: list[str] = []
+    for name in ("input_preflight.json", "post_panorama_preflight.json"):
+        report = _read_object(task_dir / name)
+        if report.get("state") == "failed":
+            reasons = report.get("failure_reasons") or [
+                reason
+                for candidate in report.get("candidates", [])
+                if isinstance(candidate, dict)
+                for reason in candidate.get("rejection_reasons", [])
+            ]
+            failures.extend(str(reason) for reason in reasons if str(reason))
+    if not failures:
+        raise AutoRecoveryError("Source retry requires a failed immutable preflight report")
+    report = _new_report(task_dir, {}, task_type)
+    report["state"] = "quality_blocked"
+    report["phase"] = "pretrajectory_preflight"
+    report["terminal_reason"] = "pretrajectory_preflight_failed: " + ", ".join(sorted(set(failures)))
+    return _persist(task_dir, report)
+
+
 def archive_downstream_checkpoints(task_dir: Path, *, source_attempt: int) -> None:
     """Keep failed downstream artifacts while forcing data/training to rerun.
 

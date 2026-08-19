@@ -2003,6 +2003,33 @@ class TestAPI:
         assert Image.open(replacement).mode == "RGB"
         assert get_task(cfg.DB_PATH, task_id)["config"]["input_mode"] == "image"
 
+    def test_post_panorama_preflight_failure_can_retry_without_existing_journal(self, client, cfg):
+        task_id = create_task(
+            cfg.DB_PATH,
+            name="pretrajectory-source-retry",
+            task_type="worldgen",
+            config={"quality_preset": "high", "recovery_policy": "auto", "seed": 1024, "input_mode": "image"},
+        )
+        update_task(cfg.DB_PATH, task_id, status="failed", error="source_replacement_required")
+        task_dir = cfg.task_dir(task_id)
+        task_dir.mkdir(parents=True)
+        (task_dir / "post_panorama_preflight.json").write_text(json.dumps({
+            "version": 4,
+            "state": "failed",
+            "failure_reasons": ["curved_walls", "mirror_or_glass"],
+        }))
+
+        response = client.post(f"/api/tasks/{task_id}/retry-source")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "pending"
+        report = json.loads((task_dir / "auto_recovery.json").read_text())
+        assert report["state"] == "regenerating_panorama"
+        assert report["source_attempt"] == 1
+        assert report["source_seed"] == 1025
+        archived = task_dir / "recovery_attempts" / "attempt-001" / "previous_downstream"
+        assert (archived / "post_panorama_preflight.json").is_file()
+
     def test_corrupt_replacement_image_does_not_advance_recovery_journal(self, client, cfg):
         task_id = create_task(
             cfg.DB_PATH,
