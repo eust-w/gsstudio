@@ -45,9 +45,9 @@ from server.pipeline.worker import (
 )
 
 
-def png_bytes(color=(120, 80, 40)) -> bytes:
+def png_bytes(color=(120, 80, 40), *, size=(8, 6)) -> bytes:
     buffer = BytesIO()
-    Image.new("RGB", (8, 6), color).save(buffer, format="PNG")
+    Image.new("RGB", size, color).save(buffer, format="PNG")
     return buffer.getvalue()
 
 
@@ -1366,21 +1366,31 @@ class TestDeploymentContract:
         assert "patch_world_gs_empty_eval.py" not in dockerfile
         assert "/opt/hyworld2/hyworld2/worldgen/world_gs_trainer.py" not in dockerfile
 
-    def test_gpu_rollout_manifests_target_the_immutable_v66_product_image(self):
+    def test_gpu_rollout_manifests_target_the_immutable_v67_product_image(self):
         root = Path(__file__).parents[1]
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v66" in deployment
-        assert "gsstudio:a800-v66" in build
-        assert "rollback-image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v65" in deployment
-        assert "sha256:08f681ddec830d2fcffc19c339f035b28d0a783ab841532f12cf200003e3a9cc" in deployment
+        assert "gsstudio:a800-v67" in deployment
+        assert "gsstudio:a800-v67" in build
+        assert "rollback-image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v66" in deployment
+        assert "sha256:3e2d48c91eedf1b80ce386a24ab86156a1af7b3f4fc1bc8337f45a1ca3cfff74" in deployment
         assert "gsstudio:a800-v56" not in deployment
         assert "gsstudio:a800-v56" not in build
         assert "gsstudio:a800-v35" not in deployment
         assert "gsstudio:a800-v35" not in build
         assert "gsstudio:a800-v22" not in deployment
         assert "gsstudio:a800-v22" not in build
+
+    def test_gpu_deployment_restarts_stale_cuda_device_mounts(self):
+        deployment = (Path(__file__).parents[1] / "deploy/k8s/deployment-gpu.yaml").read_text()
+
+        assert "readinessProbe:\n            exec:" in deployment
+        assert "livenessProbe:\n" in deployment
+        assert deployment.count("nvidia-smi -L >/dev/null") == 2
+        assert "curl -fsS --max-time 3 http://127.0.0.1:8000/api/health" in deployment
+        assert "periodSeconds: 30" in deployment
+        assert "failureThreshold: 3" in deployment
 
     def test_vllm_supervisor_stops_the_complete_process_group(self):
         source = (Path(__file__).parents[1] / "deploy/supervisord.conf").read_text()
@@ -1749,13 +1759,22 @@ class TestAPI:
         response = client.post(
             "/api/tasks",
             data={"type": "worldgen", "name": "uploaded", "config": "{}"},
-            files={"image": ("camera.jpg", png_bytes(), "image/jpeg")},
+            files={"image": ("camera.jpg", png_bytes(size=(881, 478)), "image/jpeg")},
         )
 
         assert response.status_code == 201
         input_dir = Config().task_input_dir(response.json()["task_id"])
-        assert Image.open(input_dir / "input.png").mode == "RGB"
+        normalized = Image.open(input_dir / "input.png")
+        assert normalized.mode == "RGB"
+        assert min(normalized.size) == 512
         assert (input_dir / "source_upload.jpg").is_file()
+        report = json.loads((input_dir / "input_normalization.json").read_text())
+        assert report["original_width"] == 881
+        assert report["original_height"] == 478
+        assert report["original_short_edge"] == 478
+        assert report["normalized_short_edge"] == 512
+        assert report["upscale_applied"] is True
+        assert report["resampling"] == "lanczos"
 
     def test_task_quality_endpoint_returns_compact_auto_recovery_state(self, client):
         from server.config import Config
