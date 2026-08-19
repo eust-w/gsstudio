@@ -92,6 +92,8 @@ def test_recovery_report_can_reference_canonical_uploaded_source(tmp_path):
 
     assert report["state"] == "completed"
     assert report["artifact_path"] == "input/selected_source.png"
+    assert report["effective_prompt"] == WORLD_GEOMETRY_PROMPT_SUFFIX
+    assert pipeline.panorama_calls[0][1]["prompt"] == WORLD_GEOMETRY_PROMPT_SUFFIX
     assert (attempt / "scene" / "panorama.png").is_file()
 
 
