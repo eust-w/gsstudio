@@ -103,6 +103,9 @@ def test_prompt_expansion_is_deterministic_and_idempotent():
     assert "无玻璃材质" in expanded
     assert "无鱼眼畸变" in expanded
     assert "哑光材质" in expanded
+    assert "非全景、非360度、非鱼眼、非超广角" in expanded
+    assert "禁止拱门、圆柱、弧形隔断和曲面吊顶" in expanded
+    assert "无玻璃门、无玻璃柜" in expanded
     assert expand_worldgen_prompt(expanded) == expanded
 
 
