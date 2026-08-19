@@ -1366,15 +1366,15 @@ class TestDeploymentContract:
         assert "patch_world_gs_empty_eval.py" not in dockerfile
         assert "/opt/hyworld2/hyworld2/worldgen/world_gs_trainer.py" not in dockerfile
 
-    def test_gpu_rollout_manifests_target_the_immutable_v70_product_image(self):
+    def test_gpu_rollout_manifests_target_the_immutable_v71_product_image(self):
         root = Path(__file__).parents[1]
         deployment = (root / "deploy/k8s/deployment-gpu.yaml").read_text()
         build = (root / "deploy/k8s/kaniko-build.yaml").read_text()
 
-        assert "gsstudio:a800-v70" in deployment
-        assert "gsstudio:a800-v70" in build
-        assert "rollback-image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v69" in deployment
-        assert "sha256:6a4fa86e5ed4d6d08eb31f92c22e32c737b990bb49bf0cc053f8d249c2034620" in deployment
+        assert "gsstudio:a800-v71" in deployment
+        assert "gsstudio:a800-v71" in build
+        assert "rollback-image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v70" in deployment
+        assert "sha256:02d5e666cb721ab38f9ae87fdd489a4550c30f55e52a3e5e47254721a7d14ae5" in deployment
         assert "gsstudio:a800-v56" not in deployment
         assert "gsstudio:a800-v56" not in build
         assert "gsstudio:a800-v35" not in deployment

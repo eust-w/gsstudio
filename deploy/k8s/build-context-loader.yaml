@@ -16,5 +16,5 @@ spec:
   volumes:
     - name: build-context
       hostPath:
-        path: /home/cce/gsstudio/build-context-v70
+        path: /home/cce/gsstudio/build-context-v71
         type: DirectoryOrCreate
