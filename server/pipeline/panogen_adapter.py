@@ -110,7 +110,11 @@ def generate_source_pool(
     if candidate_count != DEFAULT_SOURCE_CANDIDATE_COUNT:
         raise ValueError("The strict source pool always contains exactly four candidates")
     source_height, source_width = source_image_size
-    effective_prompt = expand_worldgen_prompt(prompt) if input_mode == "prompt" else prompt.strip()
+    effective_prompt = (
+        expand_worldgen_prompt(prompt)
+        if input_mode in {"prompt", "image"}
+        else prompt.strip()
+    )
     candidate_dir.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {
         "version": 4,
@@ -247,7 +251,11 @@ def generate_source_and_panorama(
     source_height, source_width = source_image_size
     if source_height <= 0 or source_width <= 0:
         raise ValueError("Source image dimensions must be positive")
-    effective_prompt = expand_worldgen_prompt(prompt) if input_mode == "prompt" else prompt.strip()
+    effective_prompt = (
+        expand_worldgen_prompt(prompt)
+        if input_mode in {"prompt", "image"}
+        else prompt.strip()
+    )
     report: dict[str, Any] = {
         "version": 1,
         "mode": input_mode,
