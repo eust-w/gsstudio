@@ -66,6 +66,26 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _artifact_path_for_report(path: Path, report_path: Path) -> str:
+    """Return a stable task-relative path even for recovery reports.
+
+    Recovery reports live below ``recovery_attempts/attempt-NNN`` while an
+    uploaded source may remain in the canonical task ``input`` directory.
+    Walk upward to their nearest shared task ancestor instead of emitting
+    ``..`` segments or raising ``ValueError``.
+    """
+    resolved = path.resolve()
+    report_parent = report_path.parent.resolve()
+    for ancestor in (report_parent, *report_parent.parents):
+        if ancestor == Path(ancestor.anchor):
+            break
+        try:
+            return str(resolved.relative_to(ancestor))
+        except ValueError:
+            continue
+    return str(resolved)
+
+
 def generate_source_pool(
     pipeline: Any | None,
     *,
@@ -235,7 +255,7 @@ def generate_source_and_panorama(
         "source_prompt_mode": SOURCE_PROMPT_MODE if input_mode == "prompt" else None,
         "requested_source_width": source_width if input_mode == "prompt" else None,
         "requested_source_height": source_height if input_mode == "prompt" else None,
-        "artifact_path": str(input_image.relative_to(report_path.parent)),
+        "artifact_path": _artifact_path_for_report(input_image, report_path),
         "started_at": prior.get("started_at") or _utcnow(),
         "completed_at": None,
         "duration_seconds": 0,

@@ -45,6 +45,7 @@ from ..pipeline.recovery import (
     AutoRecoveryError,
     archive_downstream_checkpoints,
     auto_recovery_summary,
+    initialize_pretrajectory_source_retry,
     request_source_retry,
 )
 from ..pipeline.stage_runner import stream_log
@@ -801,7 +802,8 @@ async def retry_task_source_endpoint(
     staged_normalized: Path | None = None
     try:
         if not current.get("available"):
-            raise AutoRecoveryError("Source retry requires an automatic recovery report")
+            initialize_pretrajectory_source_retry(task_dir, task_type=task["type"])
+            current = auto_recovery_summary(task_dir)
         if image is not None or panorama is not None:
             retry_staging = task_dir / ".incoming-retry" / uuid.uuid4().hex
             staged_raw, staged_normalized = await _stage_retry_image(image or panorama, retry_staging)
