@@ -4,7 +4,7 @@ metadata:
   name: gsstudio
   namespace: gsstudio
   annotations:
-    gsstudio.io/rollback-image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v66
+    gsstudio.io/rollback-image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v67
   labels:
     app: gsstudio
     variant: gpu
@@ -21,13 +21,13 @@ spec:
         app: gsstudio
         variant: gpu
       annotations:
-        gsstudio.io/release-digest: sha256:3e2d48c91eedf1b80ce386a24ab86156a1af7b3f4fc1bc8337f45a1ca3cfff74
+        gsstudio.io/release-digest: sha256:59ea1db1c6a658f3fdd4d969a0573e202fc706dcef609337b230515543d46bc9
     spec:
       nodeSelector:
         kubernetes.io/hostname: "192.168.80.136"
       containers:
         - name: gsstudio
-          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v67
+          image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v68
           imagePullPolicy: Always
           command: ["/app/entrypoint.sh"]
           ports:
