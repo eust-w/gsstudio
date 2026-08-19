@@ -72,6 +72,29 @@ def test_prompt_mode_generates_source_then_panorama_with_one_pipeline(tmp_path):
     assert report["requested_source_height"] == DEFAULT_SOURCE_IMAGE_HEIGHT
 
 
+def test_recovery_report_can_reference_canonical_uploaded_source(tmp_path):
+    pipeline = FakePipeline()
+    source = tmp_path / "input" / "selected_source.png"
+    source.parent.mkdir(parents=True)
+    Image.new("RGB", (944, 512), (10, 20, 30)).save(source)
+    attempt = tmp_path / "recovery_attempts" / "attempt-001"
+
+    report = generate_source_and_panorama(
+        pipeline,
+        input_mode="image",
+        input_image=source,
+        panorama_path=attempt / "scene" / "panorama.png",
+        report_path=attempt / "source_generation.json",
+        prompt="",
+        seed=1025,
+        source_attempt=1,
+    )
+
+    assert report["state"] == "completed"
+    assert report["artifact_path"] == "input/selected_source.png"
+    assert (attempt / "scene" / "panorama.png").is_file()
+
+
 def test_prompt_expansion_is_deterministic_and_idempotent():
     expanded = expand_worldgen_prompt("真实场景 地瓜机器人办公室")
 
