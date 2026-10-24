@@ -1616,26 +1616,33 @@ class TestAPI:
         assert get_task(cfg.DB_PATH, task_id)["status"] == "failed"
         assert not (task_dir / "recovery_attempts" / "attempt-001").exists()
 
-    def test_completed_degraded_delivery_can_request_a_higher_quality_source(self, client, cfg):
+    @pytest.mark.parametrize("delivery_tier", ["degraded_3d", "anchored_3d", "panorama_only"])
+    @pytest.mark.parametrize("task_type", ["worldgen", "worldgen_from_pano"])
+    def test_completed_recovery_delivery_can_retry_without_losing_prior_work(
+        self, client, cfg, delivery_tier, task_type
+    ):
         task_id = create_task(
             cfg.DB_PATH,
-            name="degraded-source-retry",
-            task_type="worldgen",
+            name="completed-source-retry",
+            task_type=task_type,
             config={"quality_preset": "high", "recovery_policy": "auto", "seed": 1024},
         )
         update_task(cfg.DB_PATH, task_id, status=TaskStatus.COMPLETED.value)
         task_dir = cfg.task_dir(task_id)
         task_dir.mkdir(parents=True)
+        previous_history = [{"source_attempt": 0, "accepted_trajectory_ids": ["old/traj0"]}]
+        previous_sources = [{"source_attempt": 0, "accepted_count": 1}]
+        accepted_ids = [f"view{i}/traj0" for i in range(5)] if delivery_tier == "degraded_3d" else []
         (task_dir / "auto_recovery.json").write_text(json.dumps({
             "version": 2,
-            "task_type": "worldgen",
+            "task_type": task_type,
             "state": "completed",
-            "delivery_tier": "degraded_3d",
+            "delivery_tier": delivery_tier,
             "recovery_exhausted": True,
             "source_attempt": 2,
-            "attempt_history": [],
-            "source_attempts": [],
-            "accepted_trajectory_ids": [f"view{i}/traj0" for i in range(5)],
+            "attempt_history": previous_history,
+            "source_attempts": previous_sources,
+            "accepted_trajectory_ids": accepted_ids,
             "attempted_trajectory_ids": [],
             "pending_candidate_trajectory_ids": [],
             "batches": [],
@@ -1644,16 +1651,87 @@ class TestAPI:
             "minimum_accepted_trajectories": 6,
             "limits": {},
         }))
+        old_output = task_dir / "output" / "gaussians.spz"
+        old_output.parent.mkdir()
+        old_output.write_bytes(b"previous validated output")
+        checkpoint_names = (".stage_gen_gs_data_done", ".stage_gs_training_done")
+        for name in checkpoint_names:
+            (task_dir / name).write_text("done")
+        (task_dir / "source_promotion.json").write_text('{"state": "completed"}')
+        old_scene = task_dir / "recovery_attempts" / "attempt-000" / "scene" / "panorama.png"
+        old_scene.parent.mkdir(parents=True)
+        old_scene.write_bytes(png_bytes())
+
+        files = {"panorama": ("replacement.png", png_bytes((5, 6, 7)), "image/png")} if task_type == "worldgen_from_pano" else None
+        response = client.post(f"/api/tasks/{task_id}/retry-source", files=files)
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "pending"
+        report = json.loads((task_dir / "auto_recovery.json").read_text())
+        assert report["state"] == ("regenerating_panorama" if task_type == "worldgen" else "replacing_panorama_source")
+        assert report["source_attempt"] == 3
+        if task_type == "worldgen":
+            assert report["source_seed"] == 1027
+        else:
+            assert "source_seed" not in report
+            replacement = task_dir / report["active_scene_relpath"] / "panorama.png"
+            assert replacement.read_bytes() == png_bytes((5, 6, 7))
+        assert report["delivery_tier"] is None
+        assert report["recovery_exhausted"] is False
+        assert report["attempt_history"][:-1] == previous_history
+        assert report["attempt_history"][-1]["source_attempt"] == 2
+        assert report["attempt_history"][-1]["accepted_trajectory_ids"] == accepted_ids
+        assert report["source_attempts"] == previous_sources
+        assert report["generated_video_trajectory_count"] == 40
+        assert report["video_seconds"] == 7000
+        archive = task_dir / "recovery_attempts" / "attempt-003" / "previous_downstream"
+        assert (archive / "output" / "gaussians.spz").read_bytes() == b"previous validated output"
+        assert not old_output.exists()
+        for name in checkpoint_names:
+            assert (archive / name).read_text() == "done"
+            assert not (task_dir / name).exists()
+        assert json.loads((archive / "source_promotion.json").read_text()) == {"state": "completed"}
+        assert old_scene.read_bytes() == png_bytes()
+
+    @pytest.mark.parametrize("task_type,status,config,delivery_tier,exhausted", [
+        ("worldgen", "completed", {}, "strict_3d", True),
+        ("worldgen", "completed", {}, "anchored_3d", False),
+        ("worldgen", "completed", {}, None, True),
+        ("worldgen", "completed", {}, "unknown_tier", True),
+        ("worldgen", "pending", {}, "anchored_3d", True),
+        ("worldgen", "running", {}, "anchored_3d", True),
+        ("worldrecon", "completed", {}, "anchored_3d", True),
+        ("worldgen", "completed", {"quality_preset": "fast"}, "degraded_3d", True),
+        ("worldgen", "completed", {"recovery_policy": "off"}, "degraded_3d", True),
+    ])
+    def test_source_retry_rejects_ineligible_tasks_without_changing_prior_work(
+        self, client, cfg, task_type, status, config, delivery_tier, exhausted
+    ):
+        task_id = create_task(cfg.DB_PATH, name="ineligible-source-retry", task_type=task_type, config=config)
+        update_task(cfg.DB_PATH, task_id, status=status)
+        task_dir = cfg.task_dir(task_id)
+        task_dir.mkdir(parents=True)
+        journal = task_dir / "auto_recovery.json"
+        journal.write_text(json.dumps({
+            "version": 2,
+            "task_type": task_type,
+            "state": "completed",
+            "source_attempt": 0,
+            "delivery_tier": delivery_tier,
+            "recovery_exhausted": exhausted,
+        }))
+        before = journal.read_bytes()
+        output = task_dir / "output" / "gaussians.spz"
+        output.parent.mkdir()
+        output.write_bytes(b"keep existing output")
 
         response = client.post(f"/api/tasks/{task_id}/retry-source")
 
-        assert response.status_code == 200
-        report = json.loads((task_dir / "auto_recovery.json").read_text())
-        assert report["state"] == "regenerating_panorama"
-        assert report["source_attempt"] == 3
-        assert report["source_seed"] == 1027
-        assert report["delivery_tier"] is None
-        assert report["recovery_exhausted"] is False
+        assert response.status_code == 409
+        assert journal.read_bytes() == before
+        assert output.read_bytes() == b"keep existing output"
+        assert get_task(cfg.DB_PATH, task_id)["status"] == status
+        assert not (task_dir / "recovery_attempts").exists()
 
     def test_retry_source_requires_and_preserves_a_replacement_panorama(self, client, cfg):
         task_id = create_task(
