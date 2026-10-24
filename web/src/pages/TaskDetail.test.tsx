@@ -69,6 +69,7 @@ afterEach(() => {
 
 beforeEach(() => {
   getTaskMock.mockResolvedValue(taskFixture);
+  getTaskQualityMock.mockResolvedValue({ available: false });
 });
 
 describe("TaskDetail", () => {
@@ -316,16 +317,22 @@ describe("TaskDetail", () => {
     expect(screen.getByRole("button", { name: "Panorama" })).toHaveClass("active");
   });
 
-  it("offers a failed panorama task a replacement-source retry", async () => {
+  it.each([
+    { status: "failed", state: "source_quality_blocked", config: { quality_preset: "high", recovery_policy: "auto" } },
+    { status: "failed", state: "quality_blocked", config: { quality_preset: "high" } },
+    { status: "cancelled", state: "source_quality_blocked", config: { recovery_policy: "auto" } },
+    { status: "cancelled", state: "quality_blocked", config: {} },
+  ])("offers a $status panorama task in $state a replacement-source retry", async ({ status, state, config }) => {
     getTaskMock.mockResolvedValue({
       ...taskFixture,
       type: "worldgen_from_pano",
-      status: "failed",
-      error: "source_quality_blocked",
+      status,
+      config,
+      error: state,
     });
     getTaskQualityMock.mockResolvedValue({
       available: true,
-      state: "source_quality_blocked",
+      state,
       phase: null,
       accepted_trajectories: 2,
       required_trajectories: 6,
@@ -350,6 +357,83 @@ describe("TaskDetail", () => {
     fireEvent.click(screen.getByRole("button", { name: "Retry with replacement panorama" }));
 
     await waitFor(() => expect(retryTaskSourceMock).toHaveBeenCalledWith("recon-task", panorama, "worldgen_from_pano"));
+  });
+
+  it.each(["degraded_3d", "anchored_3d", "panorama_only"])(
+    "offers completed %s tasks a new source after recovery is exhausted",
+    async (deliveryTier) => {
+      getTaskMock.mockResolvedValue({ ...taskFixture, type: "worldgen", config: {} });
+      getTaskQualityMock.mockResolvedValue({
+        available: true,
+        state: "completed",
+        delivery_tier: deliveryTier,
+        recovery_exhausted: true,
+      });
+      render(
+        <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+          <Routes><Route path="/tasks/:taskId" element={<TaskDetail />} /></Routes>
+        </MemoryRouter>,
+      );
+
+      fireEvent.click(await screen.findByRole("button", { name: "Retry with next seed" }));
+
+      await waitFor(() => expect(retryTaskSourceMock).toHaveBeenCalledWith("recon-task", undefined, "worldgen"));
+    },
+  );
+
+  it("requires a replacement panorama for a completed anchored delivery", async () => {
+    getTaskMock.mockResolvedValue({ ...taskFixture, type: "worldgen_from_pano" });
+    getTaskQualityMock.mockResolvedValue({
+      available: true,
+      state: "completed",
+      delivery_tier: "anchored_3d",
+      recovery_exhausted: true,
+    });
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes><Route path="/tasks/:taskId" element={<TaskDetail />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    const retry = await screen.findByRole("button", { name: "Retry with replacement panorama" });
+    expect(retry).toBeDisabled();
+    fireEvent.click(retry);
+    expect(retryTaskSourceMock).not.toHaveBeenCalled();
+    const panorama = new File(["replacement"], "replacement.png", { type: "image/png" });
+    fireEvent.change(screen.getByLabelText("Replacement panorama"), { target: { files: [panorama] } });
+    fireEvent.click(retry);
+
+    await waitFor(() => expect(retryTaskSourceMock).toHaveBeenCalledWith("recon-task", panorama, "worldgen_from_pano"));
+  });
+
+  it.each([
+    { name: "reconstruction", task: { type: "worldrecon" }, recovery: {} },
+    { name: "fast quality", task: { config: { quality_preset: "fast" } }, recovery: {} },
+    { name: "disabled recovery", task: { config: { recovery_policy: "off" } }, recovery: {} },
+    { name: "strict delivery", task: {}, recovery: { delivery_tier: "strict_3d" } },
+    { name: "missing tier", task: {}, recovery: { delivery_tier: null } },
+    { name: "unknown tier", task: {}, recovery: { delivery_tier: "unknown_tier" } },
+    { name: "recovery not exhausted", task: {}, recovery: { recovery_exhausted: false } },
+    { name: "running task", task: { status: "running" }, recovery: {} },
+    { name: "pending task", task: { status: "pending" }, recovery: {} },
+    { name: "non-source failure", task: { status: "failed" }, recovery: { state: "generating_rescue" } },
+  ])("hides source retry for $name", async ({ task, recovery }) => {
+    getTaskMock.mockResolvedValue({ ...taskFixture, type: "worldgen", ...task });
+    getTaskQualityMock.mockResolvedValue({
+      available: true,
+      state: "completed",
+      delivery_tier: "anchored_3d",
+      recovery_exhausted: true,
+      ...recovery,
+    });
+    render(
+      <MemoryRouter initialEntries={["/tasks/recon-task"]}>
+        <Routes><Route path="/tasks/:taskId" element={<TaskDetail />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    await screen.findByRole("heading", { name: "Automatic recovery" });
+    expect(screen.queryByRole("button", { name: /^Retry with/ })).not.toBeInTheDocument();
   });
 
   it("defaults to 3D and exposes fullscreen for every preview type", async () => {

@@ -718,8 +718,8 @@ def request_source_retry(
     report["pending_candidate_trajectory_ids"] = []
     report["rendered_candidate_trajectory_ids"] = []
     report.pop("render_completed_at", None)
-    # Manual retry is explicit, but it still honors the task-wide 40-path /
-    # 120-minute allowance accumulated by automatic recovery.
+    # Manual retry retains cumulative path/time usage against the configured
+    # task-wide recovery limits.
     report["batches"] = []
     report["terminal_reason"] = None
     report["delivery_tier"] = None

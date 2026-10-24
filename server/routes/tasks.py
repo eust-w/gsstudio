@@ -349,7 +349,7 @@ async def retry_task_source_endpoint(
     completed_recovery_retry = (
         task["status"] == TaskStatus.COMPLETED.value
         and current.get("recovery_exhausted") is True
-        and current.get("delivery_tier") in {"degraded_3d", "panorama_only"}
+        and current.get("delivery_tier") in {"degraded_3d", "anchored_3d", "panorama_only"}
     )
     if task["status"] not in (TaskStatus.FAILED.value, TaskStatus.CANCELLED.value) and not completed_recovery_retry:
         raise HTTPException(409, f"Cannot replace the source in status: {task['status']}")

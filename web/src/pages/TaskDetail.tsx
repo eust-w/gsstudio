@@ -237,11 +237,17 @@ export default function TaskDetail() {
 
   const canCancel = task.status === "pending" || task.status === "running";
   const canRetrySource =
-    ((task.status === "failed" || task.status === "cancelled") &&
-      (recovery?.state === "source_quality_blocked" || recovery?.state === "quality_blocked")) ||
-    (task.status === "completed" &&
-      Boolean(recovery?.recovery_exhausted) &&
-      recovery?.delivery_tier !== "strict_3d");
+    (task.type === "worldgen" || task.type === "worldgen_from_pano") &&
+    (task.config.quality_preset === undefined || task.config.quality_preset === "high") &&
+    (task.config.recovery_policy === undefined || task.config.recovery_policy === "auto") &&
+    recovery?.available === true &&
+    (((task.status === "failed" || task.status === "cancelled") &&
+      (recovery.state === "source_quality_blocked" || recovery.state === "quality_blocked")) ||
+      (task.status === "completed" &&
+        recovery.recovery_exhausted === true &&
+        (recovery.delivery_tier === "degraded_3d" ||
+          recovery.delivery_tier === "anchored_3d" ||
+          recovery.delivery_tier === "panorama_only")));
   const tierLabel = deliveryTierLabel(recovery?.delivery_tier);
   const previewLabels: Record<string, string> = {
     "3dgs": "3D Model",
