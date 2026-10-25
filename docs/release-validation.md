@@ -5,10 +5,6 @@ prepared for publication. It does not certify a hosted service or GPU
 inference. Historical reports remain available under `docs/experiments/` with
 their original dates and acceptance scope.
 
-Publication status on **2026-10-26**: the canonical repository has not been made
-public. This document records local source verification while credential and
-repository-history handling remain pending; it does not certify publication.
-
 ## Application checks
 
 The retained application and original deployment-contract tests are checked in
