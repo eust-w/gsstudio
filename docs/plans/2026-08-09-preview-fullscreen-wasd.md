@@ -165,4 +165,3 @@ Use the Browser plugin first. Verify page identity, meaningful DOM, no framework
 **Step 2: Review, commit, and push**
 
 Run the full regression again if acceptance required changes, inspect `git diff`, commit with Conventional Commits, and push `main` to both `origin` and `gitea`.
-

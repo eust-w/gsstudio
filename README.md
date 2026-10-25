@@ -73,9 +73,13 @@ the `gsstudio-cloudflared` pod is running; recreating that pod generates a new
 URL. Both endpoints require a fresh reachability check before use; the URLs
 above do not establish current availability.
 
-The username is `<configured-user>`. The password is stored in macOS Keychain under account
-`<configured-user>`, service `gsstudio-poc-basic-auth`, and is also injected into the cluster
-through the `gsstudio-basic-auth` Kubernetes Secret. It is never stored in Git.
+Configure a unique username and a strong, independent password through
+`GSSTUDIO_BASIC_AUTH_USER` and `GSSTUDIO_BASIC_AUTH_PASSWORD`, or through the
+`username` and `password` keys in the `gsstudio-basic-auth` Kubernetes Secret.
+Use your secret manager to supply both values; do not commit real credentials.
+The historical endpoints above are deployment records, not a public credential
+or a guarantee that the service is available. See [SECURITY.md](SECURITY.md)
+before exposing the service or running the development script on a network.
 
 Full panorama/text world generation also uses the gated `facebook/sam3` model.
 Accept its Hugging Face access terms, then provide the approved token through
@@ -84,11 +88,17 @@ reconstruction does not require this gated token.
 
 ### Local Verification
 
-    GSSTUDIO_MANAGE_VLLM=false .venv/bin/python -m pytest -q
+Install `requirements-dev.txt` in a Python 3.11 virtual environment and run
+`npm --prefix web ci` first. Build the frontend before the backend tests because
+the SPA routing checks require `web/dist/index.html`:
+
     npm --prefix web test
     npm --prefix web run build
+    GSSTUDIO_MANAGE_VLLM=false .venv/bin/python -m pytest -q
 
-These tests use mocks and do not establish real GPU inference health.
+These tests use mocks and do not establish real GPU inference health. See
+[release validation](docs/release-validation.md) for complete setup commands
+and the scope of the recorded checks.
 
 ### Smoke Test
 
@@ -109,4 +119,9 @@ See [docs/api.md](docs/api.md) for the REST API reference.
 
 ## License
 
-This project is for internal POC use. HY-World 2.0 models are subject to the Tencent Hunyuan Community License.
+Original GSStudio application code is licensed under [Apache-2.0](LICENSE).
+Upstream model runtimes, model weights, and upstream-derived patch excerpts
+retain their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+and [NOTICE](NOTICE). No model weights or GPU base image are included.
+
+The canonical repository is [eust-w/gsstudio](https://github.com/eust-w/gsstudio).

@@ -71,4 +71,3 @@ stuck movement.
 - Public browser acceptance verifies 3D is selected by default, all three preview
   tabs expose fullscreen, native fullscreen toggles, and WASD changes the live
   3D camera without console errors.
-

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Copyright 2026 GSStudio contributors.
+# Original patch-tool code: Apache-2.0. Upstream-derived matching excerpts
+# retain the Tencent HY-WORLD 2.0 Community License; see THIRD_PARTY_NOTICES.md.
+# Source: Tencent-Hunyuan/HY-World-2.0, hyworld2/worldgen/video_gen.py
+# Original license: https://github.com/Tencent-Hunyuan/HY-World-2.0/blob/main/License.txt
 """Add a deterministic candidate whitelist to HY-World's video generator.
 
 WorldStereo's FSDP ranks cooperate on one trajectory at a time.  Applying the
@@ -28,6 +33,23 @@ WORLD_MIRROR_PATTERN = re.compile(
 CANDIDATE_SENTINEL = "# GSStudio video candidate whitelist patch"
 RESUME_SENTINEL = "GSStudio whitelist resume patch"
 WORLD_MIRROR_SENTINEL = "GSStudio whitelist world-mirror refresh patch"
+MODIFICATION_NOTICE = (
+    "# GSStudio modification notice (2026-10-25): modified by GSStudio contributors.\n"
+    "# Changes: candidate whitelist, resume guard, and WorldMirror refresh.\n"
+    "# Original source: Tencent-Hunyuan/HY-World-2.0, video_gen.py.\n"
+    "# Original license: https://github.com/Tencent-Hunyuan/HY-World-2.0/blob/main/License.txt\n"
+)
+
+
+def _with_modification_notice(source: str) -> str:
+    if MODIFICATION_NOTICE in source:
+        return source
+    lines = source.splitlines(keepends=True)
+    offset = 0
+    for index, line in enumerate(lines[:2]):
+        if (index == 0 and line.startswith("#!")) or re.match(r"^[ \t\f]*#.*?coding[:=][ \t]*[-\w.]+", line):
+            offset = sum(len(item) for item in lines[:index + 1])
+    return source[:offset] + MODIFICATION_NOTICE + source[offset:]
 
 
 def _insert_after(pattern: re.Pattern[str], source: str, insertion_for_indent) -> str:
@@ -39,6 +61,7 @@ def _insert_after(pattern: re.Pattern[str], source: str, insertion_for_indent) -
 
 
 def patch(source: str) -> str:
+    source = _with_modification_notice(source)
     if CANDIDATE_SENTINEL not in source:
         source = _insert_after(
             ARGUMENT_PATTERN,

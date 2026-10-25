@@ -1,0 +1,25 @@
+# Only send application/build inputs to the Docker daemon.
+**
+!Dockerfile.a800
+!Dockerfile.lite
+!requirements-runtime.txt
+!deploy/
+!deploy/requirements-security.txt
+!deploy/supervisord.conf
+!deploy/scripts/
+!deploy/scripts/*.sh
+!deploy/scripts/*.py
+!server/
+!server/**
+!web/
+!web/dist/
+!web/dist/**
+**/__pycache__/
+**/*.py[cod]
+
+!LICENSE
+!NOTICE
+!THIRD_PARTY_NOTICES.md
+!third_party/
+!third_party/licenses/
+!third_party/licenses/**
