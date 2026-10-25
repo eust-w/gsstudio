@@ -1,0 +1,11 @@
+# Optional complete API and mock-pipeline dependency reference.
+# Original Dockerfile.lite and dev_local.sh retain their own install commands.
+# The real GPU runtime and model dependencies are provided separately.
+-r deploy/requirements-security.txt
+aiofiles==25.1.0
+fastapi==0.141.1
+pydantic==2.13.4
+numpy==2.0.2
+Pillow>=10.4,<13
+starlette==1.6.0
+uvicorn[standard]==0.39.0

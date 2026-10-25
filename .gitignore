@@ -11,10 +11,24 @@ web/dist/
 # SQLite
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
+*.sqlite*
 
 # Task data (runtime)
 workdir/
 data/
+output/
+outputs/
+models/
+weights/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.gguf
+*.log
 
 # IDE
 .idea/
@@ -26,7 +40,12 @@ data/
 # Env
 .env
 .env.local
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Local browser verification artifacts
 .playwright-cli/
-output/playwright/

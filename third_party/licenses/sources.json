@@ -1,0 +1,43 @@
+[
+  {
+    "file": "HY-World-2.0.txt",
+    "upstream_repository": "https://github.com/Tencent-Hunyuan/HY-World-2.0",
+    "upstream_commit": "df9988efb87bfc0f4947eb3889411cf957478b06",
+    "source_url": "https://raw.githubusercontent.com/Tencent-Hunyuan/HY-World-2.0/df9988efb87bfc0f4947eb3889411cf957478b06/License.txt",
+    "retrieved_on": "2026-10-25",
+    "sha256": "26a9f951e4097f7f965a4c3f93357beb3605246ba3663bf541593de75a1ecbd0"
+  },
+  {
+    "file": "HunyuanImage-3.0.txt",
+    "upstream_repository": "https://github.com/Tencent-Hunyuan/HunyuanImage-3.0",
+    "upstream_commit": "6e9113a692a27a0751d82aba3b2015a876646c03",
+    "source_url": "https://raw.githubusercontent.com/Tencent-Hunyuan/HunyuanImage-3.0/6e9113a692a27a0751d82aba3b2015a876646c03/LICENSE",
+    "retrieved_on": "2026-10-25",
+    "sha256": "38ee960faee3ab4ca226b0b50d661a4460e4d8c1e8fbc8431d5cd69bc2c363cc"
+  },
+  {
+    "file": "SAM3.txt",
+    "upstream_repository": "https://github.com/facebookresearch/sam3",
+    "upstream_commit": "f1647e8d0c1d280991f4d1b7d974c2704537fe66",
+    "source_url": "https://raw.githubusercontent.com/facebookresearch/sam3/f1647e8d0c1d280991f4d1b7d974c2704537fe66/LICENSE",
+    "retrieved_on": "2026-10-25",
+    "sha256": "4dea99bfaa016e21bc860d73f344236bd1e5c4977d1a9a8fd32f822b500ae1be"
+  },
+  {
+    "file": "Spark.txt",
+    "upstream_repository": "https://github.com/sparkjsdev/spark",
+    "upstream_commit": "ffe210dc0a45d0515a06c9235878108112827d61",
+    "source_url": "https://raw.githubusercontent.com/sparkjsdev/spark/ffe210dc0a45d0515a06c9235878108112827d61/LICENSE",
+    "retrieved_on": "2026-10-25",
+    "sha256": "51829693e5dccd9ca1daa093991faac3aaa93238eb8fd5f5cb4130af85791d64"
+  },
+  {
+    "file": "Apache-2.0.txt",
+    "upstream_repository": null,
+    "upstream_commit": null,
+    "source_url": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+    "retrieved_on": "2026-10-25",
+    "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "note": "Canonical Apache Software Foundation license text; no repository commit applies."
+  }
+]

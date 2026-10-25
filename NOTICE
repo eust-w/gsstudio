@@ -1,0 +1,20 @@
+GSStudio
+Copyright 2026 GSStudio contributors.
+
+Original GSStudio code and documentation are licensed under Apache-2.0.
+Third-party and upstream-derived material retains its original license.
+This source release does not bundle model weights or a GPU runtime.
+
+GSStudio is an independent project. Tencent is not affiliated with, associated
+with, sponsoring, or endorsing GSStudio. Operators of a service using the
+upstream components must identify the actual service provider to their users.
+
+Upstream notices required by the referenced community licenses
+
+Tencent HY-WORLD 2.0 is licensed under the Tencent HY-WORLD 2.0 Community License Agreement, Copyright © 2026 Tencent. All Rights Reserved. The trademark rights of “Tencent HY” are owned by Tencent or its affiliate.
+
+Tencent Hunyuan is licensed under the Tencent Hunyuan Community License Agreement, Copyright © 2025 Tencent. All Rights Reserved. The trademark rights of “Tencent Hunyuan” are owned by Tencent or its affiliate.
+
+The original community-license texts and their Acceptable Use Policies are
+provided in third_party/licenses/. See THIRD_PARTY_NOTICES.md for scope,
+additional runtime dependencies, and source provenance.

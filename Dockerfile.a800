@@ -58,3 +58,7 @@ RUN chmod +x /app/entrypoint.sh
 WORKDIR /app
 EXPOSE 8000 8100
 ENTRYPOINT ["/app/entrypoint.sh"]
+
+# Retain application and upstream license notices in distributed images.
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /app/
+COPY third_party/licenses/ /app/third_party/licenses/

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Copyright 2026 GSStudio contributors.
+# Original patch-tool code: Apache-2.0. Upstream-derived matching excerpts
+# retain the Tencent HY-WORLD 2.0 Community License; see THIRD_PARTY_NOTICES.md.
+# Source: Tencent-Hunyuan/HY-World-2.0, hyworld2/worldgen/gen_gs_data.py
+# Original license: https://github.com/Tencent-Hunyuan/HY-World-2.0/blob/main/License.txt
 """Add GSStudio's trajectory whitelist to HY-World's gen_gs_data entrypoint.
 
 The upstream script deliberately discovers every generated trajectory.  For a
@@ -20,6 +25,23 @@ SORT_PATTERN = re.compile(
     r'\(x\.split\("/"\)\[-3\], x\.split\("/"\)\[-2\]\)\)\n'
 )
 SENTINEL = "# GSStudio trajectory whitelist patch"
+MODIFICATION_NOTICE = (
+    "# GSStudio modification notice (2026-10-25): modified by GSStudio contributors.\n"
+    "# Changes: trajectory whitelist and panorama/polar anchor fallback.\n"
+    "# Original source: Tencent-Hunyuan/HY-World-2.0, gen_gs_data.py.\n"
+    "# Original license: https://github.com/Tencent-Hunyuan/HY-World-2.0/blob/main/License.txt\n"
+)
+
+
+def _with_modification_notice(source: str) -> str:
+    if MODIFICATION_NOTICE in source:
+        return source
+    lines = source.splitlines(keepends=True)
+    offset = 0
+    for index, line in enumerate(lines[:2]):
+        if (index == 0 and line.startswith("#!")) or re.match(r"^[ \t\f]*#.*?coding[:=][ \t]*[-\w.]+", line):
+            offset = sum(len(item) for item in lines[:index + 1])
+    return source[:offset] + MODIFICATION_NOTICE + source[offset:]
 
 
 def _insert_after(pattern: re.Pattern[str], source: str, insertion_for_indent) -> str:
@@ -31,6 +53,7 @@ def _insert_after(pattern: re.Pattern[str], source: str, insertion_for_indent) -
 
 
 def patch(source: str) -> str:
+    source = _with_modification_notice(source)
     if SENTINEL in source:
         return source
 
