@@ -2,12 +2,14 @@
 # include the fixed releases reported by the Python dependency audit.  Keep
 # this file narrow: HY-World's model stack remains inherited from a tested
 # CUDA base image rather than being opportunistically upgraded at rollout.
+# 2026-11-26: filelock 4.2.1, msgpack 1.2.3, setuptools 84.1.0, urllib3 2.8.0
+# per pip-audit (CVE-2026-112907..112940, CVE-2026-114613, GHSA-xmj3-9gf7-h52w, PYSEC-2026-4175..4177).
 click==8.4.2
-filelock==3.32.2
-msgpack==1.2.1
+filelock==4.2.1
+msgpack==1.2.3
 pip==26.2.1
 python-dotenv==1.2.2
 python-multipart==0.0.32
 requests==2.34.2
-setuptools==84.0.0
-urllib3==2.7.0
+setuptools==84.1.0
+urllib3==2.8.0
