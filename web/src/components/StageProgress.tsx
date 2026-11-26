@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { StageInfo } from "../api";
 
 interface StageProgressProps {
@@ -52,21 +53,35 @@ function StageIcon({ status }: { status: string }) {
 }
 
 function formatDuration(seconds?: number): string {
-  if (!seconds) return "";
+  if (seconds == null) return "";
   if (seconds < 60) return `${seconds.toFixed(0)}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s`;
   return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
 }
 
 export default function StageProgress({ stages, currentStage }: StageProgressProps) {
+  const [now, setNow] = useState(Date.now);
+  const hasRunningStage = stages.some((stage) => stage.status === "running");
+  useEffect(() => {
+    if (!hasRunningStage) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [hasRunningStage]);
+  const finishedCount = stages.filter((stage) => stage.status === "completed" || stage.status === "skipped").length;
   return (
     <div className="stage-progress">
-      <h3>Pipeline Stages</h3>
-      <div className="stage-list">
-        {stages.map((stage, idx) => (
+      <div className="stage-heading"><h3>Pipeline Stages</h3><span className="muted">{finishedCount} / {stages.length} finished</span></div>
+      {stages.length === 0 && <p className="form-help">Pipeline stages appear when the worker starts this task.</p>}
+      <div className="stage-list" role="list" aria-label="Pipeline stages">
+        {stages.map((stage, idx) => {
+          const start = stage.started_at ? new Date(stage.started_at).getTime() : NaN;
+          const duration = stage.duration_seconds ?? (stage.status === "running" && Number.isFinite(start) ? Math.max(0, (now - start) / 1000) : undefined);
+          return (
           <div
             key={stage.name}
             className={`stage-item ${stage.status} ${stage.name === currentStage ? "current" : ""}`}
+            role="listitem"
+            aria-current={stage.status === "running" ? "step" : undefined}
           >
             <div className="stage-indicator">
               <StageIcon status={stage.status} />
@@ -76,13 +91,11 @@ export default function StageProgress({ stages, currentStage }: StageProgressPro
               <div className="stage-name">
                 {STAGE_LABELS[stage.name] || stage.name}
               </div>
-              {stage.duration_seconds != null && (
-                <div className="stage-duration">{formatDuration(stage.duration_seconds)}</div>
-              )}
+              <div className="stage-duration"><span className={`stage-status-text ${stage.status}`}>{stage.status === "pending" ? "Waiting" : stage.status.charAt(0).toUpperCase() + stage.status.slice(1)}</span>{duration != null && <span> · {formatDuration(duration)}{stage.status === "running" ? " elapsed" : ""}</span>}</div>
               {stage.error && <div className="stage-error">{stageErrorSummary(stage.error)}</div>}
             </div>
           </div>
-        ))}
+        ); })}
       </div>
     </div>
   );

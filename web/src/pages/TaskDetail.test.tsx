@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import TaskDetail, { preferredPanoramaArtifact, preferredSplatArtifact } from "./TaskDetail";
@@ -42,6 +42,7 @@ const taskFixture = {
 
 vi.mock("../api", () => ({
   cancelTask: vi.fn(),
+  retryTask: vi.fn(),
   deleteTask: deleteTaskMock,
   getArtifactUrl: (_taskId: string, path: string) => `/api/artifacts/${path}`,
   getTask: getTaskMock,
@@ -187,6 +188,7 @@ describe("TaskDetail", () => {
   });
 
   it("shows the actual model, trajectory gates and fixed high-quality training plan", async () => {
+    getTaskMock.mockResolvedValue({...taskFixture, type:"worldgen"});
     render(
       <MemoryRouter initialEntries={["/tasks/recon-task"]}>
         <Routes>
@@ -202,6 +204,7 @@ describe("TaskDetail", () => {
   });
 
   it("shows live conservative-recovery progress and its GPU budget", async () => {
+    getTaskMock.mockResolvedValue({...taskFixture, type:"worldgen", status:"running"});
     getTaskQualityMock.mockResolvedValue({
       available: true,
       state: "generating_rescue",
@@ -638,5 +641,89 @@ describe("TaskDetail", () => {
 
     await waitFor(() => expect(deleteTaskMock).toHaveBeenCalledWith("recon-task"));
     expect(await screen.findByText("Task list")).toBeInTheDocument();
+  });
+});
+
+function renderDetail() {
+  return render(<MemoryRouter initialEntries={["/tasks/recon-task"]}><Routes><Route path="/tasks/:taskId" element={<TaskDetail />} /></Routes></MemoryRouter>);
+}
+
+describe("TaskDetail validation and route safety", () => {
+  it("keeps historical 3D locked on a failed quality request and reopens it only after a valid report", async () => {
+    getTaskQualityMock.mockRejectedValue(new Error("Quality service unavailable"));
+    renderDetail();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Quality report unavailable. 3D access stays locked until the report can be checked.");
+    expect(screen.queryByText("Legacy unvalidated")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "3D Model" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("splat-viewer")).not.toBeInTheDocument();
+    expect(screen.getByTestId("panorama-viewer")).toBeInTheDocument();
+
+    getTaskQualityMock.mockResolvedValue({ available: true, contract_version: 4, input_lane: "production_multiview", free_view_eligible: true });
+    fireEvent.click(screen.getByRole("button", { name: "Retry report" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+    expect(await screen.findByRole("button", { name: "3D Model" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "3D Model" }));
+    expect(await screen.findByTestId("splat-viewer")).toHaveTextContent("nav:true");
+  });
+
+  it.each(["task", "config"])("does not apply legacy inspection to a real task marked in %s when no report exists", async (location) => {
+    getTaskMock.mockResolvedValue({ ...taskFixture, ...(location === "task" ? { execution_mode: "real" } : { config: { ...taskFixture.config, execution_mode: "real" } }) });
+    getTaskQualityMock.mockResolvedValue({ available: false });
+    renderDetail();
+    await screen.findByRole("heading", { name: "Reconstruction" });
+    expect(screen.queryByText("Legacy unvalidated")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "3D Model" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("splat-viewer")).not.toBeInTheDocument();
+    expect(screen.getByTestId("panorama-viewer")).toBeInTheDocument();
+  });
+
+  it("shows the queued runtime failure summary even without a raw task error", async () => {
+    getTaskMock.mockResolvedValue({ ...taskFixture, status: "pending", error: null, error_code: "runtime_not_ready", error_summary: "Waiting for an available NVIDIA GPU runtime." });
+    renderDetail();
+    expect(await screen.findByText("Waiting for an available NVIDIA GPU runtime.")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Check runtime prerequisites" })).toHaveAttribute("href", "/system");
+    expect(screen.queryByText("Technical details")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel Task" })).toBeEnabled();
+  });
+
+  it("does not display generative WorldStereo budgets for a reconstruction task", async () => {
+    getTaskQualityMock.mockResolvedValue({ available: true, contract_version: 4, input_lane: "production_multiview", free_view_eligible: true, accepted_trajectories: 10, generated_video_trajectories: 12 });
+    renderDetail();
+    await screen.findByRole("heading", { name: "Reconstruction" });
+    expect(screen.queryByRole("heading", { name: "Generation configuration" })).not.toBeInTheDocument();
+    expect(screen.queryByText("WorldStereo budget")).not.toBeInTheDocument();
+    expect(screen.queryByText(/12 of .*WorldStereo trajectories/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps a pending save for task B intact when task A's earlier save resolves", async () => {
+    let resolveA!: (value: typeof taskFixture) => void;
+    let resolveB!: (value: typeof taskFixture) => void;
+    const saveA = new Promise<typeof taskFixture>((resolve) => { resolveA = resolve; });
+    const saveB = new Promise<typeof taskFixture>((resolve) => { resolveB = resolve; });
+    getTaskMock.mockImplementation(async (id: string) => ({ ...taskFixture, id, name: id === "first" ? "First scene" : "Second scene" }));
+    updateTaskMock.mockImplementation((id: string) => id === "first" ? saveA : saveB);
+    const router = createMemoryRouter([{ path: "/tasks/:taskId", element: <TaskDetail /> }], { initialEntries: ["/tasks/first"] });
+    render(<RouterProvider router={router} />);
+    await screen.findByRole("heading", { name: "First scene" });
+    fireEvent.click(screen.getByRole("button", { name: "Edit task" }));
+    fireEvent.change(screen.getByLabelText("Task name"), { target: { value: "First renamed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(updateTaskMock).toHaveBeenCalledWith("first", { name: "First renamed" });
+
+    await act(async () => { await router.navigate("/tasks/second"); });
+    await screen.findByRole("heading", { name: "Second scene" });
+    fireEvent.click(screen.getByRole("button", { name: "Edit task" }));
+    fireEvent.change(screen.getByLabelText("Task name"), { target: { value: "Second renamed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(updateTaskMock).toHaveBeenCalledWith("second", { name: "Second renamed" });
+
+    await act(async () => { resolveA({ ...taskFixture, id: "first", name: "First renamed" }); await saveA; });
+    expect(screen.getByLabelText("Task name")).toHaveValue("Second renamed");
+    expect(screen.getByRole("button", { name: "Saving..." })).toBeDisabled();
+    expect(screen.queryByRole("heading", { name: "First renamed" })).not.toBeInTheDocument();
+
+    await act(async () => { resolveB({ ...taskFixture, id: "second", name: "Second renamed" }); await saveB; });
+    expect(await screen.findByRole("heading", { name: "Second renamed" })).toBeInTheDocument();
+    expect(screen.queryByLabelText("Task name")).not.toBeInTheDocument();
   });
 });

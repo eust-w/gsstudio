@@ -42,7 +42,7 @@ function renderList() {
 }
 
 async function selectVisibleTasks() {
-  await screen.findByRole("heading", { name: "Tasks" });
+  await screen.findByRole("heading", { name: "Your scenes" });
   fireEvent.click(screen.getByRole("checkbox", { name: "Select visible tasks" }));
 }
 
@@ -107,11 +107,53 @@ describe("TaskList batch actions", () => {
 
   it("selecting a card checkbox does not navigate to its detail page", async () => {
     renderList();
-    await screen.findByRole("heading", { name: "Tasks" });
+    await screen.findByRole("heading", { name: "Your scenes" });
 
     fireEvent.click(screen.getByRole("checkbox", { name: "Select task Pending task" }));
 
-    expect(screen.getByRole("heading", { name: "Tasks" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Your scenes" })).toBeInTheDocument();
     expect(screen.getByText("1 selected")).toBeInTheDocument();
+  });
+});
+
+describe("TaskList server-backed discovery", () => {
+  it("sends trimmed search text, pipeline and status filters to the server and resets pagination", async () => {
+    listTasksMock.mockImplementation(async (params: { q?: string }) => ({
+      tasks: params.q ? [{ ...tasks[2], id: "remote-match", name: "Office on a later page" }] : tasks,
+      total: params.q ? 14 : 25,
+    }));
+    render(<MemoryRouter><TaskList /></MemoryRouter>);
+    await screen.findByRole("heading", { name: "Completed task" });
+    expect(listTasksMock).toHaveBeenLastCalledWith(expect.objectContaining({ limit: 12, offset: 0, q: undefined }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    await waitFor(() => expect(listTasksMock).toHaveBeenLastCalledWith(expect.objectContaining({ limit: 12, offset: 12 })));
+    expect(await screen.findByText("Page 2 of 3")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Search scenes" }), { target: { value: "  office  " } });
+    await waitFor(() => expect(listTasksMock).toHaveBeenLastCalledWith(expect.objectContaining({ q: "office", limit: 12, offset: 0 })));
+    expect(await screen.findByRole("heading", { name: "Office on a later page" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Completed task" })).not.toBeInTheDocument();
+    expect(screen.getByText("Page 1 of 2")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Filter by pipeline" }), { target: { value: "worldrecon" } });
+    await waitFor(() => expect(listTasksMock).toHaveBeenLastCalledWith(expect.objectContaining({ q: "office", type: "worldrecon", offset: 0 })));
+    fireEvent.click(screen.getByRole("button", { name: "Completed" }));
+    await waitFor(() => expect(listTasksMock).toHaveBeenLastCalledWith(expect.objectContaining({ q: "office", type: "worldrecon", status: "completed", offset: 0 })));
+  });
+
+  it("shows an API failure without claiming that the workspace has no scenes", async () => {
+    listTasksMock.mockRejectedValue(new Error("The task API is unavailable."));
+    render(<MemoryRouter><TaskList /></MemoryRouter>);
+    expect(await screen.findByRole("alert")).toHaveTextContent("The task API is unavailable.");
+    expect(screen.getByRole("heading", { name: "Your scenes are temporarily unavailable" })).toBeInTheDocument();
+    expect(screen.queryByText("A new perspective starts here")).not.toBeInTheDocument();
+    expect(screen.queryByText("No scenes yet")).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Create your first scene" })).not.toBeInTheDocument();
+
+    listTasksMock.mockResolvedValue({ tasks: [tasks[2]], total: 1 });
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByRole("heading", { name: "Completed task" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 });

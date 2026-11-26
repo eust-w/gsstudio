@@ -1,0 +1,20 @@
+import {Link} from "react-router-dom";
+import Icon from "../components/Icon";
+import {useSystemStatus} from "../components/SystemStatus";
+
+const labels: Record<string, string> = {worldrecon: "Multi-view reconstruction", worldgen: "Text / image to world", worldgen_from_pano: "Panorama to world"};
+
+export default function SystemPage() {
+  const {system, error, refresh} = useSystemStatus();
+  return <div className="page system-page">
+    <div className="page-header"><div><h2>Runtime & resources</h2><p className="page-description">Check what this server can actually run.</p></div><button className="btn" onClick={refresh}><Icon name="refresh" size={16} /> Refresh status</button></div>
+    {error && <div className="error-banner" role="alert">{error} <button className="btn btn-sm" onClick={refresh}>Reconnect</button></div>}
+    {!system ? <div className="loading">{error ? "Runtime state is unknown while the API is unavailable." : "Inspecting the runtime…"}</div> : <>
+      <section className="runtime-overview"><div><span className="field-caption">EXECUTION MODE</span><h3>{system.mode === "demo" ? "Demo simulation" : "Real pipeline"}</h3></div><div><span className="field-caption">COMPUTE</span><h3>{system.gpu.gpus.length} detected GPU{system.gpu.gpus.length !== 1 ? "s" : ""}</h3></div><div><span className="field-caption">LAST CHECK</span><p>{new Date(system.checked_at).toLocaleTimeString()}</p></div></section>
+      {system.mode === "demo" && <div className="runtime-notice"><Icon name="alert" /><div><strong>Simulation is explicitly enabled</strong><p>Tasks exercise the queue and logs. They never deliver a verified 3D model.</p></div></div>}
+      <section className="system-section"><h3>Pipeline availability</h3><div className="capability-list">{[...system.capabilities].sort((a, b) => (a.task_type === "worldrecon" ? -1 : b.task_type === "worldrecon" ? 1 : 0)).map(capability => <article key={capability.task_type} className="capability-row"><div className="capability-heading"><Icon name="cube" /><h4>{labels[capability.task_type]}</h4><span className={`capability-state ${capability.ready ? "ready" : "blocked"}`}>{system.mode === "demo" ? "Simulation only" : capability.ready ? "Ready" : "Setup required"}</span></div>{capability.blockers.length > 0 ? <div><ul>{capability.blockers.slice(0, 2).map((blocker, index) => <li key={`${blocker.code}-${index}`}>{blocker.message}</li>)}</ul>{capability.blockers.length > 2 && <details className="capability-details"><summary>Show {capability.blockers.length - 2} more requirements</summary><ul>{capability.blockers.slice(2).map((blocker, index) => <li key={`${blocker.code}-${index}`}>{blocker.message}</li>)}</ul></details>}</div> : <p className="muted">{system.mode === "demo" ? "No model inference will run." : "Runtime prerequisites are present. Input quality is checked when a task runs."}</p>}</article>)}</div></section>
+      <section className="system-section"><h3>Environment checks</h3><div className="environment-checks">{system.checks.map(check => <div className="environment-check" key={check.code}><span className={check.ok ? "check-pass" : "check-fail"}><Icon name={check.ok ? "check" : "alert"} size={18} /></span><div><strong>{check.label}</strong><p>{check.message}</p></div><span className="check-result">{check.ok ? "Available" : "Unavailable"}</span></div>)}</div></section>
+      <section className="system-section"><h3>GPU resources</h3>{system.gpu.gpus.length === 0 ? <div className="system-empty"><Icon name="monitor" /><p>{system.gpu.error || "No compatible NVIDIA GPUs were detected on this server."}</p></div> : <div className="gpu-list">{system.gpu.gpus.map(gpu => <article className="gpu-row" key={gpu.index}><div><strong>GPU {gpu.index} · {gpu.name}</strong><span>{gpu.vram_used_gb.toFixed(1)} / {gpu.vram_total_gb.toFixed(1)} GB</span></div><progress max={gpu.vram_total_gb} value={gpu.vram_used_gb} aria-label={`GPU ${gpu.index} memory used`} /></article>)}</div>}{system.gpu.active_task && <Link className="back-link" to={`/tasks/${system.gpu.active_task}`}>Open active task →</Link>}</section>
+    </>}
+  </div>;
+}

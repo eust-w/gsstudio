@@ -9,6 +9,7 @@ export interface Task {
   progress: number;
   created_at: string;
   updated_at?: string;
+  execution_mode?: "real" | "demo" | "unknown";
 }
 
 export interface StageInfo {
@@ -197,9 +198,58 @@ export interface TaskListResponse {
   total: number;
 }
 
-export async function createTask(formData: FormData): Promise<{ task_id: string }> {
-  const resp = await fetch(`${API_BASE}/tasks`, { method: "POST", body: formData });
-  if (!resp.ok) throw new Error(`Create task failed: ${resp.statusText}`);
+export function apiErrorMessage(payload: unknown, fallback: string): string {
+  if (typeof payload === "string") return payload;
+  if (!payload || typeof payload !== "object") return fallback;
+  const value = payload as Record<string, unknown>;
+  if (value.detail) return apiErrorMessage(value.detail, fallback);
+  if (Array.isArray(payload)) return payload.map(item => apiErrorMessage(item, fallback)).join("; ");
+  const message = typeof value.message === "string" ? value.message : typeof value.msg === "string" ? value.msg : fallback;
+  const blockers = Array.isArray(value.blockers) ? value.blockers.map(item => apiErrorMessage(item, "")).filter(Boolean) : [];
+  return [message, ...blockers].join(" · ");
+}
+
+async function responseError(resp: Response, fallback: string): Promise<Error> {
+  return new Error(apiErrorMessage(await resp.json().catch(() => null), `${fallback} (${resp.status})`));
+}
+
+export interface UploadOptions {
+  onProgress?: (percent: number) => void;
+  signal?: AbortSignal;
+  idempotencyKey?: string;
+}
+
+export async function createTask(formData: FormData, options: UploadOptions = {}): Promise<{ task_id: string }> {
+  if (options.onProgress || options.signal) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `${API_BASE}/tasks`);
+      if (options.idempotencyKey) xhr.setRequestHeader("Idempotency-Key", options.idempotencyKey);
+      const abort = () => xhr.abort();
+      const cleanup = () => options.signal?.removeEventListener("abort", abort);
+      xhr.upload.onprogress = event => {
+        if (event.lengthComputable) options.onProgress?.(Math.round(event.loaded / event.total * 100));
+      };
+      xhr.onload = () => {
+        cleanup();
+        let data: unknown;
+        try { data = JSON.parse(xhr.responseText); } catch { /* handled below */ }
+        if (xhr.status >= 200 && xhr.status < 300 && data && typeof data === "object" && "task_id" in data) {
+          resolve(data as {task_id: string});
+        } else reject(new Error(apiErrorMessage(data, `Create task failed (${xhr.status})`)));
+      };
+      xhr.onerror = () => { cleanup(); reject(new Error("Upload connection lost. Retry with the same files to recover your submission.")); };
+      xhr.onabort = () => { cleanup(); reject(new DOMException("Upload cancelled", "AbortError")); };
+      if (options.signal?.aborted) { reject(new DOMException("Upload cancelled", "AbortError")); return; }
+      options.signal?.addEventListener("abort", abort, {once: true});
+      xhr.send(formData);
+    });
+  }
+  const resp = await fetch(`${API_BASE}/tasks`, {
+    method: "POST", body: formData,
+    headers: options.idempotencyKey ? {"Idempotency-Key": options.idempotencyKey} : undefined,
+  });
+  if (!resp.ok) throw await responseError(resp, "Create task failed");
   return resp.json();
 }
 
@@ -208,45 +258,47 @@ export async function listTasks(params?: {
   type?: string;
   limit?: number;
   offset?: number;
+  q?: string;
+  signal?: AbortSignal;
 }): Promise<TaskListResponse> {
   const searchParams = new URLSearchParams();
   if (params?.status) searchParams.set("status", params.status);
   if (params?.type) searchParams.set("type", params.type);
   if (params?.limit) searchParams.set("limit", String(params.limit));
   if (params?.offset) searchParams.set("offset", String(params.offset));
+  if (params?.q) searchParams.set("q", params.q);
   const qs = searchParams.toString();
-  const resp = await fetch(`${API_BASE}/tasks${qs ? "?" + qs : ""}`);
-  if (!resp.ok) throw new Error(`List tasks failed: ${resp.statusText}`);
+  const resp = await fetch(`${API_BASE}/tasks${qs ? "?" + qs : ""}`, {signal: params?.signal});
+  if (!resp.ok) throw await responseError(resp, "List tasks failed");
   return resp.json();
 }
 
 export async function getTask(id: string): Promise<TaskDetail> {
   const resp = await fetch(`${API_BASE}/tasks/${id}`);
-  if (!resp.ok) throw new Error(`Get task failed: ${resp.statusText}`);
+  if (!resp.ok) throw await responseError(resp, "Get task failed");
   return resp.json();
 }
 
 export async function getTaskQuality(id: string): Promise<TaskQualityRecovery> {
   const resp = await fetch(`${API_BASE}/tasks/${id}/quality`);
-  if (!resp.ok) throw new Error(`Quality status failed: ${resp.statusText}`);
+  if (!resp.ok) throw await responseError(resp, "Quality status failed");
   return resp.json();
 }
 
 export async function cancelTask(id: string): Promise<void> {
   const resp = await fetch(`${API_BASE}/tasks/${id}/cancel`, { method: "POST" });
-  if (!resp.ok) throw new Error(`Cancel failed: ${resp.statusText}`);
+  if (!resp.ok) throw await responseError(resp, "Cancel failed");
 }
 
 export async function retryTask(id: string): Promise<void> {
   const resp = await fetch(`${API_BASE}/tasks/${id}/retry`, { method: "POST" });
-  if (!resp.ok) throw new Error(`Retry failed: ${resp.statusText}`);
+  if (!resp.ok) throw await responseError(resp, "Retry failed");
 }
 
 export async function repairTaskModel(id: string): Promise<void> {
   const resp = await fetch(`${API_BASE}/tasks/${id}/repair`, { method: "POST" });
   if (!resp.ok) {
-    const detail = await resp.json().catch(() => null);
-    throw new Error(detail?.detail || `Model repair failed: ${resp.statusText}`);
+    throw await responseError(resp, "Model repair failed");
   }
 }
 
@@ -263,7 +315,7 @@ export async function retryTaskSource(
   images?.forEach((file) => body?.append("images", file));
   if (body && video) body.set("video", video);
   const resp = await fetch(`${API_BASE}/tasks/${id}/retry-source`, { method: "POST", body });
-  if (!resp.ok) throw new Error(`Source retry failed: ${resp.statusText}`);
+  if (!resp.ok) throw await responseError(resp, "Source retry failed");
 }
 
 export async function updateTask(id: string, updates: { name: string }): Promise<TaskDetail> {
@@ -272,24 +324,24 @@ export async function updateTask(id: string, updates: { name: string }): Promise
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(updates),
   });
-  if (!resp.ok) throw new Error(`Update task failed: ${resp.statusText}`);
+  if (!resp.ok) throw await responseError(resp, "Update task failed");
   return resp.json();
 }
 
 export async function deleteTask(id: string): Promise<void> {
   const resp = await fetch(`${API_BASE}/tasks/${id}`, { method: "DELETE" });
-  if (!resp.ok) throw new Error(`Delete task failed: ${resp.statusText}`);
+  if (!resp.ok) throw await responseError(resp, "Delete task failed");
 }
 
 export async function getArtifacts(taskId: string): Promise<Artifact[]> {
   const resp = await fetch(`${API_BASE}/tasks/${taskId}/artifacts`);
-  if (!resp.ok) throw new Error(`Get artifacts failed: ${resp.statusText}`);
+  if (!resp.ok) throw await responseError(resp, "Get artifacts failed");
   const data = await resp.json();
   return data.artifacts || [];
 }
 
 export function getArtifactUrl(taskId: string, path: string): string {
-  return `${API_BASE}/tasks/${taskId}/artifacts/${path}`;
+  return `${API_BASE}/tasks/${encodeURIComponent(taskId)}/artifacts/${path.split("/").map(encodeURIComponent).join("/")}`;
 }
 
 export function getLogWebSocketUrl(taskId: string): string {
@@ -304,6 +356,22 @@ export async function healthCheck(): Promise<{ status: string }> {
 
 export async function getGpuStatus(): Promise<GpuStatus> {
   const resp = await fetch(`${API_BASE}/gpu/status`);
-  if (!resp.ok) throw new Error(`GPU status failed: ${resp.statusText}`);
+  if (!resp.ok) throw await responseError(resp, "GPU status failed");
+  return resp.json();
+}
+
+export interface RuntimeBlocker { code: string; message: string }
+export interface SystemStatus {
+  mode: "real" | "demo";
+  ready: boolean;
+  checked_at: string;
+  capabilities: Array<{task_type: Task["type"]; ready: boolean; blockers: RuntimeBlocker[]}>;
+  checks: Array<{code: string; label: string; ok: boolean; message: string}>;
+  gpu: GpuStatus & {available: boolean; error?: string | null};
+}
+
+export async function getSystemStatus(signal?: AbortSignal): Promise<SystemStatus> {
+  const resp = await fetch(`${API_BASE}/system/status`, {signal});
+  if (!resp.ok) throw await responseError(resp, "System status unavailable");
   return resp.json();
 }

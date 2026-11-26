@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   cancelTask,
@@ -8,13 +8,16 @@ import {
   getTaskQuality,
   repairTaskModel,
   retryTaskSource,
+  retryTask,
   updateTask,
   Artifact,
   TaskDetail as TaskDetailType,
   TaskQualityRecovery,
 } from "../api";
 import LogStream from "../components/LogStream";
-import PanoViewer from "../components/PanoViewer";
+import Icon from "../components/Icon";
+import {formatFileSize} from "../components/UploadInput";
+const PanoViewer = lazy(() => import("../components/PanoViewer"));
 import PreviewFrame from "../components/PreviewFrame";
 import StageProgress from "../components/StageProgress";
 import StatusBadge from "../components/StatusBadge";
@@ -98,32 +101,45 @@ export default function TaskDetail() {
   const [replacementVideo, setReplacementVideo] = useState<File | null>(null);
   const [retryingSource, setRetryingSource] = useState(false);
   const [repairingModel, setRepairingModel] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [artifactSearch, setArtifactSearch] = useState("");
+  const [selectedImage, setSelectedImage] = useState("");
+  const [qualityError, setQualityError] = useState("");
+  const requestVersion = useRef(0);
+  const routeTaskId = useRef(taskId);
+  routeTaskId.current = taskId;
 
   const fetchTask = useCallback(async () => {
-    if (!taskId) return;
+    if (!taskId || routeTaskId.current !== taskId) return;
+    const version = ++requestVersion.current;
     try {
       const [taskResult, qualityResult] = await Promise.allSettled([
         getTask(taskId),
         getTaskQuality(taskId),
       ]);
+      if (version !== requestVersion.current) return;
       if (taskResult.status === "rejected") throw taskResult.reason;
       const data = taskResult.value;
       const quality = qualityResult.status === "fulfilled" ? qualityResult.value : null;
       setTask(data);
       setRecovery(quality);
+      setQualityError(qualityResult.status === "rejected" ? "Quality report unavailable. 3D access stays locked until the report can be checked." : "");
       setActivePreview((current) => {
         const hasSpz = data.artifacts.some((artifact) => artifact.name.toLowerCase().endsWith(".spz"));
         const has3d = Boolean(preferredSplatArtifact(
           data.artifacts.filter((artifact) => artifact.type === "3dgs"),
         ));
-        const legacyWorldrecon = data.type === "worldrecon"
+        const legacyWorldrecon = qualityResult.status === "fulfilled"
+          && data.execution_mode !== "demo" && data.config.execution_mode !== "demo"
+          && data.execution_mode !== "real" && data.config.execution_mode !== "real"
+          && data.type === "worldrecon"
           && data.status === "completed"
           && (!quality?.contract_version || quality.contract_version < 4);
-        const mayShow3d = legacyWorldrecon || (
+        const mayShow3d = data.execution_mode !== "demo" && data.config.execution_mode !== "demo" && (legacyWorldrecon || (
           data.status === "completed"
           && quality?.free_view_eligible === true
           && (data.type === "worldrecon" || quality.delivery_tier === "strict_3d")
-        );
+        ));
         const hasVideo = data.artifacts.some((artifact) => artifact.type === "video");
         const hasPanorama = data.artifacts.some(
           (artifact) => artifact.type === "image" && artifact.name.includes("pano"),
@@ -133,17 +149,25 @@ export default function TaskDetail() {
           hasPanorama && "panorama",
           hasVideo && "video",
           mayShow3d && has3d && !hasSpz && "3dgs",
+          data.artifacts.some(a => a.type === "image" && !a.name.includes("pano")) && "images",
         ].filter(Boolean) as string[];
-        return available.includes(current) ? current : (available[0] ?? current);
+        return available.includes(current) ? current : (available[0] ?? "");
       });
       setError("");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load task");
+      if (version === requestVersion.current) setError(e instanceof Error ? e.message : "Failed to load task");
     }
   }, [taskId]);
 
   useEffect(() => {
-    fetchTask();
+    setTask(null);
+    setRecovery(null);
+    setActivePreview("");
+    setSelectedImage("");
+    setEditing(false); setSaving(false); setCancelling(false); setDeleting(false); setRetrying(false); setRetryingSource(false); setRepairingModel(false); setArtifactSearch(""); setError(""); setQualityError("");
+    setReplacementPanorama(null); setReplacementImages([]); setReplacementVideo(null);
+    void fetchTask();
+    return () => { requestVersion.current += 1; };
   }, [fetchTask]);
 
   // Auto-refresh while running
@@ -168,9 +192,9 @@ export default function TaskDetail() {
       await cancelTask(taskId);
       await fetchTask();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Cancel failed");
+      if (routeTaskId.current === taskId) setError(e instanceof Error ? e.message : "Cancel failed");
     } finally {
-      setCancelling(false);
+      if (routeTaskId.current === taskId) setCancelling(false);
     }
   };
 
@@ -184,13 +208,14 @@ export default function TaskDetail() {
     setSaving(true);
     try {
       const updated = await updateTask(taskId, { name: draftName.trim() });
+      if (routeTaskId.current !== taskId) return;
       setTask(updated);
       setEditing(false);
       setError("");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Update failed");
+      if (routeTaskId.current === taskId) setError(e instanceof Error ? e.message : "Update failed");
     } finally {
-      setSaving(false);
+      if (routeTaskId.current === taskId) setSaving(false);
     }
   };
 
@@ -200,10 +225,10 @@ export default function TaskDetail() {
     setDeleting(true);
     try {
       await deleteTask(taskId);
-      navigate("/");
+      if (routeTaskId.current === taskId) navigate("/");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Delete failed");
-      setDeleting(false);
+      if (routeTaskId.current === taskId) setError(e instanceof Error ? e.message : "Delete failed");
+      if (routeTaskId.current === taskId) setDeleting(false);
     }
   };
 
@@ -226,14 +251,15 @@ export default function TaskDetail() {
         replacementImages,
         replacementVideo ?? undefined,
       );
+      if (routeTaskId.current !== taskId) return;
       setReplacementPanorama(null);
       setReplacementImages([]);
       setReplacementVideo(null);
       await fetchTask();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Source retry failed");
+      if (routeTaskId.current === taskId) setError(e instanceof Error ? e.message : "Source retry failed");
     } finally {
-      setRetryingSource(false);
+      if (routeTaskId.current === taskId) setRetryingSource(false);
     }
   };
 
@@ -244,24 +270,33 @@ export default function TaskDetail() {
       await repairTaskModel(taskId);
       await fetchTask();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Model repair could not be queued");
+      if (routeTaskId.current === taskId) setError(e instanceof Error ? e.message : "Model repair could not be queued");
     } finally {
-      setRepairingModel(false);
+      if (routeTaskId.current === taskId) setRepairingModel(false);
     }
+  };
+
+  const handleRetry = async () => {
+    if (retrying) return;
+    setRetrying(true);
+    try { await retryTask(task.id); await fetchTask(); }
+    catch (cause) { if (routeTaskId.current === taskId) setError(cause instanceof Error ? cause.message : "Retry failed"); }
+    finally { if (routeTaskId.current === taskId) setRetrying(false); }
   };
 
   // Categorize artifacts
   const panoArtifacts = task.artifacts.filter((a) => a.type === "image" && a.name.includes("pano"));
   const videoArtifacts = task.artifacts.filter((a) => a.type === "video");
   const splatArtifacts = task.artifacts.filter((a) => a.type === "3dgs");
-  const legacyWorldrecon = task.type === "worldrecon"
+  const isDemo = task.execution_mode === "demo" || task.config.execution_mode === "demo";
+  const legacyWorldrecon = !qualityError && !isDemo && task.execution_mode !== "real" && task.config.execution_mode !== "real" && task.type === "worldrecon"
     && task.status === "completed"
     && (!recovery?.contract_version || recovery.contract_version < 4);
-  const mayShow3d = legacyWorldrecon || (
+  const mayShow3d = !isDemo && (legacyWorldrecon || (
     task.status === "completed"
     && recovery?.free_view_eligible === true
     && (task.type === "worldrecon" || recovery.delivery_tier === "strict_3d")
-  );
+  ));
   const previewSplat = mayShow3d ? preferredSplatArtifact(splatArtifacts) : undefined;
   const previewPanorama = preferredPanoramaArtifact(panoArtifacts);
   const positionMetadata = findArtifactByName(task.artifacts, "position_meta_info.json");
@@ -293,6 +328,7 @@ export default function TaskDetail() {
     "3dgs": "3D Model",
     video: "Video",
     panorama: "Panorama",
+    images: "Images",
   };
 
   return (
@@ -322,6 +358,7 @@ export default function TaskDetail() {
           <StatusBadge status={task.status} />
         </div>
         <div className="task-actions">
+          {(task.status === "failed" || task.status === "cancelled") && !canRetrySource && !canRepairModel && <button className="btn btn-primary" disabled={retrying} onClick={handleRetry}>{retrying ? "Queuing retry…" : "Retry task"}</button>}
           {!editing && <button className="btn" onClick={startEditing}>Edit task</button>}
           {canCancel ? (
             <button
@@ -339,14 +376,18 @@ export default function TaskDetail() {
         </div>
       </div>
 
-      {error && <div className="error-banner">{error}</div>}
-      {task.error && (
+      <div className="detail-facts"><div>Task ID<strong>{task.id}</strong></div><div>Pipeline<strong>{task.type === "worldrecon" ? "Multi-view reconstruction" : task.type === "worldgen" ? "Text / image to world" : "Panorama to world"}</strong></div><div>Created<strong>{new Date(task.created_at).toLocaleString()}</strong></div><div>Execution<strong>{isDemo ? "Demo simulation" : task.execution_mode === "real" ? "Real pipeline" : "Historical / unrecorded"}</strong></div></div>
+      {isDemo && <div className="runtime-notice"><Icon name="alert" /><div><strong>Demo task · no generated 3D model</strong><p>This task validates workflow behavior only. Simulated stages do not establish reconstruction or delivery quality.</p></div></div>}
+      {error && <div className="error-banner" role="alert">{error}</div>}
+      {qualityError && <div className="error-banner" role="alert">{qualityError} <button className="btn btn-sm" onClick={() => void fetchTask()}>Retry report</button></div>}
+      {(task.error || task.error_summary) && (
         <div className="error-banner task-error-summary">
           <p>{recovery?.user_message || task.error_summary || "The task could not be completed. Review the recommended action below."}</p>
-          <details>
+          {task.error && <details>
             <summary>Technical details</summary>
             <pre>{task.error}</pre>
-          </details>
+          </details>}
+          {task.error_code === "runtime_not_ready" && <Link className="btn btn-sm" to="/system">Check runtime prerequisites</Link>}
         </div>
       )}
 
@@ -354,11 +395,11 @@ export default function TaskDetail() {
         <div className="task-left-panel">
           <StageProgress stages={task.stages} currentStage={task.current_stage} />
 
-          {Boolean(task.config.quality_preset) && (
+          {task.type !== "worldrecon" && Boolean(task.config.quality_preset) && (
             <section className="quality-summary" aria-label="Generation configuration">
               <h3>Generation configuration</h3>
               <p><span className="quality-label">Preset</span> {String(task.config.quality_preset)}</p>
-              <p><span className="quality-label">Actual model</span> {String(task.config.worldstereo_model_type ?? "not recorded")}</p>
+              <p><span className="quality-label">Configured model</span> {String(task.config.worldstereo_model_type ?? "not recorded")}</p>
               {task.config.quality_preset === "high" ? (
                 <>
                   <p><span className="quality-label">Trajectory gate</span> first batch 8 regular trajectories; at least 6 alignment-approved, target 10</p>
@@ -427,9 +468,9 @@ export default function TaskDetail() {
               )}
               <p><span className="quality-label">Current action</span> {recoveryLabel(recovery.state)}</p>
               {recovery.contract_version && <p><span className="quality-label">Contract</span> v{recovery.contract_version} · {recovery.input_lane}</p>}
-              <p><span className="quality-label">Quality gate</span> {recovery.accepted_trajectories ?? 0} accepted · minimum {recovery.required_trajectories ?? 6} · target {recovery.target_trajectories ?? 10}</p>
+              {task.type !== "worldrecon" && <><p><span className="quality-label">Quality gate</span> {recovery.accepted_trajectories ?? 0} accepted · minimum {recovery.required_trajectories ?? 6} · target {recovery.target_trajectories ?? 10}</p>
               <p><span className="quality-label">WorldStereo budget</span> {recovery.global_budget?.worldstereo_trajectories_used ?? recovery.generated_video_trajectories ?? 0} of {recovery.limits?.maximum_video_trajectories ?? 24} WorldStereo trajectories</p>
-              <p><span className="quality-label">Task time budget</span> {Math.round((recovery.global_budget?.elapsed_seconds ?? recovery.video_seconds ?? 0) / 60)} of {Math.round((recovery.limits?.maximum_video_seconds ?? 14400) / 60)} minutes</p>
+              <p><span className="quality-label">Task time budget</span> {Math.round((recovery.global_budget?.elapsed_seconds ?? recovery.video_seconds ?? 0) / 60)} of {Math.round((recovery.limits?.maximum_video_seconds ?? 14400) / 60)} minutes</p></>}
               {recovery.source_pool && (
                 <>
                   <p><span className="quality-label">Source pool</span> {recovery.source_pool.accepted_candidate_count ?? recovery.source_pool.selected_ids?.length ?? 0} accepted · selected {recovery.source_pool.selected_candidate_id ?? recovery.source_pool.selected_ids?.[0] ?? "none"} · ranking {(recovery.source_pool.ranking ?? recovery.source_pool.selected_ids ?? []).join(" → ") || "pending"}</p>
@@ -483,7 +524,7 @@ export default function TaskDetail() {
                 <p><span className="quality-label">RGB-D anchors</span> {recovery.anchor_view_count} views</p>
               )}
               {recovery.artifact_validation && (
-                <p><span className="quality-label">3D validation</span> SPZ decoded · {String(recovery.artifact_validation.gaussian_count ?? "validated")} Gaussians</p>
+                <p><span className="quality-label">3D validation</span> Report available · {String(recovery.artifact_validation.gaussian_count ?? "unrecorded")} Gaussians</p>
               )}
               {recovery.navigation_validation && (
                 <p>
@@ -615,17 +656,20 @@ export default function TaskDetail() {
                 3D Model
               </button>
             )}
+            {imageArtifacts.length > 0 && <button className={`preview-tab ${activePreview === "images" ? "active" : ""}`} onClick={() => setActivePreview("images")}>Images</button>}
             {task.artifacts.length === 0 && (
               <span className="no-artifacts">No artifacts yet</span>
             )}
           </div>
 
+          {!previewLabels[activePreview] && <div className="preview-empty"><Icon name="cube" size={46} /><h3>{isDemo ? "Workflow preview only" : task.status === "failed" ? "Scene needs attention" : "Your scene will appear here"}</h3><p>{isDemo ? "Demo runs contain logs and simulation reports, not generated geometry." : task.status === "failed" ? "Review the stage logs and quality report to continue. Existing files remain available below." : "Previews become available as the pipeline produces artifacts. Free-view navigation requires a passed quality report."}</p></div>}
           {previewLabels[activePreview] && (
             <PreviewFrame label={previewLabels[activePreview]}>
               <div className="preview-content">
                 {activePreview === "panorama" && previewPanorama && (
-                  <PanoViewer url={getArtifactUrl(task.id, previewPanorama.path)} />
+                  <Suspense fallback={<div className="viewer-loading">Preparing panorama…</div>}><PanoViewer url={getArtifactUrl(task.id, previewPanorama.path)} /></Suspense>
                 )}
+                {activePreview === "images" && imageArtifacts.length > 0 && <div className="image-preview"><img alt={(imageArtifacts.find(a => a.path === selectedImage) ?? imageArtifacts[0]).name} src={getArtifactUrl(task.id, (imageArtifacts.find(a => a.path === selectedImage) ?? imageArtifacts[0]).path)} /><select aria-label="Preview image" value={selectedImage || imageArtifacts[0].path} onChange={event => setSelectedImage(event.target.value)}>{imageArtifacts.map(artifact => <option key={artifact.path} value={artifact.path}>{artifact.path}</option>)}</select></div>}
                 {activePreview === "video" && videoArtifacts.length > 0 && (
                   <video
                     controls
@@ -651,7 +695,7 @@ export default function TaskDetail() {
 
           {task.artifacts.length > 0 && (
             <div className="artifacts-list">
-              <h3>Artifacts</h3>
+              <div className="artifact-tools"><h3>Artifacts <span className="muted">({task.artifacts.length})</span></h3><input className="form-input" aria-label="Search artifacts" placeholder="Find a file…" value={artifactSearch} onChange={event => setArtifactSearch(event.target.value)} /><a className="btn btn-sm" href={`/api/tasks/${encodeURIComponent(task.id)}/delivery-manifest`} download>Delivery manifest</a></div>
               <table className="artifacts-table">
                 <thead>
                   <tr>
@@ -662,11 +706,11 @@ export default function TaskDetail() {
                   </tr>
                 </thead>
                 <tbody>
-                  {task.artifacts.map((a: Artifact) => (
+                  {task.artifacts.filter(a => `${a.name} ${a.path} ${a.type}`.toLowerCase().includes(artifactSearch.toLowerCase())).map((a: Artifact) => (
                     <tr key={a.path}>
-                      <td>{a.name}</td>
+                      <td title={a.path}>{a.name}</td>
                       <td>{a.type}</td>
-                      <td>{(a.size / 1024 / 1024).toFixed(1)} MB</td>
+                      <td>{formatFileSize(a.size)}</td>
                       <td>
                         <a
                           href={getArtifactUrl(task.id, a.path)}
@@ -680,6 +724,7 @@ export default function TaskDetail() {
                   ))}
                 </tbody>
               </table>
+              {artifactSearch && !task.artifacts.some(a => `${a.name} ${a.path} ${a.type}`.toLowerCase().includes(artifactSearch.toLowerCase())) && <p className="form-help">No files match this search.</p>}
             </div>
           )}
         </div>
