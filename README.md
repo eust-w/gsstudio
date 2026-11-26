@@ -558,7 +558,7 @@ git diff --check
 
 `Direct IP` 的地址和端口不写在清单里：`deploy/k8s/service-public-ip.yaml.tmpl` 由 `deploy/scripts/render-public-service.sh` 按 `GSSTUDIO_PUBLIC_IP` / `GSSTUDIO_PUBLIC_PORT`（默认 80）渲染，`deploy/scripts/deploy.sh` 检测到 `GSSTUDIO_PUBLIC_IP` 时会自动应用。
 
-用户名为 `<configured-user>`。密码仅保存在 macOS Keychain 的 `gsstudio-poc-basic-auth` service，以及集群的 `gsstudio-basic-auth` Secret 中，不进入仓库。请不要在不可信网络上使用明文 HTTP 入口。
+用户名为 `<configured-user>`（与公开版一致，实际值在 Keychain / Secret 中）。密码仅保存在 macOS Keychain 的 `gsstudio-poc-basic-auth` service，以及集群的 `gsstudio-basic-auth` Secret 中，不进入仓库。请不要在不可信网络上使用明文 HTTP 入口。
 
 ---
 
