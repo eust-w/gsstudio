@@ -20,7 +20,7 @@ spec:
         variant: gpu
     spec:
       nodeSelector:
-        kubernetes.io/hostname: "<gpu-node-ip>"
+        kubernetes.io/hostname: "<gpu-node-ip>"  # replace with the GPU node of your cluster
       containers:
         - name: gsstudio
           image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v50

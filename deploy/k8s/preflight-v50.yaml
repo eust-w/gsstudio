@@ -4,7 +4,7 @@ metadata:
   name: gsstudio-v50-preflight
   namespace: gsstudio
 spec:
-  nodeName: <gpu-node-ip>
+  nodeName: <gpu-node-ip>  # replace with the GPU node of your cluster
   enableServiceLinks: false
   restartPolicy: Never
   imagePullSecrets:

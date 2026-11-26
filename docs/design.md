@@ -161,7 +161,7 @@ The following are historical acceptance facts, not current health claims. See
 
 - Image: `ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v50`
 - Digest: `sha256:31781e16e3b5f73f2badef91db24267f1d56a2b9d92ecfa37e58f718440308ef`
-- Deployment: `gsstudio` namespace, five A800 GPUs on node <gpu-node-ip>;
+- Deployment: `gsstudio` namespace, five A800 GPUs on node `<gpu-node-ip>`;
   startup GPU/model preflight passed during acceptance.
 - Recorded public IP URL: http://<poc-public-ip> (CCE load balancer + Basic Auth)
 - Recorded TLS URL: https://<poc-tunnel>.trycloudflare.com

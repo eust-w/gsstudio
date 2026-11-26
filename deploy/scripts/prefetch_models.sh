@@ -22,7 +22,7 @@ spec:
   backoffLimit: 2
   template:
     spec:
-      nodeName: <gpu-node-ip>
+      nodeName: <gpu-node-ip>  # replace with the GPU node of your cluster
       containers:
         - name: prefetch
           image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v43
