@@ -24,7 +24,7 @@ spec:
         gsstudio.io/release-digest: sha256:9d769dc511ab860ccebdaa517c5948a4546529b7ffcc8deadc21ece555635c9c
     spec:
       nodeSelector:
-        kubernetes.io/hostname: "<gpu-node-ip>"
+        kubernetes.io/hostname: "<gpu-node-ip>"  # replace with the GPU node of your cluster
       containers:
         - name: gsstudio
           image: ccr-29eug8s3-pub.cnc.bj.baidubce.com/dataflow-poc/gsstudio:a800-v72
