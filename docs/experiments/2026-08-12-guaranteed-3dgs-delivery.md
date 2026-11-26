@@ -70,4 +70,4 @@ cache `.pt` files cannot satisfy this gate.
 - The only browser console error was the unrelated missing `favicon.ico`; no
   application or WebGL error was introduced.
 
-Public task: <http://<poc-public-ip>/tasks/3dc27ec897d9>
+Public task: `http://<poc-public-ip>/tasks/3dc27ec897d9`

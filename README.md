@@ -59,9 +59,8 @@ the pinned deployment.
 
 ### Public POC
 
-The public-IP endpoint recorded during the August acceptance was:
-
-    http://<poc-public-ip>
+The public-IP endpoint used during the August acceptance is not published
+(the repository is public); set your own elastic IP in the Service manifest.
 
 The direct-IP deployment uses a CCE load balancer and HTTP Basic Auth over plain
 HTTP. Its recorded Cloudflare TLS endpoint was:

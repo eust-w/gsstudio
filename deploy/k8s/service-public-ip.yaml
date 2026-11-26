@@ -27,6 +27,7 @@ metadata:
       }
 spec:
   type: LoadBalancer
+  # Set to your own elastic IP before applying; the live POC value is not published.
   loadBalancerIP: <poc-public-ip>
   externalTrafficPolicy: Local
   selector:
