@@ -220,7 +220,7 @@ def _write_pruned_checkpoints(
     matched_keys: set[bytes] = set()
     removed_total = 0
     for checkpoint in checkpoints:
-        value = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        value = torch.load(checkpoint, map_location="cpu", weights_only=True)
         splats = value.get("splats") if isinstance(value, dict) else None
         if not isinstance(splats, dict) or not all(name in splats for name in ("means", "scales", "opacities")):
             raise GaussianRepairError(f"repair_checkpoint_invalid: {checkpoint.name}")
