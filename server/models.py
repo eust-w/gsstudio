@@ -70,6 +70,7 @@ class TaskResponse(BaseModel):
     progress: float = 0.0
     created_at: datetime
     updated_at: datetime
+    execution_mode: str = "unknown"
 
 
 class TaskDetail(TaskResponse):
@@ -89,7 +90,7 @@ class GPUInfo(BaseModel):
     name: str = "Unknown"
     used_by: Optional[str] = None
     vram_used_gb: float = 0.0
-    vram_total_gb: float = 80.0
+    vram_total_gb: float = 0.0
 
 
 class GPUStatus(BaseModel):

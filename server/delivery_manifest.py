@@ -75,6 +75,8 @@ def build_delivery_manifest(
 ) -> dict[str, Any]:
     """Build a deterministic manifest suitable for cross-system import."""
     quality = auto_recovery_summary(task_dir)
+    execution_mode = (task.get("config") or {}).get("execution_mode", "unknown")
+    is_demo = execution_mode == "demo"
     entries: list[dict[str, Any]] = []
     seen: set[str] = set()
     for artifact in artifacts if artifacts is not None else task.get("artifacts", []):
@@ -107,12 +109,14 @@ def build_delivery_manifest(
         "task_name": task.get("name"),
         "task_type": task.get("type"),
         "status": task.get("status"),
+        "execution_mode": execution_mode,
+        "verified": not is_demo and task.get("status") == "completed" and quality.get("free_view_eligible") is True,
         "updated_at": task.get("updated_at"),
         "success_policy": contract.get("success_policy", "strict_free_view"),
-        "delivery_tier": quality.get("delivery_tier"),
+        "delivery_tier": "demo" if is_demo else quality.get("delivery_tier"),
         "input_lane": quality.get("input_lane") or contract.get("input_lane"),
-        "product_state": quality.get("product_state"),
-        "free_view_eligible": quality.get("free_view_eligible") is True,
+        "product_state": "demo" if is_demo else quality.get("product_state"),
+        "free_view_eligible": not is_demo and quality.get("free_view_eligible") is True,
         "error_code": task.get("error_code"),
         "error_summary": task.get("error_summary"),
         "quality_path": f"/api/tasks/{task['id']}/quality",

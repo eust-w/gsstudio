@@ -4,6 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .environment import pipeline_commands
+
 
 def get_worldrecon_commands(
     task_dir: Path,
@@ -13,8 +15,10 @@ def get_worldrecon_commands(
 ) -> "list[tuple[str, list[str], dict[str, str], Path]]":
     """Build command list for WorldMirror-2 reconstruction.
 
-    Returns list with single (stage_name, cmd, env_overrides, cwd).
+    Returns preflight, reconstruction and delivery-validation stage commands.
     """
+    task_dir, input_dir = task_dir.resolve(), input_dir.resolve()
+    hyworld_repo = hyworld_repo.expanduser().resolve()
     output_dir = task_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -47,7 +51,6 @@ def get_worldrecon_commands(
     env = {
         "CUDA_VISIBLE_DEVICES": gpu_ids,
         "HF_HOME": config.get("hf_home", "/models/hf-cache"),
-        "PYTHONPATH": "/opt/hyworld2",
     }
 
     preflight = [
@@ -66,13 +69,13 @@ def get_worldrecon_commands(
         "--task-dir", str(task_dir),
         "--task-type", "worldrecon",
     ]
-    return [
+    return pipeline_commands([
         ("input_preflight", preflight, {"CUDA_VISIBLE_DEVICES": "0"}, hyworld_repo),
         ("worldrecon", cmd, env, hyworld_repo),
         (
             "navigation_stress",
             stress,
-            {"CUDA_VISIBLE_DEVICES": "0", "PYTHONPATH": "/app:/opt/hyworld2"},
+            {"CUDA_VISIBLE_DEVICES": "0"},
             hyworld_repo,
         ),
-    ]
+    ], hyworld_repo, config)

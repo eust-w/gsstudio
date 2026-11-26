@@ -13,6 +13,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from fastapi import HTTPException
+
 from ..config import Config
 from ..db import get_task, list_tasks, set_task_stages, update_stage, update_task
 from ..delivery_manifest import write_delivery_manifest
@@ -278,6 +280,7 @@ class PipelineWorker:
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._current_task_id: Optional[str] = None
         self._vllm_stopped = False
+        self._last_vllm_admission_recovery = float("-inf")
 
     # ------------------------------------------------------------------
     # vLLM lifecycle management (via supervisord)
@@ -423,6 +426,8 @@ class PipelineWorker:
                 break
 
         for task in completed:
+            if (task.get("config") or {}).get("execution_mode") == "demo":
+                continue
             task_type = str(task.get("type") or "")
             if task_type not in {"worldgen", "worldgen_from_pano"}:
                 continue
@@ -559,12 +564,18 @@ class PipelineWorker:
 
         while self._running:
             try:
-                tasks, _ = list_tasks(self.config.DB_PATH, status="pending", limit=1)
-                if tasks:
-                    task = tasks[0]
+                tasks, _ = list_tasks(self.config.DB_PATH, status="pending", limit=100)
+                executed = False
+                for task in tasks:
+                    if not self._running:
+                        break
+                    if not await self._task_runtime_ready(task):
+                        continue
                     await self.execute_task(task["id"])
-                else:
-                    await asyncio.sleep(2)
+                    executed = True
+                    break
+                if not executed:
+                    await asyncio.sleep(15 if tasks else 2)
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -572,6 +583,57 @@ class PipelineWorker:
                 await asyncio.sleep(5)
 
         logger.info("Pipeline worker stopped")
+
+    async def _task_runtime_ready(self, task: dict) -> bool:
+        """Keep unavailable queued work pending; never spend GPU stages proving missing dependencies."""
+        from ..runtime import clear_runtime_cache, require_repair_capability, require_task_capability
+
+        async def admit():
+            task_dir = self.config.task_dir(task["id"])
+            repair_only = (task_dir / "gaussian_repair_request.json").is_file() and all(
+                (task_dir / f".stage_{name}_done").is_file()
+                for name in get_stage_names(task["type"]) if name != "navigation_stress"
+            )
+            if repair_only:
+                await asyncio.to_thread(require_repair_capability, self.config)
+            else:
+                await asyncio.to_thread(require_task_capability, self.config, task["type"], task.get("config"))
+
+        try:
+            await admit()
+        except HTTPException as exc:
+            if exc.status_code != 503:
+                raise
+            detail = exc.detail
+            blockers = detail.get("blockers", []) if isinstance(detail, dict) else []
+            codes = {item.get("code") for item in blockers if isinstance(item, dict)}
+            if self.config.MANAGE_VLLM and codes == {"vlm_service"} and time.monotonic() - self._last_vllm_admission_recovery >= 60:
+                try:
+                    _, status = await self._supervisorctl("status", "vllm")
+                    fields = status.split()
+                    state = fields[1].upper() if len(fields) > 1 and fields[0] == "vllm" else ""
+                    if state not in {"STOPPED", "EXITED", "FATAL", "RUNNING", "STARTING", "BACKOFF"}:
+                        raise RuntimeError("Cannot determine the managed vLLM supervisor state")
+                    if state in {"STOPPED", "EXITED", "FATAL"}:
+                        self._vllm_stopped = True
+                    await self._start_vllm()
+                    clear_runtime_cache()
+                    await admit()
+                    return True
+                except HTTPException as recheck:
+                    if recheck.status_code != 503:
+                        raise
+                    detail = recheck.detail
+                except RuntimeError as error:
+                    logger.warning("Managed VLM recovery left task %s queued: %s", task["id"], error)
+                finally:
+                    self._last_vllm_admission_recovery = time.monotonic()
+            message = str(detail.get("message") or "Execution runtime is not ready") if isinstance(detail, dict) else str(detail)
+            if task.get("error_summary") != message or task.get("error_code") != "runtime_not_ready":
+                update_task(self.config.DB_PATH, task["id"], error_code="runtime_not_ready", error_summary=message)
+                logger.warning("Task %s remains queued: %s", task["id"], message)
+            return False
+        return True
 
     async def stop(self):
         self._running = False
@@ -933,11 +995,27 @@ class PipelineWorker:
             self._cancel_events[task_id].set()
         update_task(self.config.DB_PATH, task_id, status=TaskStatus.CANCELLED.value)
 
+    def is_task_active(self, task_id: str) -> bool:
+        """A cancelled database row may still own a terminating subprocess."""
+        return task_id in self._cancel_events
+
     async def execute_task(self, task_id: str):
         """Execute a single task through its pipeline stages."""
         task = get_task(self.config.DB_PATH, task_id)
         if not task:
             logger.error("Task %s not found", task_id)
+            return
+        if task["status"] not in {TaskStatus.PENDING.value, TaskStatus.RUNNING.value}:
+            return
+        execution_mode = "demo" if self.config.MOCK_PIPELINE else "real"
+        previous_mode = (task.get("config") or {}).get("execution_mode")
+        if previous_mode and previous_mode != execution_mode:
+            update_task(
+                self.config.DB_PATH, task_id, status=TaskStatus.FAILED.value,
+                error="Task execution mode differs from the current server; create a new task",
+                error_code="execution_mode_mismatch",
+                error_summary="Demo and real execution checkpoints cannot be interchanged.",
+            )
             return
 
         self._current_task_id = task_id
@@ -960,6 +1038,7 @@ class PipelineWorker:
 
         task_type = task["type"]
         task_config = task.get("config", {})
+        task_config["execution_mode"] = execution_mode
         task_config.setdefault("hf_home", self.config.HF_HOME)
         task_config.setdefault("num_gpus", self.config.NUM_GPUS)
         task_config.setdefault("panogen_python", self.config.PANOGEN_PYTHON)
@@ -975,6 +1054,7 @@ class PipelineWorker:
             )
             task_config.setdefault("seed", 1024)
         task_config = normalize_task_contract(task_config, task_type)
+        update_task(self.config.DB_PATH, task_id, config=task_config)
         task_config.setdefault("vllm_host", self.config.VLLM_HOST)
         task_config.setdefault("vllm_port", self.config.VLLM_PORT)
         task_config.setdefault("vllm_model", self.config.VLLM_MODEL)
@@ -983,16 +1063,23 @@ class PipelineWorker:
         # Adopt that persisted source into v4 without generating four new
         # images mid-task; the following input_preflight stage still evaluates
         # the exact existing source before any further GPU stage proceeds.
-        if task_type == "worldgen" and (task_dir / ".stage_panogen_done").is_file():
+        if not self.config.MOCK_PIPELINE and task_type == "worldgen" and (task_dir / ".stage_panogen_done").is_file():
             (task_dir / ".stage_source_generate_done").touch()
 
         stage_names = get_stage_names(task_type)
         set_task_stages(self.config.DB_PATH, task_id, stage_names)
-        update_task(self.config.DB_PATH, task_id, status=TaskStatus.RUNNING.value)
+        update_task(self.config.DB_PATH, task_id, status=TaskStatus.RUNNING.value, error=None, error_code=None, error_summary=None)
 
         logger.info("Executing task %s (%s): %d stages", task_id, task_type, len(stage_names))
 
         try:
+            write_json_atomic(task_dir / "execution_report.json", {
+                "version": 1,
+                "execution_mode": execution_mode,
+                "simulated": self.config.MOCK_PIPELINE,
+                "model_inference_executed": False if self.config.MOCK_PIPELINE else None,
+                "message": "Demonstration only; no models are loaded and no 3D result is produced." if self.config.MOCK_PIPELINE else "Real pipeline execution; delivery remains subject to quality validation.",
+            })
             if self.config.MOCK_PIPELINE:
                 await self._execute_mock(task_id, stage_names, cancel_event, task_dir, logs_dir)
             else:
@@ -1010,17 +1097,24 @@ class PipelineWorker:
                 self.config.DB_PATH, task_id,
                 status=TaskStatus.COMPLETED.value,
                 progress=1.0,
+                current_stage=None,
+                error=None,
+                error_code=None,
+                error_summary=None,
                 artifacts=artifacts,
             )
             completed_task = get_task(self.config.DB_PATH, task_id)
             if completed_task is None:
                 raise RuntimeError("Completed task disappeared before delivery manifest creation")
-            write_delivery_manifest(task_dir, completed_task, artifacts)
+            await asyncio.to_thread(write_delivery_manifest, task_dir, completed_task, artifacts)
             artifacts = self._collect_artifacts(output_dir, scene_dir, task_dir)
             update_task(self.config.DB_PATH, task_id, artifacts=artifacts)
             logger.info("Task %s completed", task_id)
 
         except Exception as e:
+            if cancel_event.is_set():
+                update_task(self.config.DB_PATH, task_id, status=TaskStatus.CANCELLED.value)
+                return
             logger.exception("Task %s failed", task_id)
             # Surface structured quality evidence even for a deliberately
             # rejected task, so the user can diagnose why it did not proceed.
@@ -1082,7 +1176,7 @@ class PipelineWorker:
             try:
                 failed_task = get_task(self.config.DB_PATH, task_id)
                 if failed_task is not None:
-                    write_delivery_manifest(task_dir, failed_task, artifacts)
+                    await asyncio.to_thread(write_delivery_manifest, task_dir, failed_task, artifacts)
                     artifacts = self._collect_artifacts(output_dir, scene_dir, task_dir)
                     update_task(self.config.DB_PATH, task_id, artifacts=artifacts)
             except Exception:
@@ -1988,26 +2082,23 @@ class PipelineWorker:
         return True, ""
 
     async def _execute_mock(self, task_id, stage_names, cancel_event, task_dir, logs_dir):
-        """Mock pipeline for local development."""
-        for stage_name in stage_names:
+        """Exercise UI lifecycle without creating real-pipeline checkpoints or artifacts."""
+        for index, stage_name in enumerate(stage_names):
             if cancel_event.is_set():
                 return
 
-            marker = task_dir / f".stage_{stage_name}_done"
+            marker = task_dir / f".demo_stage_{stage_name}_done"
             if marker.exists():
                 update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.SKIPPED)
                 continue
 
             log_file = task_dir / "logs" / f"{stage_name}.log"
             update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.RUNNING)
+            update_task(self.config.DB_PATH, task_id, current_stage=stage_name, progress=index / len(stage_names))
 
             fake_logs = [
-                f"[{stage_name}] Starting...",
-                f"[{stage_name}] Loading models...",
-                f"[{stage_name}] Progress: 25%",
-                f"[{stage_name}] Progress: 50%",
-                f"[{stage_name}] Progress: 75%",
-                f"[{stage_name}] Done.",
+                f"[DEMO] {stage_name}: simulating the interface lifecycle only.",
+                "[DEMO] No model inference, quality validation, or 3D export is performed.",
             ]
 
             with open(log_file, "w") as f:
@@ -2016,15 +2107,10 @@ class PipelineWorker:
                         return
                     f.write(line + "\n")
                     f.flush()
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.25)
 
             marker.touch()
-            update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.COMPLETED)
-
-        output_dir = task_dir / "output"
-        output_dir.mkdir(exist_ok=True)
-        (output_dir / "result.ply").write_bytes(b"ply\nmock gaussian splatting data")
-        (output_dir / "result.spz").write_bytes(b"mock spz data")
+            update_stage(self.config.DB_PATH, task_id, stage_name, StageStatus.SKIPPED)
 
     def _collect_artifacts(self, output_dir: Path, scene_dir: Path, task_dir: Path | None = None) -> list[dict]:
         """Scan output and scene directories for artifacts."""
@@ -2040,7 +2126,12 @@ class PipelineWorker:
                     continue
                 ext = f.suffix.lower()
                 if ext in ARTIFACT_TYPES:
-                    rel_path = str(f.relative_to(search_dir.parent))
+                    root = task_dir if task_dir is not None else search_dir.parent
+                    try:
+                        f.resolve().relative_to(root.resolve())
+                    except ValueError:
+                        continue
+                    rel_path = str(f.relative_to(root))
                     artifacts.append({
                         "name": f.name,
                         "path": rel_path,
@@ -2076,6 +2167,7 @@ class PipelineWorker:
                 "safe_training_retry.json",
                 "strict_free_view_migration.json",
                 "delivery_manifest.json",
+                "execution_report.json",
             ):
                 report = task_dir / name
                 if report.is_file():

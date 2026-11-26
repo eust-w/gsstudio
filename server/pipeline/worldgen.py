@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .quality import normalize_worldgen_config
+from .environment import pipeline_commands
 
 
 WORLDGEN_STAGES = [
@@ -56,6 +57,8 @@ def get_worldgen_commands(
     Returns list of (stage_name, cmd, env_overrides, cwd).
     """
     config = normalize_worldgen_config(config, form_prompt=None)
+    task_dir, scene_dir, input_dir = task_dir.resolve(), scene_dir.resolve(), input_dir.resolve()
+    hyworld_repo = hyworld_repo.expanduser().resolve()
     worldgen_dir = hyworld_repo / "hyworld2" / "worldgen"
     panogen_dir = hyworld_repo / "hyworld2" / "panogen"
     quality_preset = config["quality_preset"]
@@ -309,8 +312,7 @@ def get_worldgen_commands(
     ]
     commands.append(("navigation_stress", stress_cmd, {
         "CUDA_VISIBLE_DEVICES": "0",
-        "PYTHONPATH": "/app:/opt/hyworld2",
         "TORCH_HOME": config.get("torch_home", "/models/torch-cache"),
     }, hyworld_repo))
 
-    return commands
+    return pipeline_commands(commands, hyworld_repo, config)

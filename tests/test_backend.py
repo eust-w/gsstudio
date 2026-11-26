@@ -13,13 +13,6 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-# Set mock mode before importing server modules
-os.environ["GSSTUDIO_MOCK_PIPELINE"] = "true"
-os.environ["GSSTUDIO_DATA_DIR"] = tempfile.mkdtemp()
-os.environ["GSSTUDIO_BASIC_AUTH_USER"] = "poc-user"
-os.environ["GSSTUDIO_BASIC_AUTH_PASSWORD"] = "poc-password"
-os.environ["GSSTUDIO_SERVICE_TOKEN"] = "workflow-service-token"
-
 from server.config import Config
 from server.db import (
     IdempotencyConflictError,
@@ -51,6 +44,10 @@ def png_bytes(color=(120, 80, 40), *, size=(8, 6)) -> bytes:
     return buffer.getvalue()
 
 
+def reconstruction_uploads():
+    return [("images", (f"frame-{index:02d}.png", png_bytes((index, 80, 40)), "image/png")) for index in range(12)]
+
+
 def test_recovery_source_promotion_updates_uploaded_image_and_report(tmp_path):
     attempt_dir = tmp_path / "recovery_attempts" / "attempt-007"
     attempt_input = attempt_dir / "input"
@@ -77,7 +74,15 @@ def test_recovery_source_promotion_updates_uploaded_image_and_report(tmp_path):
 
 
 @pytest.fixture
-def cfg():
+def cfg(tmp_path, monkeypatch):
+    # Set explicit test paths even when another test imported Config before
+    # this module; tests must never enqueue work in the developer database.
+    monkeypatch.setattr(Config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(Config, "DB_PATH", tmp_path / "gsstudio.db")
+    monkeypatch.setattr(Config, "MOCK_PIPELINE", True)
+    monkeypatch.setattr(Config, "BASIC_AUTH_USER", "poc-user")
+    monkeypatch.setattr(Config, "BASIC_AUTH_PASSWORD", "poc-password")
+    monkeypatch.setattr(Config, "SERVICE_TOKEN", "workflow-service-token")
     c = Config()
     c.MANAGE_VLLM = False
     c.DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1477,10 +1482,15 @@ class TestDeploymentContract:
 
 class TestAPI:
     @pytest.fixture
-    def client(self, cfg):
+    def client(self, cfg, monkeypatch):
         from fastapi.testclient import TestClient
         from server.main import app, worker as app_worker
         app_worker.config.MANAGE_VLLM = False
+        # Route contract tests control database transitions themselves. Worker
+        # execution/cancellation has dedicated tests and must not race these.
+        async def idle_worker():
+            await asyncio.Event().wait()
+        monkeypatch.setattr(app_worker, "start", idle_worker)
         token = base64.b64encode(b"poc-user:poc-password").decode()
         with TestClient(app, headers={"Authorization": f"Basic {token}"}) as c:
             yield c
@@ -1539,7 +1549,7 @@ class TestAPI:
             "type": "worldrecon",
             "name": "test-api-task",
             "config": "{}",
-        })
+        }, files=reconstruction_uploads())
         assert resp.status_code == 201
         task_id = resp.json()["task_id"]
 
@@ -1551,8 +1561,8 @@ class TestAPI:
         headers = {"Idempotency-Key": "droboticflow:run-api:node-gsstudio"}
         payload = {"type": "worldrecon", "name": "idempotent-api", "config": "{}"}
 
-        first = client.post("/api/tasks", data=payload, headers=headers)
-        second = client.post("/api/tasks", data=payload, headers=headers)
+        first = client.post("/api/tasks", data=payload, files=reconstruction_uploads(), headers=headers)
+        second = client.post("/api/tasks", data=payload, files=reconstruction_uploads(), headers=headers)
 
         assert first.status_code == 201
         assert second.status_code == 200
@@ -1564,12 +1574,12 @@ class TestAPI:
         headers = {"Idempotency-Key": "droboticflow:run-api:node-conflict"}
         first = client.post(
             "/api/tasks",
-            data={"type": "worldrecon", "name": "first", "config": "{}"},
+            data={"type": "worldrecon", "name": "first", "config": "{}"}, files=reconstruction_uploads(),
             headers=headers,
         )
         second = client.post(
             "/api/tasks",
-            data={"type": "worldrecon", "name": "different", "config": "{}"},
+            data={"type": "worldrecon", "name": "different", "config": "{}"}, files=reconstruction_uploads(),
             headers=headers,
         )
 
@@ -1584,7 +1594,7 @@ class TestAPI:
                 "type": "worldrecon",
                 "name": "unsafe-runtime",
                 "config": json.dumps({"vllm_host": "attacker.example", "hf_home": "/tmp/other"}),
-            },
+            }, files=reconstruction_uploads(),
         )
 
         assert response.status_code == 400
@@ -1600,7 +1610,7 @@ class TestAPI:
                 "type": "worldrecon",
                 "name": "bounded-recon",
                 "config": json.dumps({"recon_gpus": recon_gpus}),
-            },
+            }, files=reconstruction_uploads(),
         )
 
         assert response.status_code == 400
@@ -1783,7 +1793,7 @@ class TestAPI:
             "type": "worldrecon",
             "name": "quality-status",
             "config": "{}",
-        }).json()["task_id"]
+        }, files=reconstruction_uploads()).json()["task_id"]
         task_dir = Config().task_dir(task_id)
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / "auto_recovery.json").write_text(json.dumps({
@@ -2217,6 +2227,8 @@ class TestAPI:
         self, client, monkeypatch, task_type, upload_field
     ):
         monkeypatch.delenv("HF_TOKEN", raising=False)
+        from server.routes import tasks as task_routes
+        monkeypatch.setattr(task_routes._config, "MOCK_PIPELINE", False)
 
         resp = client.post(
             "/api/tasks",
@@ -2273,7 +2285,7 @@ class TestAPI:
             "type": "worldrecon",
             "name": "cancel-test",
             "config": "{}",
-        })
+        }, files=reconstruction_uploads())
         task_id = resp.json()["task_id"]
 
         resp = client.post(f"/api/tasks/{task_id}/cancel")
@@ -2285,7 +2297,7 @@ class TestAPI:
             "type": "worldrecon",
             "name": "cancel-completed",
             "config": "{}",
-        })
+        }, files=reconstruction_uploads())
         task_id = resp.json()["task_id"]
 
         # Directly set task to completed in DB instead of waiting for pipeline
@@ -2303,7 +2315,7 @@ class TestAPI:
             "type": "worldrecon",
             "name": "before-edit",
             "config": "{}",
-        })
+        }, files=reconstruction_uploads())
         task_id = resp.json()["task_id"]
 
         resp = client.patch(f"/api/tasks/{task_id}", json={"name": "after-edit"})
@@ -2317,7 +2329,7 @@ class TestAPI:
             "type": "worldrecon",
             "name": "keep-me",
             "config": "{}",
-        }).json()["task_id"]
+        }, files=reconstruction_uploads()).json()["task_id"]
 
         resp = client.patch(f"/api/tasks/{task_id}", json={"name": "   "})
 
@@ -2333,7 +2345,7 @@ class TestAPI:
             "type": "worldrecon",
             "name": "delete-me",
             "config": "{}",
-        }).json()["task_id"]
+        }, files=reconstruction_uploads()).json()["task_id"]
         task_dir = cfg.task_dir(task_id)
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / "artifact.txt").write_text("generated")
@@ -2354,7 +2366,7 @@ class TestAPI:
             "type": "worldrecon",
             "name": "active-task",
             "config": "{}",
-        }).json()["task_id"]
+        }, files=reconstruction_uploads()).json()["task_id"]
         update_task(cfg.DB_PATH, task_id, status=TaskStatus.RUNNING.value)
 
         resp = client.delete(f"/api/tasks/{task_id}")
@@ -2374,7 +2386,7 @@ class TestAPI:
             "type": "worldrecon",
             "name": "retry-me",
             "config": "{}",
-        }).json()["task_id"]
+        }, files=reconstruction_uploads()).json()["task_id"]
         checkpoint = cfg.task_dir(task_id) / ".stage_traj_render_done"
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         checkpoint.touch()
@@ -2410,7 +2422,7 @@ class TestAPI:
             "type": "worldrecon",
             "name": "do-not-retry",
             "config": "{}",
-        }).json()["task_id"]
+        }, files=reconstruction_uploads()).json()["task_id"]
         update_task(cfg.DB_PATH, task_id, status=blocked_status.value)
 
         resp = client.post(f"/api/tasks/{task_id}/retry")

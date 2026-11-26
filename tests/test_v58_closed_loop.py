@@ -567,6 +567,6 @@ def test_worldgen_command_graph_has_independent_pilot_and_navigation(tmp_path):
     assert by_stage["gs_training"][by_stage["gs_training"].index("--max_steps") + 1] == "2000"
     assert by_stage["gs_training"][by_stage["gs_training"].index("--test-every") + 1] == "16"
     assert by_stage["navigation_stress"][:3] == [
-        "python", "-m", "server.pipeline.gaussian_repair",
+        sys.executable, "-m", "server.pipeline.gaussian_repair",
     ]
-    assert env_by_stage["navigation_stress"]["PYTHONPATH"].startswith("/app")
+    assert env_by_stage["navigation_stress"]["PYTHONPATH"].startswith(str(Path(__file__).resolve().parents[1]))

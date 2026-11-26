@@ -167,6 +167,7 @@ def list_tasks(
     task_type: Optional[str] = None,
     limit: int = 20,
     offset: int = 0,
+    search: Optional[str] = None,
 ) -> Tuple[list, int]:
     with _get_conn(db_path) as conn:
         where_parts = []
@@ -177,6 +178,12 @@ def list_tasks(
         if task_type:
             where_parts.append("type = ?")
             params.append(task_type)
+
+        if search:
+            # Treat user search as literal text rather than SQL LIKE patterns.
+            escaped = search.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+            where_parts.append("(name LIKE ? ESCAPE '!' OR id LIKE ? ESCAPE '!')")
+            params.extend([f"%{escaped}%", f"%{escaped}%"])
 
         where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 

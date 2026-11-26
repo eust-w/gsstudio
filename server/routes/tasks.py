@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -22,6 +23,7 @@ from ..db import (
     create_task_idempotent,
     delete_task,
     get_task,
+    get_task_by_idempotency_key,
     list_tasks,
     new_task_id,
     update_task,
@@ -48,12 +50,15 @@ from ..pipeline.recovery import (
     initialize_pretrajectory_source_retry,
     request_source_retry,
 )
-from ..pipeline.stage_runner import stream_log
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["tasks"])
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
+MAX_IMAGE_COUNT = 48
+MAX_TASK_NAME_CHARS = 120
 MAX_PROMPT_CHARS = 2000
 MAX_IDEMPOTENCY_KEY_CHARS = 200
 GENERATIVE_MINIMUM_SHORT_EDGE = 512
@@ -101,13 +106,14 @@ def normalize_uploaded_generation_image(source: Path, destination: Path) -> dict
     below the 512-pixel transport contract.  Original bytes are retained next
     to the normalized PNG for audit.
     """
-    from PIL import Image, UnidentifiedImageError
+    from PIL import Image, ImageOps, UnidentifiedImageError
 
     try:
         with Image.open(source) as decoded:
+            _validate_image_dimensions(decoded.size)
             decoded.verify()
         with Image.open(source) as decoded:
-            image = decoded.convert("RGB")
+            image = ImageOps.exif_transpose(decoded).convert("RGB")
             original_width, original_height = image.size
             short_edge = min(original_width, original_height)
             if short_edge <= 0:
@@ -119,9 +125,10 @@ def normalize_uploaded_generation_image(source: Path, destination: Path) -> dict
                     math.ceil(original_width * scale),
                     math.ceil(original_height * scale),
                 )
+                _validate_image_dimensions(normalized_size)
                 image = image.resize(normalized_size, Image.Resampling.LANCZOS)
             image.save(destination, format="PNG")
-    except (UnidentifiedImageError, OSError, ValueError) as exc:
+    except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError) as exc:
         raise HTTPException(400, "Uploaded image is corrupt or unsupported") from exc
 
     normalized_width, normalized_height = image.size
@@ -142,6 +149,61 @@ def normalize_uploaded_generation_image(source: Path, destination: Path) -> dict
     }
 
 
+def _validate_image_dimensions(size: tuple[int, int]) -> None:
+    width, height = size
+    if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS or max(width, height) > 16384:
+        raise ValueError("Image dimensions exceed the supported limit")
+
+
+def _validate_reconstruction_image(path: Path) -> None:
+    from PIL import Image, UnidentifiedImageError
+    try:
+        with Image.open(path) as decoded:
+            _validate_image_dimensions(decoded.size)
+            decoded.verify()
+        # verify() checks headers; load() also catches truncated pixel data.
+        with Image.open(path) as decoded:
+            decoded.load()
+    except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError) as exc:
+        raise HTTPException(400, f"Multi-view image is corrupt or unsupported: {path.name}") from exc
+
+
+def _validate_reconstruction_video(path: Path) -> None:
+    try:
+        import cv2
+    except ImportError as exc:
+        raise HTTPException(503, "Video decoding is unavailable on this server") from exc
+    capture = cv2.VideoCapture(str(path))
+    try:
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        ok, _ = capture.read()
+        if not ok or frame_count < 24:
+            raise HTTPException(400, "Video must contain at least 24 decodable frames")
+    finally:
+        capture.release()
+
+
+def _validate_name(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise HTTPException(400, "Task name cannot be blank")
+    if len(value) > MAX_TASK_NAME_CHARS:
+        raise HTTPException(400, f"Task name must be at most {MAX_TASK_NAME_CHARS} characters")
+    return value
+
+
+def _validate_media_fields(task_type: str, *, image=None, panorama=None, images=None, video=None) -> None:
+    if task_type == "worldrecon":
+        if image or panorama:
+            raise HTTPException(400, "Reconstruction accepts multi-view images or one video")
+        if bool(images) == bool(video):
+            raise HTTPException(400, "Upload either multi-view images or one video")
+        if images and not MINIMUM_MULTIVIEW_FRAMES <= len(images) <= MAX_IMAGE_COUNT:
+            raise HTTPException(400, f"Upload between {MINIMUM_MULTIVIEW_FRAMES} and {MAX_IMAGE_COUNT} multi-view images")
+    elif images or video or (task_type == "worldgen" and panorama) or (task_type == "worldgen_from_pano" and image):
+        raise HTTPException(400, "Uploaded media does not match the selected task type")
+
+
 async def _stage_retry_image(upload: UploadFile, staging_dir: Path) -> tuple[Path, Path]:
     """Validate a replacement before any durable recovery state is changed."""
     staging_dir.mkdir(parents=True, exist_ok=False)
@@ -158,7 +220,7 @@ async def _stage_retry_image(upload: UploadFile, staging_dir: Path) -> tuple[Pat
         raise HTTPException(400, "Replacement source is empty")
     normalized = staging_dir / "input.png"
     try:
-        report = normalize_uploaded_generation_image(raw, normalized)
+        report = await asyncio.to_thread(normalize_uploaded_generation_image, raw, normalized)
     except HTTPException as exc:
         raise HTTPException(400, "Replacement source is corrupt or unsupported") from exc
     write_json_atomic(staging_dir / "input_normalization.json", report)
@@ -224,15 +286,38 @@ def _sanitize_user_config(config: dict[str, Any], task_type: str) -> dict[str, A
             "config contains unsupported server-managed keys: " + ", ".join(unsupported),
         )
     sanitized = dict(config)
-    if "recon_gpus" in sanitized:
+    for field, lower, upper in (("seed", 0, 4294967295), ("recon_gpus", 1, 5)):
+        if field not in sanitized:
+            continue
+        value = sanitized[field]
+        message = f"{field} must be an integer from {lower} to {upper}"
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise HTTPException(400, message)
         try:
-            recon_gpus = int(sanitized["recon_gpus"])
+            number = int(value)
         except (TypeError, ValueError) as exc:
-            raise HTTPException(400, "recon_gpus must be an integer from 1 to 5") from exc
-        if recon_gpus < 1 or recon_gpus > 5:
-            raise HTTPException(400, "recon_gpus must be an integer from 1 to 5")
-        sanitized["recon_gpus"] = recon_gpus
+            raise HTTPException(400, message) from exc
+        if number < lower or number > upper:
+            raise HTTPException(400, message)
+        sanitized[field] = number
+    for field in ("prompt", "quality_preset", "recovery_policy"):
+        if field in sanitized and not isinstance(sanitized[field], str):
+            raise HTTPException(400, f"{field} must be a string")
     return sanitized
+
+
+async def _require_retry_capability(config: Config, task: dict, task_config: dict | None = None, *, repair: bool = False) -> None:
+    if _worker and _worker.is_task_active(task["id"]):
+        raise HTTPException(409, "Task cancellation is still stopping its processes; retry after it stops")
+    requested_mode = "demo" if config.MOCK_PIPELINE else "real"
+    if (task.get("config") or {}).get("execution_mode", requested_mode) != requested_mode:
+        raise HTTPException(409, "Task execution mode differs from this server; create a new task")
+    from ..runtime import require_task_capability
+    if repair:
+        from ..runtime import require_repair_capability
+        await asyncio.to_thread(require_repair_capability, config)
+        return
+    await asyncio.to_thread(require_task_capability, config, task["type"], task_config if task_config is not None else task.get("config"))
 
 
 @router.post("/tasks", status_code=201)
@@ -255,8 +340,12 @@ async def create_task_endpoint(
     if type not in ("worldgen", "worldgen_from_pano", "worldrecon"):
         raise HTTPException(400, f"Invalid task type: {type}")
 
+    name = _validate_name(name)
+
     if (
         type in ("worldgen", "worldgen_from_pano")
+        and not cfg.MOCK_PIPELINE
+        and not (request_key and get_task_by_idempotency_key(cfg.DB_PATH, request_key))
         and not os.environ.get("HF_TOKEN")
         and not _sam3_is_cached(cfg.HF_HOME)
     ):
@@ -292,6 +381,8 @@ async def create_task_endpoint(
         raise HTTPException(400, "Panorama to World requires a panorama image")
     if type == "worldgen":
         config_dict["input_mode"] = "image" if image is not None else "prompt"
+    _validate_media_fields(type, image=image, panorama=panorama, images=images, video=video)
+    config_dict["execution_mode"] = "demo" if cfg.MOCK_PIPELINE else "real"
 
     # The SQLite pending row is the worker queue. Stage and validate every
     # byte before inserting that row so a worker can never observe half an
@@ -301,21 +392,24 @@ async def create_task_endpoint(
     input_dir = incoming_dir / "input"
     input_dir.mkdir(parents=True, exist_ok=False)
 
-    saved_files = []
+    upload_bytes = 0
 
     async def save_upload(upload: UploadFile, filename: Optional[str] = None, *, max_bytes: int | None = None):
+        nonlocal upload_bytes
         fname = Path(filename or upload.filename or "unnamed").name
         fpath = input_dir / fname
         total = 0
         with open(fpath, "wb") as f:
             while chunk := await upload.read(1024 * 1024):  # 1MB chunks
                 total += len(chunk)
+                upload_bytes += len(chunk)
+                if upload_bytes > MAX_UPLOAD_BYTES:
+                    raise HTTPException(400, "Upload exceeds the 2 GiB limit")
                 if max_bytes is not None and total > max_bytes:
                     raise HTTPException(400, f"Image exceeds the {max_bytes // (1024 * 1024)} MiB limit")
                 f.write(chunk)
         if total == 0:
             raise HTTPException(400, "Uploaded file is empty")
-        saved_files.append(str(fpath))
         return fpath
 
     try:
@@ -323,7 +417,7 @@ async def create_task_endpoint(
             suffix = Path(panorama.filename or "panorama.png").suffix.lower() or ".png"
             original = await save_upload(panorama, f"source_upload{suffix}", max_bytes=MAX_IMAGE_BYTES)
             normalized = input_dir / "panorama.png"
-            normalization = normalize_uploaded_generation_image(original, normalized)
+            normalization = await asyncio.to_thread(normalize_uploaded_generation_image, original, normalized)
             write_json_atomic(input_dir / "panorama_normalization.json", normalization)
             if type == "worldgen_from_pano":
                 scene_dir = incoming_dir / "scene"
@@ -333,27 +427,39 @@ async def create_task_endpoint(
         if image:
             suffix = Path(image.filename or "input.png").suffix.lower() or ".png"
             original = await save_upload(image, f"source_upload{suffix}", max_bytes=MAX_IMAGE_BYTES)
-            normalization = normalize_uploaded_generation_image(original, input_dir / "input.png")
+            normalization = await asyncio.to_thread(normalize_uploaded_generation_image, original, input_dir / "input.png")
             write_json_atomic(input_dir / "input_normalization.json", normalization)
 
         if images:
             for index, img in enumerate(images):
-                await save_upload(img, f"image_{index:04d}_{Path(img.filename or 'image').name}")
+                suffix = Path(img.filename or "image.png").suffix.lower()
+                if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
+                    raise HTTPException(400, "Multi-view images must use a supported image extension")
+                saved = await save_upload(img, f"image_{index:04d}{suffix}", max_bytes=MAX_IMAGE_BYTES)
+                await asyncio.to_thread(_validate_reconstruction_image, saved)
 
         if video:
-            await save_upload(video, "input_video.mp4")
+            saved = await save_upload(video, "input_video.mp4", max_bytes=MAX_UPLOAD_BYTES)
+            await asyncio.to_thread(_validate_reconstruction_video, saved)
 
-        final_dir = cfg.task_dir(task_id)
-        final_dir.parent.mkdir(parents=True, exist_ok=True)
-        incoming_dir.replace(final_dir)
-        write_json_atomic(final_dir / "task_contract.json", strict_contract(type))
-        fingerprint = _request_fingerprint(
+        from ..runtime import require_task_capability
+        # Replays do not launch work and remain available while the running
+        # job temporarily owns all GPUs or has stopped its managed VLM.
+        # The atomic insert below still verifies the exact request fingerprint.
+        if not request_key or not get_task_by_idempotency_key(cfg.DB_PATH, request_key):
+            await asyncio.to_thread(require_task_capability, cfg, type, config_dict)
+
+        fingerprint = await asyncio.to_thread(_request_fingerprint,
             task_type=type,
             name=name,
             prompt=normalized_prompt,
             config=config_dict,
-            input_dir=final_dir / "input",
+            input_dir=input_dir,
         )
+        final_dir = cfg.task_dir(task_id)
+        final_dir.parent.mkdir(parents=True, exist_ok=True)
+        incoming_dir.replace(final_dir)
+        write_json_atomic(final_dir / "task_contract.json", strict_contract(type))
         try:
             created_task_id, replayed = create_task_idempotent(
                 cfg.DB_PATH,
@@ -407,9 +513,12 @@ async def list_tasks_endpoint(
     type: Optional[str] = Query(None),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    q: Optional[str] = Query(None, max_length=200),
 ):
     cfg = _get_config()
-    tasks, total = list_tasks(cfg.DB_PATH, status=status, task_type=type, limit=limit, offset=offset)
+    tasks, total = list_tasks(cfg.DB_PATH, status=status, task_type=type, limit=limit, offset=offset, search=q)
+    for task in tasks:
+        task["execution_mode"] = (task.get("config") or {}).get("execution_mode", "unknown")
     return {"tasks": tasks, "total": total}
 
 
@@ -419,6 +528,7 @@ async def get_task_endpoint(task_id: str):
     task = get_task(cfg.DB_PATH, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    task["execution_mode"] = (task.get("config") or {}).get("execution_mode", "unknown")
     return task
 
 
@@ -439,7 +549,7 @@ async def get_task_delivery_manifest_endpoint(task_id: str):
     if not task:
         raise HTTPException(404, "Task not found")
     try:
-        return build_delivery_manifest(cfg.task_dir(task_id), task)
+        return await asyncio.to_thread(build_delivery_manifest, cfg.task_dir(task_id), task)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(409, f"Delivery manifest is incomplete: {exc}") from exc
 
@@ -536,9 +646,7 @@ async def update_task_endpoint(task_id: str, payload: TaskUpdate):
     if not task:
         raise HTTPException(404, "Task not found")
 
-    name = payload.name.strip()
-    if not name:
-        raise HTTPException(400, "Task name cannot be blank")
+    name = _validate_name(payload.name)
 
     update_task(cfg.DB_PATH, task_id, name=name)
     return get_task(cfg.DB_PATH, task_id)
@@ -552,6 +660,8 @@ async def delete_task_endpoint(task_id: str):
         raise HTTPException(404, "Task not found")
     if task["status"] in (TaskStatus.PENDING.value, TaskStatus.RUNNING.value):
         raise HTTPException(409, "Cancel the active task before deleting it")
+    if _worker and _worker.is_task_active(task_id):
+        raise HTTPException(409, "Task cancellation is still stopping its processes; delete after it stops")
 
     task_dir = cfg.task_dir(task_id)
     if task_dir.exists():
@@ -586,6 +696,7 @@ async def retry_task_endpoint(task_id: str):
         raise HTTPException(404, "Task not found")
     if task["status"] not in (TaskStatus.FAILED.value, TaskStatus.CANCELLED.value):
         raise HTTPException(409, f"Cannot retry task in status: {task['status']}")
+    await _require_retry_capability(cfg, task)
 
     update_task(
         cfg.DB_PATH,
@@ -609,6 +720,7 @@ async def repair_task_model_endpoint(task_id: str):
         raise HTTPException(404, "Task not found")
     if task["status"] not in (TaskStatus.FAILED.value, TaskStatus.CANCELLED.value):
         raise HTTPException(409, f"Cannot repair task in status: {task['status']}")
+    await _require_retry_capability(cfg, task, repair=True)
     if task["type"] not in ("worldgen", "worldgen_from_pano", "worldrecon"):
         raise HTTPException(409, "This task type does not support model repair")
     task_dir = cfg.task_dir(task_id)
@@ -666,6 +778,9 @@ async def retry_task_source_endpoint(
     if task["status"] not in (TaskStatus.FAILED.value, TaskStatus.CANCELLED.value):
         raise HTTPException(409, f"Cannot replace the source in status: {task['status']}")
     config = dict(task.get("config") or {})
+    if task["type"] == "worldgen" and image is not None:
+        config["input_mode"] = "image"
+    await _require_retry_capability(cfg, task, config)
     if task["type"] != "worldrecon" and (
         config.get("quality_preset", "high") != "high" or config.get("recovery_policy", "auto") != "auto"
     ):
@@ -675,6 +790,7 @@ async def retry_task_source_endpoint(
             raise HTTPException(400, "Upload a replacement video or at least 12 multi-view images")
         if images and len(images) < MINIMUM_MULTIVIEW_FRAMES:
             raise HTTPException(400, "At least 12 replacement multi-view images are required")
+        _validate_media_fields("worldrecon", image=image, panorama=panorama, images=images, video=video)
         retry_id = uuid.uuid4().hex
         staging = task_dir / ".incoming-retry" / retry_id
         staged_input = staging / "input"
@@ -687,9 +803,13 @@ async def retry_task_source_endpoint(
                 if not (upload.content_type or "").startswith("image/"):
                     raise HTTPException(400, "Every replacement multi-view file must be an image")
                 raw = staged_input / f"image_{index:04d}_{Path(upload.filename or 'image').name}"
+                image_bytes = 0
                 with raw.open("wb") as handle:
                     while chunk := await upload.read(1024 * 1024):
                         total += len(chunk)
+                        image_bytes += len(chunk)
+                        if image_bytes > MAX_IMAGE_BYTES:
+                            raise HTTPException(400, "Replacement image exceeds the 32 MiB limit")
                         if total > total_limit:
                             raise HTTPException(400, "Replacement upload exceeds the 2 GiB limit")
                         handle.write(chunk)
@@ -708,21 +828,13 @@ async def retry_task_source_endpoint(
                 if raw.stat().st_size == 0:
                     raise HTTPException(400, "Replacement video is empty")
             if uploads:
-                from PIL import Image, UnidentifiedImageError
                 for path in sorted(staged_input.glob("image_*")):
                     try:
-                        with Image.open(path) as decoded:
-                            decoded.verify()
-                    except (UnidentifiedImageError, OSError, ValueError) as exc:
+                        await asyncio.to_thread(_validate_reconstruction_image, path)
+                    except HTTPException as exc:
                         raise HTTPException(400, f"Replacement image is corrupt: {path.name}") from exc
             if video:
-                import cv2
-                capture = cv2.VideoCapture(str(staged_input / "input_video.mp4"))
-                frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-                ok, _ = capture.read()
-                capture.release()
-                if not ok or frame_count < 24:
-                    raise HTTPException(400, "Replacement video must contain at least 24 decodable frames")
+                await asyncio.to_thread(_validate_reconstruction_video, staged_input / "input_video.mp4")
             replacement_root = task_dir / "source_replacements"
             replacement_root.mkdir(parents=True, exist_ok=True)
             attempt = len([item for item in replacement_root.glob("attempt-*") if item.is_dir()]) + 1
@@ -801,12 +913,12 @@ async def retry_task_source_endpoint(
     staged_raw: Path | None = None
     staged_normalized: Path | None = None
     try:
-        if not current.get("available"):
-            initialize_pretrajectory_source_retry(task_dir, task_type=task["type"])
-            current = auto_recovery_summary(task_dir)
         if image is not None or panorama is not None:
             retry_staging = task_dir / ".incoming-retry" / uuid.uuid4().hex
             staged_raw, staged_normalized = await _stage_retry_image(image or panorama, retry_staging)
+        if not current.get("available"):
+            initialize_pretrajectory_source_retry(task_dir, task_type=task["type"])
+            current = auto_recovery_summary(task_dir)
         source_attempt = int(current.get("source_attempt", 0))
         base_seed = int(config.get("seed", 1024))
         # Archive downstream state before mutating the journal. If the archive
@@ -867,42 +979,88 @@ async def retry_task_source_endpoint(
 
 @router.websocket("/tasks/{task_id}/logs")
 async def task_logs_websocket(websocket: WebSocket, task_id: str):
+    """Follow all stage logs with resumable byte offsets, including queued tasks."""
     await websocket.accept()
     cfg = _get_config()
-
-    task = get_task(cfg.DB_PATH, task_id)
-    if not task:
+    if not get_task(cfg.DB_PATH, task_id):
         await websocket.close(code=4004, reason="Task not found")
         return
-
-    # Stream logs from all stage log files
-    logs_dir = cfg.task_logs_dir(task_id)
-    current_stage = task.get("current_stage")
-
-    if current_stage:
-        log_file = logs_dir / f"{current_stage}.log"
-    else:
-        # Find the most recent log file
-        log_files = sorted(logs_dir.glob("*.log"), key=lambda f: f.stat().st_mtime, reverse=True)
-        log_file = log_files[0] if log_files else None
-
-    if not log_file or not log_file.exists():
-        await websocket.send_json({"stage": "", "timestamp": "", "line": "No logs available yet."})
-        await websocket.close()
-        return
-
-    try:
-        async for line in stream_log(log_file):
-            await websocket.send_json({
-                "stage": current_stage or "",
-                "timestamp": "",
-                "line": line,
-            })
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:
-        logger.error("WebSocket error: %s", e)
+    offsets: dict[str, int] = {}
+    cursor = websocket.query_params.get("cursor", "")
+    if cursor:
         try:
-            await websocket.close()
-        except Exception:
-            pass
+            if len(cursor) > 16384:
+                raise ValueError("Cursor too large")
+            decoded = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+            if not isinstance(decoded, dict) or len(decoded) > 256:
+                raise ValueError("Invalid cursor")
+            for name, offset in decoded.items():
+                if Path(name).name != name or not name.endswith(".log") or type(offset) is not int or offset < 0:
+                    raise ValueError("Invalid cursor offset")
+            offsets = decoded
+        except (ValueError, TypeError, UnicodeDecodeError):
+            await websocket.close(code=1008, reason="Invalid log cursor")
+            return
+
+    def encode_cursor() -> str:
+        return base64.urlsafe_b64encode(json.dumps(offsets, separators=(",", ":")).encode()).decode().rstrip("=")
+
+    receiver = asyncio.create_task(websocket.receive())
+    try:
+        while True:
+            task = get_task(cfg.DB_PATH, task_id)
+            if not task:
+                await websocket.close(code=4004, reason="Task not found")
+                return
+            terminal = task["status"] in {"completed", "failed", "cancelled"}
+            # Cancellation becomes terminal only after the subprocess has stopped.
+            if _worker and _worker.is_task_active(task_id):
+                terminal = False
+            remaining = False
+            files = sorted(cfg.task_logs_dir(task_id).glob("*.log"), key=lambda path: (path.stat().st_mtime_ns, path.name))
+            for path in files:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                size = path.stat().st_size
+                with path.open("rb") as handle:
+                    if path.name not in offsets:
+                        handle.seek(max(0, size - 128 * 1024))
+                        if handle.tell():
+                            handle.readline()  # Drop a partial first line from the bounded history.
+                        offsets[path.name] = handle.tell()
+                    elif offsets[path.name] > size:
+                        offsets[path.name] = 0  # Stage log was replaced by a retry.
+                    handle.seek(offsets[path.name])
+                    batch_start = handle.tell()
+                    while handle.tell() - batch_start < 256 * 1024:
+                        line = handle.readline(65536)
+                        if not line:
+                            break
+                        if not line.endswith(b"\n") and len(line) < 65536 and not terminal:
+                            break  # The producer has not finished writing this line yet.
+                        offsets[path.name] = handle.tell()
+                        await websocket.send_json({
+                            "stage": path.stem,
+                            "timestamp": "",
+                            "line": line.decode("utf-8", errors="replace").rstrip("\r\n"),
+                            "cursor": encode_cursor(),
+                        })
+                    remaining = remaining or offsets[path.name] < path.stat().st_size
+            if terminal and not remaining:
+                await websocket.send_json({"type": "complete", "status": task["status"], "cursor": encode_cursor()})
+                await websocket.close()
+                return
+            done, _ = await asyncio.wait([receiver], timeout=0.25)
+            if receiver in done:
+                if receiver.result().get("type") == "websocket.disconnect":
+                    return
+                receiver = asyncio.create_task(websocket.receive())
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    except Exception:
+        logger.exception("Task log stream failed for %s", task_id)
+        await websocket.close(code=1011, reason="Log stream unavailable")
+    finally:
+        if not receiver.done():
+            receiver.cancel()
+        await asyncio.gather(receiver, return_exceptions=True)
