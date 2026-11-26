@@ -19,18 +19,43 @@ second GPU job. Reusing the key for different metadata or file bytes returns
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | type | string | yes | worldgen, worldgen_from_pano, or worldrecon |
-| name | string | yes | Task display name |
+| name | string | yes | Trimmed display name, 1–120 characters |
 | prompt | string | no | Text prompt for panorama generation |
 | panorama | file | conditional | Panorama image (required for worldgen_from_pano) |
-| image | file | conditional | Single input image (required for worldgen) |
-| images | file[] | conditional | At least 12 multi-view images for the recommended worldrecon lane |
-| video | file | no | Video input; 24 candidates are sampled before frame/parallax filtering |
+| image | file | conditional | Single input image for worldgen; omit only when a non-empty prompt is supplied |
+| images | file[] | conditional | 12–48 multi-view images; mutually exclusive with video |
+| video | file | conditional | One decodable video with at least 24 reported frames; later preflight samples and validates frame/parallax quality |
 | config | JSON string | no | Optional safe config (`seed`, `recon_gpus=1..5`); v4 policy fields are ignored and executable paths, hosts, model storage, budgets, and quality thresholds cannot be overridden |
 
 The server always writes `contract_version=4`,
 `success_policy=strict_free_view`, and either
 `input_lane=production_multiview` or `input_lane=generative_worldgen`.
 There is no Fast or degraded Worldgen contract.
+
+Images are limited to 32 MiB each, 40 million pixels and a maximum side of
+16,384 pixels. The total uploaded payload is limited to 2 GiB. Files are staged,
+decoded and validated before the task enters the queue; rejected staging files
+are removed. Missing, conflicting or corrupt inputs return `400`. The `seed`
+range is `0..4294967295`; booleans and fractional numbers are rejected.
+
+Before creating real work, missing runtime dependencies return `503` with
+structured details such as:
+
+```json
+{
+  "detail": {
+    "code": "runtime_not_ready",
+    "message": "The real execution runtime is not ready for this task.",
+    "blockers": [{"code": "gpu_capacity", "message": "This task requires 5 accessible CUDA GPU(s); 0 are available."}]
+  }
+}
+```
+
+`execution_mode` is assigned by the server and cannot be supplied in client
+configuration. New tasks expose `real` or `demo` in the task response and
+config. Historical tasks without recorded provenance expose `unknown`.
+Demo tasks simulate lifecycle only, create no 3D model and cannot become
+verified real deliveries.
 
 Response: 201 Created
 
@@ -42,7 +67,10 @@ Response: 201 Created
 
 ### List Tasks
 
-GET /api/tasks?status=&type=&limit=20&offset=0
+GET /api/tasks?status=&type=&search=&limit=20&offset=0
+
+`search` filters task name and ID as literal text, together with status/type
+filters, before pagination. The returned `total` is the matching count.
 
 Response: 200 OK
 
@@ -96,6 +124,12 @@ POST /api/tasks/{task_id}/cancel
 Response: 200 OK
 
     { "status": "cancelled" }
+
+Cancellation signals the subprocess group, escalates to termination when
+necessary and reaps the stage. While its processes are still stopping, delete,
+retry and source replacement return `409`. A cancelled row is not restarted
+from an earlier queue snapshot. Timeout and server-shutdown paths also stop
+the spawned stage process group.
 
 ### Get Delivery Quality
 
@@ -233,6 +267,11 @@ checkpoint shards, and metadata are archived; repaired artifacts are promoted
 atomically and must pass the complete 1,000-step, 32-view, 16-pair test again.
 There is no second repair attempt and no threshold relaxation.
 
+Repair readiness requires one CUDA GPU, the existing-model renderer and
+validation dependencies, writable task storage and the perceptual checkpoint.
+It does not require the source-generation VLM or panorama/WorldStereo model
+caches. Ordinary retries retain the full task dependency checks.
+
 ### Quality Summary
 
 GET /api/quality/summary
@@ -243,11 +282,21 @@ counts, trajectory/GPU time, and the rolling 20-task success rate against the
 
 ### Task Logs (WebSocket)
 
-GET /api/tasks/{task_id}/logs
+GET /api/tasks/{task_id}/logs?cursor={opaque_cursor}
 
-WebSocket endpoint. Streams JSON messages:
+WebSocket endpoint. Follows all stage log files, including stages that start
+after the connection. Initial history is bounded to 128 KiB per file.
+Reconnect with the latest returned opaque cursor to resume from byte offsets:
 
-    { "stage": "video_gen", "timestamp": "...", "line": "log line text" }
+    { "stage": "video_gen", "timestamp": "", "line": "log line text", "cursor": "opaque-value" }
+
+After the terminal task's final log bytes have been sent and its subprocess
+has stopped, the server sends a completion message and closes the connection:
+
+    { "type": "complete", "status": "completed", "cursor": "opaque-value" }
+
+An empty timestamp means the source log did not provide a timestamp; it is not
+a generated execution time.
 
 ### List Artifacts
 
@@ -280,8 +329,33 @@ GET /api/health
 GET /api/gpu/status
 
     {
-      "gpus": [
-        { "index": 0, "name": "A800-SXM4-80GB", "used_by": "vllm", "vram_used_gb": 48.2, "vram_total_gb": 80 }
-      ],
-      "active_task": "uuid-or-null"
+      "gpus": [],
+      "available": false,
+      "error": "NVIDIA GPU telemetry is unavailable: nvidia-smi was not found.",
+      "active_task": null,
+      "mode": "real"
     }
+
+When available, `gpus` contains observed `index`, `name`, `vram_total_gb` and
+`vram_used_gb`. `used_by` is `null` because process ownership is not inferred
+from a GPU index. Demo mode uses the same real telemetry probe.
+
+### Runtime Readiness
+
+GET /api/system/status
+
+Returns `mode` (`real` or `demo`), `ready`, `checked_at`, `capabilities`,
+`checks`, `gpu`, `repair`, and `verification_scope=dependency_preflight`.
+Each task capability has `task_type`, `ready`, `required_gpus`, and
+`blockers: [{code, message}]`. Each check includes its applicable `task_types`.
+Top-level `ready` means at least one real task type satisfies dependency
+preflight, including when the server is in demo mode; use the selected task's
+capability when deciding whether to submit real work. Text generation also
+checks the HunyuanImage-3 image-optional interface at admission.
+
+Probes check CUDA access, Python modules, configured source files, model-cache
+files and indexed shards, the VLM served-model list and writable storage. They
+never download weights or submit inference. Dependency snapshots are cached
+for at most 15 seconds. Successful preflight is not a guarantee of sufficient
+free memory, valid model contents or acceptable reconstruction quality; model
+loading and strict stage/delivery validation still run during execution.

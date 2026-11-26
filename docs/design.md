@@ -28,6 +28,42 @@ Single-pod deployment: API server + Pipeline Worker + vLLM sidecar, sharing 5 GP
 2. **worldgen_from_pano** - Uploaded panorama -> strict generated world
 3. **worldrecon** - Recommended 12-48 selected multi-view frames/video -> WorldMirror-2 reconstruction
 
+### Runtime admission and execution provenance
+
+The local development launcher defaults to real mode. `--demo` explicitly
+enables synthetic lifecycle execution. The API records `execution_mode` at
+task creation; the worker rejects known demo/real mode mismatches before
+executing a stage. Demo markers use `.demo_stage_*_done`, stage states are
+`skipped`, and the execution report states that no inference or 3D export took
+place. Demo delivery manifests are never verified or free-view eligible.
+
+`server/runtime.py` performs bounded, cached, read-only dependency probes.
+`/api/system/status` distinguishes task-specific readiness from API liveness
+and exposes actionable blockers. GPU telemetry always comes from the local
+driver, including in demo mode; unavailable telemetry is an empty result.
+Readiness is a dependency preflight, not hardware acceptance or a guarantee
+of reconstruction quality. No model downloads or inference are initiated by
+status requests. New real tasks and retries are checked before being queued.
+Previously queued tasks remain pending while their runtime is unavailable.
+Model repair has a narrower admission check for one GPU and existing-model
+rendering/validation dependencies.
+
+Stage commands use the API's `sys.executable` and its
+`torch.distributed.run` module. Application and configured HY-World import
+roots are explicit; task paths are absolute before changing a subprocess's
+working directory. Panorama generation retains its configured independent
+interpreter. Existing-model repair runs from the application root, without
+requiring the source-inference checkout as its working directory.
+
+Input files enter a temporary task workspace before any pending row is
+published. Size, dimensions, decoding, media exclusivity and safe public
+configuration are checked at this boundary. A reconstruction request contains
+12–48 images or one video. Long-running stage subprocesses use a separate
+process session; cancellation, timeout and worker shutdown terminate the
+process group and reap the child. Retry/delete actions are blocked while a
+cancelled task still owns an active subprocess. Log streams follow new stages,
+resume with byte-offset cursors and send an explicit terminal message.
+
 ### State Machine
 
 Task: pending -> running -> completed | failed | cancelled
@@ -176,3 +212,38 @@ Based on pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel. All CUDA extensions are co
   and exposes neither the repair action nor 3D/WASD navigation.
 - Panorama preview explicitly selects the source `scene/panorama.png`; generated
   depth/normal maps are never used as the interactive panorama.
+
+## Workspace interface and client contracts
+
+The workspace has three routes: scenes (`/`), creation (`/create`), and runtime
+resources (`/system`). Scene search and status/type filters use the paginated
+API; search is literal text, including percent and underscore characters.
+Polling discards superseded results, and task/batch mutations cannot replace a
+newly selected task or filtered list with an older response. API failure has its
+own state and is never presented as an empty workspace or a ready runtime.
+
+Creation supports 12–48 photos, one video, one reference image, or one panorama,
+according to the selected pipeline. Only the active source is submitted. The
+browser checks format, file count, duplicates, total size, and typed settings;
+the server remains authoritative and additionally decodes uploaded media.
+Progress comes from the actual upload, cancellation aborts that connection,
+and retries retain an idempotency key for the same form payload.
+
+Task details expose stage state, live logs with cursor-based reconnection,
+quality evidence, source replacement/repair/retry actions, preview controls,
+artifact search and the delivery manifest. Non-Gaussian images are inspected
+as images; panoramas use a separate interactive viewer. Three.js and Spark
+load only when a preview is opened. Panorama resources and late texture
+callbacks are cleaned up when a source or page changes.
+
+Both embedded and standalone 3D routes fail closed when a quality request
+fails. New real tasks need a passed delivery report; demo tasks never display
+a model. Historical reconstructions with no recorded execution mode can be
+inspected with navigation disabled. A successful task state alone never opens
+WASD. Stage completion and simulated workflow completion are not model quality
+evidence.
+
+The UI adapts from a desktop sidebar to phone navigation. Browser acceptance
+covers the empty workspace, runtime blockers, source switching/file selection,
+a separately identified demo lifecycle, logs, artifacts, editing, and narrow
+viewports. These checks do not establish successful GPU model inference.

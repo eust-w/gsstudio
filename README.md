@@ -488,17 +488,31 @@ stateDiagram-v2
 
 ## Quick start
 
-### Local development — no GPU required
+### Local API and UI
 
 ```bash
 ./scripts/dev_local.sh
 ```
 
-脚本会创建 Python 虚拟环境、安装本地依赖，并以 mock pipeline 启动：
+脚本会创建 Python 虚拟环境、安装本地依赖，并默认以真实执行模式启动。没有 GPU 的机器可以运行界面、查看任务与运行环境；创建真实任务前，服务端会校验 CUDA、HY-World 代码、模型缓存和 VLM 服务。缺少依赖时返回具体阻断原因，不会排入一个必然无法运行的新任务。
 
 - Web UI: <http://localhost:5173>
 - API: <http://localhost:8000>
 - OpenAPI: <http://localhost:8000/docs>
+
+界面中的「运行环境」和 `GET /api/system/status` 显示每种任务的实际可用性。`GET /api/health` 只代表 API 存活。GPU 名称和显存来自本机 `nvidia-smi`；没有遥测时返回空列表，任何模式都不会生成虚构 GPU。
+
+仅调试任务界面与状态流转时显式使用：
+
+```bash
+./scripts/dev_local.sh --demo
+```
+
+演示任务标记为 `execution_mode=demo`，日志和报告注明没有执行模型推理，不生成 PLY/SPZ，也不会通过真实交付验证。演示检查点与真实检查点分开保存；切换服务器模式后不能把已标记的演示任务当作真实任务继续执行。
+
+演示数据默认放在 `data/demo`，真实模式保留 `data`。设置 `GSSTUDIO_DATA_DIR` 可以为任一模式选择独立目录，启动脚本会保留该设置。
+
+真实执行需配置 `GSSTUDIO_HYWORLD_REPO`、`GSSTUDIO_HF_HOME`、`GSSTUDIO_PANOGEN_PYTHON` 和 `VLLM_HOST` / `VLLM_PORT` / `VLLM_MODEL`，并预先准备模型缓存。分布式阶段使用 API 所在 Python 环境中的 `torch.distributed.run`；全景推理使用配置的独立 Python。脚本默认不管理外部 VLM 进程，只有由 supervisord 管理的部署才应设置 `GSSTUDIO_MANAGE_VLLM=true`。
 
 ### Production image and Kubernetes deployment
 
@@ -519,11 +533,17 @@ npm --prefix web run build
 git diff --check
 ```
 
-部署后的 API / GPU / 任务创建冒烟测试：
+这些检查覆盖接口、输入校验、任务流转、进程终止和浏览器构建；运行环境预检仅验证依赖条件，不等于模型加载成功或真实 GPU 交付验收。实际 GPU、真实输入与完整质量门仍须在目标执行环境验证。
+
+部署后的 API、GPU 遥测、运行环境和无效输入拒绝冒烟测试（不创建任务）：
 
 ```bash
 ./scripts/smoke_test.sh http://localhost:8000
+# 部署验收还要求至少一种真实任务的运行依赖就绪：
+./scripts/smoke_test.sh http://localhost:8000 --require-ready
 ```
+
+启用认证时，冒烟脚本读取环境变量 `GSSTUDIO_SERVICE_TOKEN`，或 `GSSTUDIO_BASIC_AUTH_USER` / `GSSTUDIO_BASIC_AUTH_PASSWORD`。
 
 ---
 
@@ -551,6 +571,7 @@ git diff --check
 | `POST /api/tasks/{id}/retry-source` | 原子校验并归档新的图片组、视频或生成式来源 |
 | `GET /api/quality/summary` | 按通道统计预检率、严格完成率、失败阶段和最近 20 个任务 SLO |
 | `GET /api/gpu/status` | 查看 GPU 与工作负载状态 |
+| `GET /api/system/status` | 查看真实 / 演示模式、各任务依赖阻断原因与模型修复运行条件 |
 | `GET /api/health` | 服务健康检查 |
 
 完整请求和响应结构见 [docs/api.md](docs/api.md)。
