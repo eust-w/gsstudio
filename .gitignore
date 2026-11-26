@@ -30,3 +30,6 @@ data/
 # Local browser verification artifacts
 .playwright-cli/
 output/playwright/
+
+# Rendered manifests (contain the real public IP)
+deploy/k8s/*.rendered.yaml

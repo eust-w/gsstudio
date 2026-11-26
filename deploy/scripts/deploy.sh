@@ -46,6 +46,15 @@ if [ -f "$K8S_DIR/ingress.yaml" ]; then
     kubectl apply -f "$K8S_DIR/ingress.yaml"
 fi
 
+# Optional public-IP LoadBalancer (the elastic IP is configuration, not in the manifest)
+if [ -n "${GSSTUDIO_PUBLIC_IP:-}" ]; then
+    echo "Applying public-IP Service for ${GSSTUDIO_PUBLIC_IP}:${GSSTUDIO_PUBLIC_PORT:-80}..."
+    "$SCRIPT_DIR/render-public-service.sh" --apply
+else
+    echo "Public-IP Service skipped (set GSSTUDIO_PUBLIC_IP to apply it, or run"
+    echo "  GSSTUDIO_PUBLIC_IP=<ip> deploy/scripts/render-public-service.sh --apply)"
+fi
+
 echo ""
 echo "=== Deployment Status ==="
 kubectl -n "$NAMESPACE" get pods -l app=gsstudio

@@ -1,3 +1,4 @@
+# Template: render with deploy/scripts/render-public-service.sh (GSSTUDIO_PUBLIC_IP, GSSTUDIO_PUBLIC_PORT).
 apiVersion: v1
 kind: Service
 metadata:
@@ -9,7 +10,7 @@ metadata:
     service.kubernetes.io/cce-update-in-time: "true"
     service.beta.kubernetes.io/cce.listener.customized-listener: |-
       {
-        "80": {
+        "${GSSTUDIO_PUBLIC_PORT}": {
           "protocol": "TCP",
           "scheduler": "RoundRobin",
           "timeout": "900"
@@ -17,7 +18,7 @@ metadata:
       }
     service.beta.kubernetes.io/cce.listener.customized-health-check: |-
       {
-        "80": {
+        "${GSSTUDIO_PUBLIC_PORT}": {
           "healthCheck": "TCP",
           "healthCheckTimeoutInSecond": "3",
           "healthCheckIntervalInSecond": "3",
@@ -27,12 +28,12 @@ metadata:
       }
 spec:
   type: LoadBalancer
-  loadBalancerIP: <poc-public-ip>
+  loadBalancerIP: ${GSSTUDIO_PUBLIC_IP}
   externalTrafficPolicy: Local
   selector:
     app: gsstudio
   ports:
     - name: http
-      port: 80
+      port: ${GSSTUDIO_PUBLIC_PORT}
       targetPort: http
       protocol: TCP

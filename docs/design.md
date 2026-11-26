@@ -189,7 +189,9 @@ Based on pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel. All CUDA extensions are co
 - Service integration: Bearer service-token authentication, idempotent task
   creation, task-root-contained artifact downloads, and checksum-backed
   `gsstudio.delivery/v1` manifests are deployed for the Drobodata connector.
-- Public IP URL: http://<poc-public-ip> (CCE load balancer + Basic Auth)
+- Public IP URL: http://<poc-public-ip> (CCE load balancer + Basic Auth; the IP and listener
+  port are rendered from `GSSTUDIO_PUBLIC_IP` / `GSSTUDIO_PUBLIC_PORT` by
+  `deploy/scripts/render-public-service.sh`, not stored in the manifest)
 - TLS URL: https://<poc-tunnel>.trycloudflare.com (Cloudflare Tunnel TLS + Basic Auth)
 - One-time world generation prerequisite: approved access to gated
   `facebook/sam3` and `HF_TOKEN` via the optional `gsstudio-huggingface` Secret
