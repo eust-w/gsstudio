@@ -553,7 +553,7 @@ git diff --check
 
 | Entry | URL | Notes |
 | --- | --- | --- |
-| Direct IP | <http://<poc-public-ip>> | CCE LoadBalancer，HTTP Basic Auth，明文 HTTP |
+| Direct IP | `http://<poc-public-ip>` | CCE LoadBalancer，HTTP Basic Auth，明文 HTTP |
 | TLS tunnel | <https://<poc-tunnel>.trycloudflare.com> | Cloudflare Quick Tunnel；Pod 重建后 URL 可能变化 |
 
 `Direct IP` 的地址和端口不写在清单里：`deploy/k8s/service-public-ip.yaml.tmpl` 由 `deploy/scripts/render-public-service.sh` 按 `GSSTUDIO_PUBLIC_IP` / `GSSTUDIO_PUBLIC_PORT`（默认 80）渲染，`deploy/scripts/deploy.sh` 检测到 `GSSTUDIO_PUBLIC_IP` 时会自动应用。
